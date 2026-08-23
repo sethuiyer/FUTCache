@@ -366,6 +366,46 @@ backend replaceable behind the same API.
 embedding stream with a cosine-distance callback, representative export, and
 memory statistics. It is synthetic and dependency-free so it builds in CI.
 
+## Python bindings
+
+`pip install .` builds and installs the `futcache` package, a thin Python
+wrapper around the C `futcache_pack` cache implemented via nanobind +
+scikit-build-core. Payloads (LLM responses, retrieval results, etc.) are
+stored in a Python dict keyed by representative slot index; the C cache
+itself owns only novelty semantics.
+
+```python
+import numpy as np
+from futcache import PackCache, NoveltyResult
+
+cache = PackCache(dimension=384, epsilon=0.6, distance="cosine",
+                  domain_min=-1.0, domain_max=1.0)
+
+q = np.random.randn(384); q /= np.linalg.norm(q)
+res = cache.observe(q, payload=b"cached LLM response")
+
+if res.is_novel:
+    response = call_llm(q)
+    cache.set_payload(res.representative_id, response.encode())
+else:
+    response = cache.get_payload(res.representative_id).decode()
+```
+
+The wrapper exposes:
+
+- `PackCache(dimension, epsilon, distance, domain_min, domain_max)`
+- `cache.observe(point, payload=None) -> NoveltyResult`
+- `cache.query(point) -> NoveltyResult`
+- `cache.get_payload(representative_id) -> bytes | None`
+- `cache.set_payload(representative_id, payload)`
+- `cache.copy_representatives() -> numpy.ndarray` of shape `(N, dimension)`
+- `cache.clear()`
+- `len(cache)`, `cache.peak_count()`, `cache.memory_bytes()`,
+  `cache.observations()`, `cache.novel_observations()`
+- `PackCache.version() -> "1.1.0"`
+
+Supported distance names: `"linf"` (default), `"l1"`, `"l2"`, `"cosine"`.
+
 ## Empirical comparison vs LRU
 
 `bench/cache_comparison.c` (build with `FUTCACHE_BUILD_BENCHMARKS=ON`) runs

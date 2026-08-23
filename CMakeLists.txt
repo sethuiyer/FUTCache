@@ -14,6 +14,7 @@ include(CMakePackageConfigHelpers)
 option(FUTCACHE_BUILD_SHARED "Build FUTCache as a shared library" OFF)
 option(FUTCACHE_BUILD_EXAMPLES "Build FUTCache examples" ON)
 option(FUTCACHE_BUILD_BENCHMARKS "Build FUTCache benchmarks" OFF)
+option(FUTCACHE_BUILD_PYTHON "Build the Python bindings (futcache_ext)" OFF)
 option(FUTCACHE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(FUTCACHE_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 option(FUTCACHE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
@@ -156,6 +157,37 @@ install(EXPORT FUTCacheTargets
   NAMESPACE FUTCache::
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/FUTCache
 )
+
+if(FUTCACHE_BUILD_PYTHON)
+  # nanobind is a C++ binding library; enable C++ if the project has
+  # not already done so.
+  if(NOT CMAKE_CXX_COMPILER_LOADED)
+    enable_language(CXX)
+  endif()
+  # The Python extension is a shared library and needs -fPIC on the
+  # static libfutcache that it links against. Apply to the library
+  # target so all its sources get PIC.
+  set_target_properties(futcache PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+  find_package(Python REQUIRED COMPONENTS Interpreter Development)
+  find_package(nanobind CONFIG REQUIRED)
+  nanobind_add_module(futcache_ext python/futcache/_core.cpp)
+  target_link_libraries(futcache_ext PRIVATE futcache m)
+  target_include_directories(futcache_ext PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  if(NOT MSVC)
+    target_compile_options(futcache_ext PRIVATE
+      -Wall -Wextra -Wpedantic -Wconversion -Wno-unused-parameter
+    )
+  endif()
+  # Install the compiled extension next to the python package so
+  # wheel builds pick it up.
+  install(TARGETS futcache_ext
+    LIBRARY DESTINATION futcache
+    RUNTIME DESTINATION futcache
+  )
+endif()
 
 configure_package_config_file(
   cmake/FUTCacheConfig.cmake.in

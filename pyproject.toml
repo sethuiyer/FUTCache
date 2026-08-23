@@ -1,0 +1,36 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0", "numpy>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "futcache"
+version = "1.1.0"
+description = "Future-equivalence caching in C, with Python bindings."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "FUTCache contributors" }]
+classifiers = [
+    "Programming Language :: C",
+    "Programming Language :: Cython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = ["numpy>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/example/futcache"
+
+[tool.scikit-build]
+cmake.version = ">=3.16"
+wheel.packages = ["python/futcache"]
+wheel.license-files = []
+
+[tool.scikit-build.cmake.define]
+FUTCACHE_BUILD_PYTHON = "ON"
+FUTCACHE_BUILD_EXAMPLES = "OFF"
+FUTCACHE_BUILD_BENCHMARKS = "OFF"
