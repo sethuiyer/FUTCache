@@ -15,6 +15,7 @@ option(FUTCACHE_BUILD_SHARED "Build FUTCache as a shared library" OFF)
 option(FUTCACHE_BUILD_EXAMPLES "Build FUTCache examples" ON)
 option(FUTCACHE_BUILD_BENCHMARKS "Build FUTCache benchmarks" OFF)
 option(FUTCACHE_BUILD_PYTHON "Build the Python bindings (futcache_ext)" OFF)
+option(FUTCACHE_BUILD_NITROSAT "Build the vendored NitroSAT V3 offline optimizer" OFF)
 option(FUTCACHE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(FUTCACHE_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 option(FUTCACHE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
@@ -157,6 +158,42 @@ if(FUTCACHE_BUILD_BENCHMARKS)
   futcache_enable_warnings(futcache_bekko_semantic_cache)
 endif()
 
+if(FUTCACHE_BUILD_NITROSAT)
+  add_executable(nitrosatv3
+    third_party/nitrosat/v3/nitrosatv3.c
+    third_party/nitrosat/navokoj_checkpoint.c
+  )
+  target_compile_features(nitrosatv3 PRIVATE c_std_99)
+  futcache_enable_warnings(nitrosatv3)
+  if(NOT MSVC)
+    target_link_libraries(nitrosatv3 PRIVATE m)
+  endif()
+
+  if(BUILD_TESTING)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+      execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+        RESULT_VARIABLE FUTCACHE_HAVE_TEST_NUMPY
+        OUTPUT_QUIET
+        ERROR_QUIET
+      )
+      if(FUTCACHE_HAVE_TEST_NUMPY EQUAL 0)
+        add_test(
+          NAME nitrosat_min_reps_tests
+          COMMAND ${CMAKE_COMMAND} -E env
+            NITROSAT_V3=$<TARGET_FILE:nitrosatv3>
+            ${Python3_EXECUTABLE} -B -m unittest
+            tests/test_nitrosat_min_reps.py -v
+        )
+        set_tests_properties(nitrosat_min_reps_tests PROPERTIES
+          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+      endif()
+    endif()
+  endif()
+endif()
+
 install(TARGETS futcache
   EXPORT FUTCacheTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -221,5 +258,6 @@ install(FILES
   LICENSE
   docs/serialization.md
   docs/verification.md
+  docs/nitrosat_optimization.md
   DESTINATION ${CMAKE_INSTALL_DOCDIR}
 )

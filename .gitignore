@@ -1,6 +1,7 @@
 /build/
 /build-*/
 /cmake-build-*/
+/third_party/nitrosat/nitrosatv3
 *.o
 *.a
 *.so

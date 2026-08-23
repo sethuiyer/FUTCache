@@ -81,6 +81,7 @@ Useful build options:
 FUTCACHE_BUILD_SHARED=ON       build a shared library
 FUTCACHE_BUILD_EXAMPLES=OFF    omit examples
 FUTCACHE_BUILD_BENCHMARKS=ON   build the stress/throughput benchmark
+FUTCACHE_BUILD_NITROSAT=ON     build the optional offline anchor optimizer
 FUTCACHE_ENABLE_SANITIZERS=ON  enable ASan and UBSan on GCC/Clang
 FUTCACHE_ENABLE_TSAN=ON        enable ThreadSanitizer in a separate build
 FUTCACHE_WARNINGS_AS_ERRORS=ON make supported warning checks fatal
@@ -209,6 +210,24 @@ cache (`<futcache/pack.h>`) answer different questions:
 `futcache_nd_dedup` exercises the packing cache on uniform random streams
 in dimensions 2, 4, 8, and 16 under `L_inf`, `L1`, and `L2`, and reports
 representative count versus packing bound for each.
+
+### Offline representative optimization
+
+`scripts/bench_nitrosat_min_reps.py` uses the vendored NitroSAT V3 solver to
+replace an order-dependent online packing with a smaller offline packing over a
+fixed observation set. Hard WCNF clauses enforce full empirical coverage and
+pairwise distance greater than epsilon; unit soft clauses minimize the number
+of retained representatives. Every solver claim is independently recomputed,
+and the safe operational policy keeps the smaller of the verified NitroSAT set
+and the greedy packing.
+
+On corrected synthetic workloads with 40 actual clusters, five deterministic
+solver restarts reduced representative count by 15.1% at 200 points (20/20
+workload wins), 17.4% at 500 points, and 15.7% at 1,000 points, always with
+full empirical coverage and zero packing violations in the tested matrix.
+These are heuristic results, not optimality proofs or continuous-domain cover
+certificates. See `docs/nitrosat_optimization.md` for formulation, provenance,
+generator correction, commands, and complete caveats.
 
 ## Bekko semantic cache experiment
 

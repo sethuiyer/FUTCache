@@ -180,6 +180,7 @@ scripts/
     cacheability.py            cacheability analysis
     bekko_generate.py          benchmark data generation
     bekko_multilingual.py      multilingual data generation
+    bench_nitrosat_min_reps.py offline packing optimizer benchmark
 python/
     futcache/__init__.py       Python wrapper and docstrings
     futcache/_core.cpp         nanobind extension
@@ -187,6 +188,8 @@ python/
 docs/
     serialization.md           interval snapshot format
     verification.md            build and test results
+    nitrosat_optimization.md   offline packing formulation and evidence
+third_party/nitrosat/          vendored optional NitroSAT V3 optimizer
 ```
 
 The split between `include/` and `src/` is one header per engine. Each engine
