@@ -100,8 +100,10 @@ int main(void)
     }
     futcache_pack_get_stats(cache, &stats);
     representative_count = stats.representative_count;
-    coordinate_count = representative_count * DIMENSION;
-    representatives = calloc(coordinate_count,
+    /* inout_count is now in *representatives*; the buffer itself holds
+     * reps * DIMENSION doubles. */
+    coordinate_count = representative_count;
+    representatives = calloc(representative_count * DIMENSION,
                               sizeof(*representatives));
     if (representatives == NULL || futcache_pack_copy_representatives(
             cache, representatives, &coordinate_count) != FUTCACHE_OK) {

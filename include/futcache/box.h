@@ -15,8 +15,11 @@ extern "C" {
  * The current implementation supports dimensions 1..8 and stores the union
  * as an append-only list of closed epsilon boxes.  Overlap is intentional:
  * the representation is exact but not canonical/minimal; box_count is a
- * storage diagnostic, not a packing bound.  A future canonical cell backend
- * can replace the representation without changing this API. */
+ * storage diagnostic.  The per-box centers (p) are L_inf-eps-separated
+ * (because novelty gating is by d(x, R) > eps at observation time), so the
+ * box count is bounded above by the packing number P(K, eps), though it may
+ * exceed P(K, eps) due to overlap.  A future canonical cell backend can
+ * replace the representation without changing this API. */
 typedef struct futcache_box_config {
     size_t dimension;
     double epsilon;

@@ -103,7 +103,7 @@ typedef struct futcache_pack_config {
     void *distance_context;
     /* Inclusive lower domain bound per coordinate. Required. */
     const double *domain_min;
-    /* Exclusive? Inclusive upper domain bound per coordinate. Required. */
+    /* Inclusive upper domain bound per coordinate. Required. */
     const double *domain_max;
     /* Allocator. NULL selects malloc/free. */
     futcache_allocator_t allocator;
@@ -184,8 +184,14 @@ FUTCACHE_API futcache_status_t futcache_pack_get_stats(
 
 /*
  * Copies up to `*inout_count` representatives into `out_points` (length
- * `dimension` each). On input, `*inout_count` is the destination capacity;
- * on return it is the required count. Pass NULL/0 to query size.
+ * `dimension` each). On input, `*inout_count` is the destination capacity
+ * in *representatives*; on return it is the number of representatives
+ * actually written (also the required capacity). Pass `out_points=NULL`
+ * and `*inout_count=0` to query the required capacity.
+ *
+ * On return, allocate `out_points` as
+ *   (*inout_count) * dimension * sizeof(double)
+ * bytes, then call again to copy.
  */
 FUTCACHE_API futcache_status_t futcache_pack_copy_representatives(
     const futcache_pack_t *cache,

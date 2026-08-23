@@ -11,4 +11,6 @@
 *.gcda
 *.gcno
 *.gcov
+__pycache__/
+*.pyc
 pi-session-*.html

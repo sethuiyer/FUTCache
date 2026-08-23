@@ -277,10 +277,12 @@ static run_stats_t run_pack(
 
 static void print_table_header(void)
 {
-    puts("| truncate | epsilon | reps | novel | correct_reuse | "
-         "incorrect_reuse | missed_reuse | us/op |");
-    puts("|----------|---------|------|-------|---------------|"
-         "-----------------|--------------|-------|");
+    puts("| truncate | epsilon | reps | novel | reuse_rate | "
+         "reuse_precision | correct_reuse | incorrect_reuse | "
+         "missed_reuse | us/op |");
+    puts("|----------|---------|------|-------|------------|"
+         "-----------------|---------------|-----------------|"
+         "--------------|-------|");
 }
 
 static void print_row(uint32_t truncate_dim, double epsilon,
@@ -291,10 +293,16 @@ static void print_row(uint32_t truncate_dim, double epsilon,
     double correct = (double)r->correct_reuse / (double)count;
     double incorrect = (double)r->incorrect_reuse / (double)count;
     double missed = (double)r->missed_reuse / (double)count;
-    printf("|   %3u    | %.3f   | %4zu | %5zu |    %.4f     |    "
-           "%.4f      |   %.4f     | %5.2f |\n",
+    size_t reuse_count = r->correct_reuse + r->missed_reuse;
+    double reuse_rate = (double)reuse_count / (double)count;
+    double reuse_precision = reuse_count > 0
+        ? (double)r->correct_reuse / (double)reuse_count
+        : 0.0;
+    printf("|   %3u    | %.3f   | %4zu | %5zu |   %.4f    |     "
+           "%.4f      |    %.4f     |    %.4f      |   "
+           "%.4f     | %5.2f |\n",
         truncate_dim, epsilon, r->representative_count, r->novel_count,
-        correct, incorrect, missed, us_per_op);
+        reuse_rate, reuse_precision, correct, incorrect, missed, us_per_op);
 }
 
 static void usage(const char *prog)

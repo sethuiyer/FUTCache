@@ -114,22 +114,17 @@ double futcache_distance_cosine(const double *a, const double *b,
  * ============================================================ */
 
 typedef struct pack_representative {
-    uint64_t hash;
     size_t dimension;
     double coordinates[];  /* [dimension] */
 } pack_representative_t;
 
-static uint64_t hash_point(const double *point, size_t dimension)
+/* Saturating counter increment. Mirrors the helper in futcache.c so the
+ * telemetry invariants (generation >= observations, novel <= observations)
+ * survive overflow rather than wrap into a state the serializer would
+ * reject. */
+static uint64_t increment_saturating(uint64_t value)
 {
-    /* FNV-1a over the bytes of the coordinates. */
-    uint64_t h = UINT64_C(14695981039346656037);
-    const uint8_t *bytes = (const uint8_t *)point;
-    size_t bytes_count = dimension * sizeof(double);
-    for (size_t i = 0; i < bytes_count; ++i) {
-        h ^= (uint64_t)bytes[i];
-        h *= UINT64_C(1099511628211);
-    }
-    return h;
+    return value < UINT64_MAX ? value + 1U : value;
 }
 
 static pack_representative_t *make_representative(
@@ -142,7 +137,6 @@ static pack_representative_t *make_representative(
     pack_representative_t *rep =
         (pack_representative_t *)allocator->allocate(allocator->context, bytes);
     if (rep == NULL) return NULL;
-    rep->hash = hash_point(point, dimension);
     rep->dimension = dimension;
     memcpy(rep->coordinates, point, dimension * sizeof(double));
     return rep;
@@ -482,9 +476,10 @@ futcache_status_t futcache_pack_observe(
         }
     }
 
-    cache->observations++;
-    if (novel) cache->novel_observations++;
-    cache->generation++;
+    cache->observations = increment_saturating(cache->observations);
+    if (novel) cache->novel_observations =
+        increment_saturating(cache->novel_observations);
+    cache->generation = increment_saturating(cache->generation);
 
     if (out_was_novel != NULL) *out_was_novel = novel;
     pthread_rwlock_unlock(lock);
@@ -532,13 +527,17 @@ futcache_status_t futcache_pack_copy_representatives(
     pthread_rwlock_t *lock = (pthread_rwlock_t *)&cache->lock;
     pthread_rwlock_rdlock(lock);
 
-    size_t required = cache->count * cache->dimension;
-    size_t available = *inout_count;
-
-    if (out_points == NULL || available < required) {
+    /* inout_count is now uniform: it counts *representatives*, both as
+     * the destination capacity and as the required count on query. */
+    if (out_points == NULL) {
+        *inout_count = cache->count;
         pthread_rwlock_unlock(lock);
-        *inout_count = required;
-        if (out_points == NULL) return FUTCACHE_OK;
+        return FUTCACHE_OK;
+    }
+
+    if (*inout_count < cache->count) {
+        *inout_count = cache->count;
+        pthread_rwlock_unlock(lock);
         return FUTCACHE_ERROR_BUFFER_TOO_SMALL;
     }
 
@@ -548,8 +547,8 @@ futcache_status_t futcache_pack_copy_representatives(
                cache->dimension * sizeof(double));
     }
 
-    pthread_rwlock_unlock(lock);
     *inout_count = cache->count;
+    pthread_rwlock_unlock(lock);
     return FUTCACHE_OK;
 }
 
@@ -566,7 +565,10 @@ futcache_status_t futcache_pack_clear(futcache_pack_t *cache)
         }
     }
     free_all_representatives(cache);
-    cache->generation++;
+    cache->peak_count = 0U;
+    cache->observations = 0U;
+    cache->novel_observations = 0U;
+    cache->generation = increment_saturating(cache->generation);
     pthread_rwlock_unlock(&cache->lock);
     return FUTCACHE_OK;
 }

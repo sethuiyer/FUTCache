@@ -561,22 +561,23 @@ double hi[2] = {1.0, 1.0};
     futcache_pack_observe(cache, p1, &novel);
     futcache_pack_observe(cache, p2, &novel);
 
-    /* Query required size. */
+    /* Size query: inout_count is in *representatives*, not doubles. */
     size_t required = 0U;
     if (futcache_pack_copy_representatives(cache, NULL, &required)
         != FUTCACHE_OK) {
         futcache_pack_destroy(cache);
         return false;
     }
-    if (required != 4U) {
-        fprintf(stderr, "expected required=4 (2 reps * dim 2), got %zu\n",
+    if (required != 2U) {
+        fprintf(stderr, "size query: expected required=2 reps, got %zu\n",
                 required);
         futcache_pack_destroy(cache);
         return false;
     }
 
-    double out[4];
-    size_t count = 4U;
+    /* Copy with capacity = 2 reps. Buffer holds reps * dim doubles. */
+    double out[2 * 2];
+    size_t count = 2U;
     if (futcache_pack_copy_representatives(cache, out, &count)
         != FUTCACHE_OK) {
         futcache_pack_destroy(cache);
@@ -588,8 +589,8 @@ double hi[2] = {1.0, 1.0};
         return false;
     }
 
-    /* Buffer too small. */
-    double tiny[2];
+    /* Buffer too small (capacity = 1 rep, but cache has 2). */
+    double tiny[2 * 2];
     size_t tiny_count = 1U;
     if (futcache_pack_copy_representatives(cache, tiny, &tiny_count)
         != FUTCACHE_ERROR_BUFFER_TOO_SMALL) {
@@ -597,8 +598,9 @@ double hi[2] = {1.0, 1.0};
         futcache_pack_destroy(cache);
         return false;
     }
-    if (tiny_count != 4U) {
-        fprintf(stderr, "tiny required should be 4, got %zu\n", tiny_count);
+    if (tiny_count != 2U) {
+        fprintf(stderr, "tiny required should be 2 reps, got %zu\n",
+                tiny_count);
         futcache_pack_destroy(cache);
         return false;
     }

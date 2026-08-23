@@ -277,6 +277,80 @@ dimensions preserve enough cross-lingual semantic structure for this
 cache regime, and the smaller representation dominates on throughput
 without losing semantic fidelity.
 
+### Operational metrics: reuse precision
+
+The raw `correct_reuse / incorrect_reuse / missed_reuse` columns need
+rephrasing for product decisions. The two numbers that matter are:
+
+- **reuse_rate** = P(cache says HIT) = (correct + missed) / N
+- **reuse_precision** = P(true semantic reuse | cache says HIT)
+                          = correct / (correct + missed)
+
+With those definitions, the multilingual result at 384-d becomes:
+
+| epsilon | reps | reuse_rate | reuse_precision | us/op |
+|--------:|-----:|-----------:|----------------:|------:|
+|    0.30 |   35 |     0.4375 |        **1.0000** |  7.72 |
+|    0.45 |   16 |     0.6667 |        **1.0000** |  3.61 |
+|    0.55 |    9 |     0.8125 |        **1.0000** |  2.15 |
+|    0.70 |    9 |     0.8125 |        0.9487 |  2.10 |
+|    0.80 |    6 |     0.8750 |        0.8810 |  1.47 |
+|    0.90 |    3 |     0.9375 |        0.8667 |  0.92 |
+
+At `epsilon=0.55` the cache holds 9 representatives, achieves 81.25%
+reuse rate, and has **100% reuse precision** — every HIT is a true
+semantic match. Above `epsilon` of about 0.6 the cache starts merging
+cross-topic points, and precision drops.
+
+### Cacheability: FUTCache as a measuring instrument
+
+The interesting fact is that the cache does not invent the geometry —
+it reports it. `scripts/cacheability.py` reads the binary and computes,
+independently of any cache invocation:
+
+- `d_max_within[d]`: maximum within-topic cosine distance at dimension d
+- `d_min_cross[d]`: minimum cross-topic cosine distance at dimension d
+- `margin[d] = d_min_cross - d_max_within`
+- `D_cache[d]` via regression of log M(ε) vs log ε in the scaling regime
+
+Discriminative margin on the multilingual corpus:
+
+| dim | d_max_within | d_min_cross | margin     | interpretation                |
+|----:|-------------:|------------:|-----------:|-------------------------------|
+|  64 |        0.629 |       0.361 |     -0.268 | no global ε separates topics  |
+| 128 |        0.597 |       0.449 |     -0.148 | no global ε separates topics  |
+| 256 |        0.681 |       0.469 |     -0.211 | no global ε separates topics  |
+| 384 |        0.715 |       0.503 |     -0.212 | no global ε separates topics  |
+
+The margin is *negative* at every truncation, which means **no single
+cosine threshold cleanly separates the eight topics in this corpus**.
+The cache works as well as it does because the sequential insertion
+order builds one cluster at a time: as each topic's first point enters,
+it becomes the seed representative before any cross-topic point can
+challenge it. The cache exploits *insertion dynamics*, not a clean
+margin.
+
+Empirical `D_cache` via log-log regression of M(ε):
+
+| dim | D_cache | n_used | interpretation                                |
+|----:|--------:|-------:|-----------------------------------------------|
+|  64 |   1.14  |     12 | multilingual: ~1 bit of distinguishing structure per topic cluster |
+| 128 |   0.96  |     11 | multilingual: same                          |
+| 256 |   1.06  |     12 | multilingual: same                          |
+| 384 |   1.02  |     12 | multilingual: same                          |
+
+For the English-only corpus, `D_cache` is slightly lower (0.7-0.9) and
+*decreases* with dimension: higher-d embeddings give a lower packing
+exponent, meaning more separable structure per bit of memory.
+
+This reframes FUTCache as a *diagnostic tool for embedding models*. A
+good retrieval embedding is not automatically a good caching embedding.
+Caching needs clusters whose within-topic spread is genuinely tighter
+than the gap to the nearest cross-topic cluster. The discriminative
+margin and empirical `D_cache` are the two numbers a practitioner
+should look at to decide whether a given model + corpus is cacheable
+at all, and at what threshold.
+
 ## Exact n-d `L_inf` box cache
 
 Include `<futcache/box.h>` when the exact full-history predicate is required
