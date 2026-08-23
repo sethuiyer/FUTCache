@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 #define FUTCACHE_VERSION_MAJOR 1
-#define FUTCACHE_VERSION_MINOR 1
+#define FUTCACHE_VERSION_MINOR 2
 #define FUTCACHE_VERSION_PATCH 0
 
 typedef enum futcache_status {

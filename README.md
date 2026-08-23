@@ -5,8 +5,9 @@
 </p>
 
 FUTCache is a C11 implementation of future-equivalence caching for metric
-novelty. It stores what future novelty queries can observe, rather than storing
-the observation history or evicting recent items.
+novelty. It stores what future novelty queries can observe rather than storing
+the observation history. The packing engine can additionally enforce a hard
+byte ceiling with deterministic oldest-first pressure eviction.
 
 For a bounded one-dimensional metric domain `K=[a,b]` and resolution
 `epsilon`, the exact query is
@@ -49,6 +50,10 @@ specify fidelity (`epsilon`), and the geometry determines memory use.
   finite-dimensional metric spaces with user-supplied distance function.
   This is the natural generalization of the interval-union cache to
   dimensions where no closed-form canonical union exists.
+- Strict packing-cache allocation accounting with a configurable physical
+  byte ceiling, FIFO allocation recycling under pressure, and live/peak
+  memory telemetry.
+- Atomic, versioned, CRC32-protected packing snapshots for crash recovery.
 - An exact bounded-dimensional `L_inf` box-union cache (`<futcache/box.h>`)
   for applications that need full d-dimensional ball coverage rather than
   representative packing.
@@ -176,10 +181,25 @@ the observed `M_j`, adjacent-level multiplier, and cache-dimension estimate.
 
 Include `<futcache/pack.h>`. The packing cache generalizes the interval-union
 to arbitrary finite-dimensional metric spaces with a user-supplied distance.
-Its state is a maximal `epsilon`-separated set of representatives. Novelty
-is `d(x, R) > epsilon`; an observation within `epsilon` of an existing
-representative is redundant and the state is unchanged. Representative
-count is bounded by the packing number `P(K, epsilon)`.
+Without a hard byte ceiling, its state is a maximal `epsilon`-separated set of
+representatives for the observed stream. Novelty is `d(x, R) > epsilon`; an
+observation within `epsilon` of an existing representative is redundant and
+the state is unchanged. Representative count is bounded by the packing number
+`P(K, epsilon)`.
+
+For deployments with a smaller operational budget, set
+`futcache_pack_config_t.max_memory_bytes`. Every live allocation requested by
+the cache—including VP-tree nodes and rebuild scratch—is charged to this hard
+ceiling. When another representative would cross it, the oldest
+representative allocation is recycled in place. This can forget coverage and
+therefore cause extra misses, but it cannot produce a false hit. Stats expose
+`memory_bytes`, `peak_memory_bytes`, `memory_limit_bytes`, and `evictions`.
+
+`futcache_pack_serialize` and `futcache_pack_deserialize` checkpoint and
+recover the complete representative state, parameters, pressure limit, and
+telemetry. Snapshots are little-endian, versioned, strictly framed, and CRC32
+protected. Built-in VP-tree state is reconstructed from representatives; it
+is not persisted as pointer-rich derived state.
 
 This is the cache that addresses the *geometric* novelty question for RAG
 embeddings, sensor fusion, time-series anomaly detection, and intrinsic
@@ -204,7 +224,7 @@ cache (`<futcache/pack.h>`) answer different questions:
 | Distance             | Euclidean on reals      | user-supplied                |
 | State                | sorted disjoint 1D intervals | representative points   |
 | Novelty predicate    | exact match             | representative match         |
-| Memory bound         | `P(K, epsilon)`         | `P(K, epsilon)`              |
+| Memory bound         | `P(K, epsilon)`         | `P(K, epsilon)` or hard bytes |
 | Use case             | 1D metric novelty       | RAG, embeddings, multi-d     |
 
 `futcache_nd_dedup` exercises the packing cache on uniform random streams
@@ -423,7 +443,7 @@ else:
 
 The wrapper exposes:
 
-- `PackCache(dimension, epsilon, distance, domain_min, domain_max)`
+- `PackCache(dimension, epsilon, distance, domain_min, domain_max, backend, max_memory_bytes)`
 - `cache.observe(point, payload=None) -> NoveltyResult`
 - `cache.query(point) -> NoveltyResult`
 - `cache.get_payload(representative_id) -> bytes | None`
@@ -431,15 +451,19 @@ The wrapper exposes:
 - `cache.copy_representatives() -> numpy.ndarray` of shape `(N, dimension)`
 - `cache.clear()`
 - `len(cache)`, `cache.peak_count()`, `cache.memory_bytes()`,
-  `cache.observations()`, `cache.novel_observations()`
-- `PackCache.version() -> "1.1.0"`
+  `cache.peak_memory_bytes()`, `cache.memory_limit_bytes()`,
+  `cache.evictions()`, `cache.observations()`, `cache.novel_observations()`
+- `PackCache.version() -> "1.2.0"`
 
 Supported distance names: `"linf"` (default), `"l1"`, `"l2"`, `"cosine"`.
 
 On a semantic HIT, `NoveltyResult.representative_id` is the slot index to
 pass to `get_payload()`, and `NoveltyResult.distance` is the distance to the
 nearest representative (a HIT has `distance <= epsilon`). On a novel
-observation `representative_id` is `-1` and `distance` is `0.0`.
+observation `representative_id` names the newly inserted slot and `distance`
+is `0.0`; only a novel non-mutating query returns `-1`. Under pressure, FIFO
+eviction shifts older slot ids down by one and the Python wrapper shifts or
+drops their payload entries in the same operation.
 
 ## Empirical comparison vs LRU
 
@@ -510,25 +534,27 @@ callbacks, return memory suitably aligned for any C object, and be safe for the
 threads that call the cache.
 
 Snapshot size-query/copy pairs can race with writers; if the state grows between
-calls, `futcache_copy_intervals` returns `FUTCACHE_ERROR_BUFFER_TOO_SMALL` and
-the new required count. Serialization itself always captures one atomic
-snapshot.
+calls, copy or serialize returns `FUTCACHE_ERROR_BUFFER_TOO_SMALL` and the new
+required size/count. Serialization itself always captures one atomic snapshot.
 
 ## Persistence guarantees
 
-The serialized representation has a fixed magic value, format version, explicit
-little-endian integers and IEEE-754 binary64 values, canonical sorted intervals,
-and a trailing CRC32. Deserialization rejects truncated, extended,
-non-canonical, out-of-domain, non-finite, or checksum-invalid input. Platforms
-without IEEE-754 binary64 report `FUTCACHE_ERROR_UNSUPPORTED_PLATFORM`.
+Both serialized representations have fixed magic values, format versions,
+explicit little-endian integers and IEEE-754 binary64 values, strict framing,
+and trailing CRC32 checksums. Deserialization rejects truncated, extended,
+out-of-domain, non-finite, structurally invalid, or checksum-invalid input.
+Platforms without IEEE-754 binary64 report
+`FUTCACHE_ERROR_UNSUPPORTED_PLATFORM`.
 
-The binary format is documented in [docs/serialization.md](docs/serialization.md).
+The interval and packing formats are documented in
+[docs/serialization.md](docs/serialization.md) and
+[docs/pack-serialization.md](docs/pack-serialization.md).
 The adversarial build, sanitizer, differential, concurrency, and scaling results
 are recorded in [docs/verification.md](docs/verification.md).
 
 ## Phase 2: distributed semantic cache
 
-The v1.1 design covers the single-node cache. Phase 2 formalises a
+The v1.x design covers the single-node cache. Phase 2 formalises a
 **distributed semantic cache** whose replicas converge without
 coordination, by replacing the order-dependent greedy packing with a
 fixed geometric Voronoi quotient. The full treatment — the

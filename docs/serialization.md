@@ -1,4 +1,7 @@
-# FUTCache snapshot format, version 1
+# Interval-cache snapshot format, version 1
+
+The packing engine has its own format, documented in
+[pack-serialization.md](pack-serialization.md).
 
 All multi-byte fields are little-endian. Floating-point fields are IEEE-754
 binary64 bit patterns. Offsets are bytes from the start of the snapshot.

@@ -63,7 +63,9 @@ class PackCache:
 
     Payloads (LLM responses, retrieval results, etc.) are stored in a
     Python dict keyed by representative slot index. The C cache itself
-    manages only novelty state.
+    manages only novelty state. With a memory limit, ids may shift after a
+    novel observation triggers FIFO eviction; the wrapper shifts payloads in
+    the same operation, so treat an id as valid only until the next mutation.
 
     Typical RAG-cache use:
 
@@ -89,6 +91,10 @@ class PackCache:
             uses an exact scapegoat VP-tree with triangle-inequality
             pruning (logarithmic inserts, exact queries) — identical
             novelty semantics, faster at large representative counts.
+        max_memory_bytes: hard bound for all live native allocations owned by
+            this cache. Zero (default) is unlimited. At the bound, the oldest
+            representative and its payload are evicted and its native
+            allocation is recycled without exceeding the ceiling.
     """
 
     def __init__(self,
@@ -97,7 +103,10 @@ class PackCache:
                  distance: str = "linf",
                  domain_min=None,
                  domain_max=None,
-                 backend: str = "linear") -> None:
+                 backend: str = "linear",
+                 max_memory_bytes: int = 0) -> None:
+        if not isinstance(max_memory_bytes, int) or max_memory_bytes < 0:
+            raise ValueError("max_memory_bytes must be a non-negative integer")
         lo, hi = _broadcast_domain(dimension, domain_min, domain_max)
         self._dimension = dimension
         self._impl = _PackCacheRaw(
@@ -107,6 +116,7 @@ class PackCache:
             domain_min=lo,
             domain_max=hi,
             backend=backend,
+            max_memory_bytes=max_memory_bytes,
         )
 
     def query(self, point) -> NoveltyResult:
@@ -161,6 +171,7 @@ class PackCache:
             f"peak={self.peak_count()}, "
             f"observations={self.observations()}, "
             f"novel={self.novel_observations()}, "
+            f"evictions={self.evictions()}, "
             f"memory_bytes={self.memory_bytes()})"
         )
 
@@ -179,6 +190,15 @@ class PackCache:
 
     def novel_observations(self) -> int:
         return self._impl.novel_observations()
+
+    def evictions(self) -> int:
+        return self._impl.evictions()
+
+    def peak_memory_bytes(self) -> int:
+        return self._impl.peak_memory_bytes()
+
+    def memory_limit_bytes(self) -> int:
+        return self._impl.memory_limit_bytes()
 
     def copy_representatives(self):
         """Return a (N, dimension) numpy ndarray of current reps."""

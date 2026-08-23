@@ -18,21 +18,26 @@ mapped once at the finest level and shifted to every ancestor, making refinement
 compatibility structural rather than dependent on repeated floating-point
 rounding.
 
-Core snapshots use an explicit little-endian binary format with IEEE-754
-binary64 fields and CRC32. The parser checks framing, overflow, checksum,
-configuration, telemetry relations, interval bounds/order/canonicality, and AVL
-invariants. Both objects support custom allocation and linearizable public
-operations; destruction requires external quiescence.
+Interval and packing snapshots use explicit little-endian binary formats with
+IEEE-754 binary64 fields and CRC32. Their parsers check framing, overflow,
+checksum, configuration, telemetry relations, bounds, and structural
+invariants. The packing engine additionally wraps every child/backend
+allocation with exact live-byte accounting; a configured ceiling is reserved
+atomically before allocation and FIFO pressure eviction recycles a fixed-size
+representative without a transient memory spike. Objects support custom
+allocation and linearizable public operations; destruction requires external
+quiescence.
 
 ## B. Build matrix
 
 | Configuration | Result | Warnings/findings |
 |---|---|---|
-| GCC Debug, static, strongest project warnings, `-Werror` | 55 tests pass | none |
-| GCC Release, shared, strongest project warnings, `-Werror` | 55 tests pass | none |
-| GCC ASan + UBSan, Debug | 55 tests pass | none; leak detector disabled as noted below |
-| GCC TSan, Debug, non-PIE plus ASLR-disabled environment workaround | 55 tests pass | no races or lock findings |
+| GCC Debug, static, strongest project warnings, `-Werror` | 69 tests pass | none |
+| GCC Release, shared, strongest project warnings, `-Werror` | 69 tests pass | none |
+| GCC ASan + UBSan, Debug | 69 tests pass | none; leak detector disabled as noted below |
+| GCC TSan, Debug | startup blocked | managed host rejected TSan shadow mapping before tests (`unexpected memory mapping`) |
 | Release examples and benchmarks, `-Werror` | build and run | RAG, n-d packing, LRU comparison clean |
+| Python/nanobind extension | build + bounded payload smoke pass | FIFO eviction shifts payload ids correctly |
 | GCC `-fanalyzer` | library builds | no analyzer findings |
 | Installed shared package + external `find_package` consumer | builds and runs | none |
 | Clang | not run | compiler is not installed on this host |
@@ -69,12 +74,14 @@ This is a verification limitation, not an observed leak.
   novelty implication, adjacent projection, and composed projection match
   independent arrays and arithmetic. A focused two-level test checks the exact
   discovery-word identity `q_(1,0)(D_1(L)) = D_0(L)` element by element.
-- The packing cache has twelve tests covering configurable metrics, Voronoi
-  representative separation, query purity, allocator failure, concurrency,
-  the pluggable nearest-neighbour backend lifecycle, and the nearest-site
-  id/distance lookup (`futcache_pack_nearest`). Approximate backend
-  semantics are explicitly one-sided: over-estimation may report extra
-  novelty, but must not suppress a genuinely novel point.
+- The packing cache has eighteen core tests plus eight VP-tree tests covering
+  configurable metrics, representative separation, query purity, allocator
+  failure, concurrency, backend lifecycle, nearest-site ids/distances, exact
+  byte-ceiling enforcement, FIFO recycling, bounded VP-tree fallback, and
+  concurrent snapshot/recovery during writes. Every byte mutation, every
+  truncation, and trailing data are rejected for a representative snapshot.
+  An independent counting allocator confirms that both live and transient
+  bytes requested upstream remain at or below the configured ceiling.
 - The exact `L_inf` box cache has five tests covering bounded 2D/3D unions,
   clipping, domain errors, query purity, clear semantics, allocation
   failure atomicity, and lifecycle-telemetry/containment validation. Its
@@ -96,7 +103,9 @@ This is a verification limitation, not an observed leak.
   estimated (lower-bound) radius, which the tests assert never exceeds the
   certified grid radius for the same resolution.
 - Concurrent observations, queries, serialization/restoration, tower reads,
-  and tower writes remain valid under TSan.
+  and tower writes pass deterministic stress tests in Debug, Release, and the
+  ASan/UBSan build. TSan runtime coverage was unavailable on this host as
+  recorded in the build matrix.
 
 ## D. Bugs found and fixed
 
@@ -153,8 +162,12 @@ endpoints, subnormals, and ULP-neighbor boundary values.
 - Exact cache: four writers x 2,000 operations.
 - Snapshot stress: two writers x 3,000 operations concurrent with two snapshot
   readers x 500 serialize/restore/validate cycles.
+- Bounded packing snapshot stress: two writers x 2,000 operations concurrent
+  with two readers x 200 serialize/restore/validate cycles, with a hard
+  eight-representative allocation ceiling.
 - Tower: four writers and four readers x 1,000 operations.
-- TSan result: clean with `halt_on_error=1`.
+- TSan result: binary builds; runtime aborts before `main` because the managed
+  host cannot reserve TSan's shadow mapping.
 - Deadlocks: none observed.
 - Linearizability argument: each public operation has one object-level read or
   write critical section; outputs are copied only from state held under that

@@ -3,10 +3,38 @@
 #include "futcache/pack.h"
 #include "futcache/futcache.h"
 
+#include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+
+enum {
+    FUTCACHE_PACK_SERIAL_HEADER_SIZE = 104,
+    FUTCACHE_PACK_SERIAL_CRC_SIZE = 4,
+    FUTCACHE_PACK_SERIAL_VERSION = 1,
+    FUTCACHE_PACK_DISTANCE_LINF = 1,
+    FUTCACHE_PACK_DISTANCE_L1 = 2,
+    FUTCACHE_PACK_DISTANCE_L2 = 3,
+    FUTCACHE_PACK_DISTANCE_COSINE = 4,
+    FUTCACHE_PACK_BACKEND_LINEAR = 0,
+    FUTCACHE_PACK_BACKEND_VPTREE = 1
+};
+
+static const uint8_t futcache_pack_serial_magic[8] = {
+    (uint8_t)'F', (uint8_t)'U', (uint8_t)'T', (uint8_t)'P',
+    (uint8_t)'A', (uint8_t)'C', (uint8_t)'K', UINT8_C(0)
+};
+
+/* Prefix every child allocation so exact live-byte accounting is possible
+ * even with a caller-supplied allocator.  The union preserves max_align_t
+ * alignment for the returned payload. */
+typedef union pack_allocation_header {
+    max_align_t alignment;
+    size_t total_bytes;
+} pack_allocation_header_t;
 
 /* ============================================================
  * Default allocator (matches futcache.c pattern)
@@ -114,6 +142,7 @@ double futcache_distance_cosine(const double *a, const double *b,
  * ============================================================ */
 
 typedef struct pack_representative {
+    struct pack_representative *next;
     size_t dimension;
     double coordinates[];  /* [dimension] */
 } pack_representative_t;
@@ -132,11 +161,16 @@ static pack_representative_t *make_representative(
     const double *point,
     size_t dimension)
 {
+    if (dimension > (SIZE_MAX - sizeof(pack_representative_t)) /
+                        sizeof(double)) {
+        return NULL;
+    }
     size_t bytes = sizeof(pack_representative_t) +
                    dimension * sizeof(double);
     pack_representative_t *rep =
         (pack_representative_t *)allocator->allocate(allocator->context, bytes);
     if (rep == NULL) return NULL;
+    rep->next = NULL;
     rep->dimension = dimension;
     memcpy(rep->coordinates, point, dimension * sizeof(double));
     return rep;
@@ -159,19 +193,24 @@ struct futcache_pack {
     double epsilon;
     futcache_distance_fn distance;
     void *distance_context;
+    /* owner_allocator owns this object; allocator is the accounting wrapper
+     * used for every child/backend allocation. */
+    futcache_allocator_t owner_allocator;
     futcache_allocator_t allocator;
     const futcache_pack_backend_ops_t *backend;
     void *backend_context;
     void *backend_state;
+    bool backend_active;
 
     /* Domain bounds. Copied at create time, freed at destroy. */
     double *domain_min;
     double *domain_max;
 
-    /* Representative storage: array of pointers to variable-size structs. */
-    pack_representative_t **representatives;
+    /* FIFO-linked representatives.  Recycling head under pressure avoids a
+     * transient allocation above the configured hard ceiling. */
+    pack_representative_t *representatives;
+    pack_representative_t *representatives_tail;
     size_t count;
-    size_t capacity;
     size_t peak_count;
 
     pthread_rwlock_t lock;
@@ -179,7 +218,237 @@ struct futcache_pack {
     uint64_t observations;
     uint64_t novel_observations;
     uint64_t generation;
+    uint64_t evictions;
+
+    size_t memory_limit_bytes;
+    atomic_size_t memory_bytes;
+    atomic_size_t peak_memory_bytes;
 };
+
+/* ============================================================
+ * Hard-limit allocation accounting
+ * ============================================================ */
+
+static bool allocation_total_size(size_t payload_bytes, size_t *out_total)
+{
+    if (out_total == NULL ||
+        payload_bytes > SIZE_MAX - sizeof(pack_allocation_header_t)) {
+        return false;
+    }
+    *out_total = sizeof(pack_allocation_header_t) + payload_bytes;
+    return true;
+}
+
+static bool reserve_allocation_bytes(futcache_pack_t *cache, size_t bytes)
+{
+    size_t current = atomic_load_explicit(&cache->memory_bytes,
+                                          memory_order_relaxed);
+    for (;;) {
+        if (current > SIZE_MAX - bytes) return false;
+        size_t next = current + bytes;
+        if (cache->memory_limit_bytes != 0U &&
+            next > cache->memory_limit_bytes) {
+            return false;
+        }
+        if (atomic_compare_exchange_weak_explicit(
+                &cache->memory_bytes, &current, next,
+                memory_order_acq_rel, memory_order_relaxed)) {
+            return true;
+        }
+    }
+}
+
+static void update_peak_memory(futcache_pack_t *cache)
+{
+    size_t current = atomic_load_explicit(&cache->memory_bytes,
+                                          memory_order_relaxed);
+    size_t peak = atomic_load_explicit(&cache->peak_memory_bytes,
+                                       memory_order_relaxed);
+    while (peak < current &&
+           !atomic_compare_exchange_weak_explicit(
+               &cache->peak_memory_bytes, &peak, current,
+               memory_order_relaxed, memory_order_relaxed)) {
+        /* compare_exchange refreshes peak */
+    }
+}
+
+static void *tracked_allocate(void *context, size_t size)
+{
+    futcache_pack_t *cache = (futcache_pack_t *)context;
+    pack_allocation_header_t *header;
+    size_t total;
+
+    if (cache == NULL || !allocation_total_size(size, &total) ||
+        !reserve_allocation_bytes(cache, total)) {
+        return NULL;
+    }
+    header = (pack_allocation_header_t *)cache->owner_allocator.allocate(
+        cache->owner_allocator.context, total);
+    if (header == NULL) {
+        (void)atomic_fetch_sub_explicit(&cache->memory_bytes, total,
+                                        memory_order_acq_rel);
+        return NULL;
+    }
+    header->total_bytes = total;
+    update_peak_memory(cache);
+    return (void *)(header + 1);
+}
+
+static void tracked_deallocate(void *context, void *pointer)
+{
+    futcache_pack_t *cache = (futcache_pack_t *)context;
+    pack_allocation_header_t *header;
+    size_t total;
+
+    if (cache == NULL || pointer == NULL) return;
+    header = ((pack_allocation_header_t *)pointer) - 1;
+    total = header->total_bytes;
+    cache->owner_allocator.deallocate(cache->owner_allocator.context, header);
+    (void)atomic_fetch_sub_explicit(&cache->memory_bytes, total,
+                                    memory_order_acq_rel);
+}
+
+static bool tracked_allocation_fits(const futcache_pack_t *cache,
+                                    size_t payload_bytes)
+{
+    size_t total;
+    size_t current;
+    if (!allocation_total_size(payload_bytes, &total)) return false;
+    current = atomic_load_explicit(&cache->memory_bytes, memory_order_relaxed);
+    if (current > SIZE_MAX - total) return false;
+    return cache->memory_limit_bytes == 0U ||
+           current + total <= cache->memory_limit_bytes;
+}
+
+/* ============================================================
+ * Snapshot encoding helpers
+ * ============================================================ */
+
+static bool pack_double_serialization_supported(void)
+{
+    return CHAR_BIT == 8 && sizeof(double) == sizeof(uint64_t) &&
+        FLT_RADIX == 2 && DBL_MANT_DIG == 53 && DBL_MAX_EXP == 1024;
+}
+
+static void pack_write_u16_le(uint8_t *destination, uint16_t value)
+{
+    destination[0] = (uint8_t)(value & UINT16_C(0xff));
+    destination[1] = (uint8_t)((value >> 8U) & UINT16_C(0xff));
+}
+
+static void pack_write_u32_le(uint8_t *destination, uint32_t value)
+{
+    for (size_t i = 0U; i < 4U; ++i) {
+        destination[i] = (uint8_t)((value >> (i * 8U)) & UINT32_C(0xff));
+    }
+}
+
+static void pack_write_u64_le(uint8_t *destination, uint64_t value)
+{
+    for (size_t i = 0U; i < 8U; ++i) {
+        destination[i] = (uint8_t)((value >> (i * 8U)) & UINT64_C(0xff));
+    }
+}
+
+static uint16_t pack_read_u16_le(const uint8_t *source)
+{
+    return (uint16_t)((uint16_t)source[0] |
+                      ((uint16_t)source[1] << 8U));
+}
+
+static uint32_t pack_read_u32_le(const uint8_t *source)
+{
+    uint32_t value = UINT32_C(0);
+    for (size_t i = 0U; i < 4U; ++i) {
+        value |= (uint32_t)source[i] << (i * 8U);
+    }
+    return value;
+}
+
+static uint64_t pack_read_u64_le(const uint8_t *source)
+{
+    uint64_t value = UINT64_C(0);
+    for (size_t i = 0U; i < 8U; ++i) {
+        value |= (uint64_t)source[i] << (i * 8U);
+    }
+    return value;
+}
+
+static void pack_write_double_le(uint8_t *destination, double value)
+{
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    pack_write_u64_le(destination, bits);
+}
+
+static double pack_read_double_le(const uint8_t *source)
+{
+    uint64_t bits = pack_read_u64_le(source);
+    double value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static uint32_t pack_crc32_bytes(const uint8_t *data, size_t size)
+{
+    uint32_t crc = UINT32_C(0xffffffff);
+    for (size_t i = 0U; i < size; ++i) {
+        crc ^= (uint32_t)data[i];
+        for (unsigned int bit = 0U; bit < 8U; ++bit) {
+            uint32_t mask = (uint32_t)(-(int32_t)(crc & UINT32_C(1)));
+            crc = (crc >> 1U) ^ (UINT32_C(0xedb88320) & mask);
+        }
+    }
+    return ~crc;
+}
+
+static uint32_t pack_distance_identifier(futcache_distance_fn distance)
+{
+    if (distance == futcache_distance_linf) return FUTCACHE_PACK_DISTANCE_LINF;
+    if (distance == futcache_distance_l1) return FUTCACHE_PACK_DISTANCE_L1;
+    if (distance == futcache_distance_l2) return FUTCACHE_PACK_DISTANCE_L2;
+    if (distance == futcache_distance_cosine) {
+        return FUTCACHE_PACK_DISTANCE_COSINE;
+    }
+    return UINT32_C(0);
+}
+
+static futcache_distance_fn pack_distance_from_identifier(uint32_t identifier)
+{
+    switch (identifier) {
+    case FUTCACHE_PACK_DISTANCE_LINF:
+        return futcache_distance_linf;
+    case FUTCACHE_PACK_DISTANCE_L1:
+        return futcache_distance_l1;
+    case FUTCACHE_PACK_DISTANCE_L2:
+        return futcache_distance_l2;
+    case FUTCACHE_PACK_DISTANCE_COSINE:
+        return futcache_distance_cosine;
+    default:
+        return NULL;
+    }
+}
+
+static bool pack_snapshot_size(size_t dimension, size_t count,
+                               size_t *out_size)
+{
+    size_t vector_bytes;
+    size_t vector_count;
+    size_t fixed = FUTCACHE_PACK_SERIAL_HEADER_SIZE +
+                   FUTCACHE_PACK_SERIAL_CRC_SIZE;
+    if (out_size == NULL || dimension > SIZE_MAX / sizeof(double) ||
+        count > SIZE_MAX - 2U) {
+        return false;
+    }
+    vector_bytes = dimension * sizeof(double);
+    vector_count = count + 2U;
+    if (vector_bytes != 0U &&
+        vector_count > (SIZE_MAX - fixed) / vector_bytes) {
+        return false;
+    }
+    *out_size = fixed + vector_count * vector_bytes;
+    return true;
+}
 
 /* ============================================================
  * Public API
@@ -197,12 +466,17 @@ void futcache_pack_config_init(futcache_pack_config_t *config)
     config->domain_max = NULL;
     config->backend = NULL;
     config->backend_context = NULL;
+    config->max_memory_bytes = 0U;
 }
 
 static bool valid_config(const futcache_pack_config_t *config)
 {
     if (config->dimension == 0) return false;
-    if (!(config->epsilon >= 0.0)) return false;  /* reject NaN and negative */
+    if (!isfinite(config->epsilon) || config->epsilon < 0.0) return false;
+    if (config->dimension >
+        (SIZE_MAX - sizeof(pack_representative_t)) / sizeof(double)) {
+        return false;
+    }
     if (config->domain_min == NULL) return false;
     if (config->domain_max == NULL) return false;
     for (size_t i = 0; i < config->dimension; ++i) {
@@ -220,6 +494,7 @@ futcache_status_t futcache_pack_create(
     if (config == NULL || out_cache == NULL) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
+    *out_cache = NULL;
     if (!valid_config(config)) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
@@ -234,6 +509,25 @@ futcache_status_t futcache_pack_create(
     futcache_status_t st = normalize_allocator(&config->allocator, &allocator);
     if (st != FUTCACHE_OK) return st;
 
+    size_t bounds_bytes = config->dimension * sizeof(double);
+    size_t domain_allocation_bytes;
+    size_t representative_allocation_bytes;
+    if (!allocation_total_size(bounds_bytes, &domain_allocation_bytes) ||
+        !allocation_total_size(sizeof(pack_representative_t) + bounds_bytes,
+                               &representative_allocation_bytes) ||
+        domain_allocation_bytes >
+            (SIZE_MAX - sizeof(futcache_pack_t)) / 2U ||
+        sizeof(futcache_pack_t) + 2U * domain_allocation_bytes >
+            SIZE_MAX - representative_allocation_bytes) {
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+    size_t minimum_useful_bytes = sizeof(futcache_pack_t) +
+        2U * domain_allocation_bytes + representative_allocation_bytes;
+    if (config->max_memory_bytes != 0U &&
+        config->max_memory_bytes < minimum_useful_bytes) {
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+
     futcache_pack_t *cache = (futcache_pack_t *)allocator.allocate(
         allocator.context, sizeof(*cache));
     if (cache == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
@@ -245,19 +539,29 @@ futcache_status_t futcache_pack_create(
                           ? config->distance
                           : futcache_distance_linf;
     cache->distance_context = config->distance_context;
-    cache->allocator = allocator;
+    cache->owner_allocator = allocator;
+    cache->allocator.allocate = tracked_allocate;
+    cache->allocator.deallocate = tracked_deallocate;
+    cache->allocator.context = cache;
     cache->backend = config->backend;
     cache->backend_context = config->backend_context;
+    cache->backend_active = false;
+    cache->memory_limit_bytes = config->max_memory_bytes;
+    atomic_init(&cache->memory_bytes, sizeof(*cache));
+    atomic_init(&cache->peak_memory_bytes, sizeof(*cache));
 
     /* Copy domain bounds so the caller may free the source arrays. */
-    size_t bounds_bytes = config->dimension * sizeof(double);
-    cache->domain_min = (double *)allocator.allocate(allocator.context, bounds_bytes);
-    cache->domain_max = (double *)allocator.allocate(allocator.context, bounds_bytes);
+    cache->domain_min = (double *)cache->allocator.allocate(
+        cache->allocator.context, bounds_bytes);
+    cache->domain_max = (double *)cache->allocator.allocate(
+        cache->allocator.context, bounds_bytes);
     if (cache->domain_min == NULL || cache->domain_max == NULL) {
         if (cache->domain_min != NULL)
-            allocator.deallocate(allocator.context, cache->domain_min);
+            cache->allocator.deallocate(cache->allocator.context,
+                                        cache->domain_min);
         if (cache->domain_max != NULL)
-            allocator.deallocate(allocator.context, cache->domain_max);
+            cache->allocator.deallocate(cache->allocator.context,
+                                        cache->domain_max);
         allocator.deallocate(allocator.context, cache);
         return FUTCACHE_ERROR_OUT_OF_MEMORY;
     }
@@ -265,13 +569,15 @@ futcache_status_t futcache_pack_create(
     memcpy(cache->domain_max, config->domain_max, bounds_bytes);
 
     cache->representatives = NULL;
+    cache->representatives_tail = NULL;
     cache->count = 0;
-    cache->capacity = 0;
     cache->peak_count = 0;
 
     if (pthread_rwlock_init(&cache->lock, NULL) != 0) {
-        allocator.deallocate(allocator.context, cache->domain_max);
-        allocator.deallocate(allocator.context, cache->domain_min);
+        cache->allocator.deallocate(cache->allocator.context,
+                                    cache->domain_max);
+        cache->allocator.deallocate(cache->allocator.context,
+                                    cache->domain_min);
         allocator.deallocate(allocator.context, cache);
         return FUTCACHE_ERROR_SYSTEM;
     }
@@ -282,11 +588,14 @@ futcache_status_t futcache_pack_create(
                                     &cache->allocator, cache->backend_context);
         if (st != FUTCACHE_OK) {
             pthread_rwlock_destroy(&cache->lock);
-            allocator.deallocate(allocator.context, cache->domain_max);
-            allocator.deallocate(allocator.context, cache->domain_min);
+            cache->allocator.deallocate(cache->allocator.context,
+                                        cache->domain_max);
+            cache->allocator.deallocate(cache->allocator.context,
+                                        cache->domain_min);
             allocator.deallocate(allocator.context, cache);
             return st;
         }
+        cache->backend_active = true;
     }
 
     *out_cache = cache;
@@ -295,9 +604,14 @@ futcache_status_t futcache_pack_create(
 
 static void free_all_representatives(futcache_pack_t *cache)
 {
-    for (size_t i = 0; i < cache->count; ++i) {
-        free_representative(&cache->allocator, cache->representatives[i]);
+    pack_representative_t *representative = cache->representatives;
+    while (representative != NULL) {
+        pack_representative_t *next = representative->next;
+        free_representative(&cache->allocator, representative);
+        representative = next;
     }
+    cache->representatives = NULL;
+    cache->representatives_tail = NULL;
     cache->count = 0;
 }
 
@@ -306,13 +620,9 @@ void futcache_pack_destroy(futcache_pack_t *cache)
     if (cache == NULL) return;
     /* Caller guarantees quiescence per header. */
     free_all_representatives(cache);
-    if (cache->backend != NULL) {
+    if (cache->backend_active) {
         cache->backend->destroy(cache->backend_state, &cache->allocator,
                                 cache->backend_context);
-    }
-    if (cache->representatives != NULL) {
-        cache->allocator.deallocate(cache->allocator.context,
-                                     cache->representatives);
     }
     if (cache->domain_min != NULL) {
         cache->allocator.deallocate(cache->allocator.context, cache->domain_min);
@@ -321,12 +631,13 @@ void futcache_pack_destroy(futcache_pack_t *cache)
         cache->allocator.deallocate(cache->allocator.context, cache->domain_max);
     }
     pthread_rwlock_destroy(&cache->lock);
-    cache->allocator.deallocate(cache->allocator.context, cache);
+    cache->owner_allocator.deallocate(cache->owner_allocator.context, cache);
 }
 
 static bool point_in_domain(const futcache_pack_t *cache, const double *point)
 {
     for (size_t i = 0; i < cache->dimension; ++i) {
+        if (!isfinite(point[i])) return false;
         if (point[i] < cache->domain_min[i]) return false;
         if (point[i] > cache->domain_max[i]) return false;
     }
@@ -337,13 +648,14 @@ static double min_distance_to_set(const futcache_pack_t *cache,
                                    const double *point)
 {
     double min_d = INFINITY;
-    pack_representative_t *const *reps = cache->representatives;
+    const pack_representative_t *representative = cache->representatives;
     futcache_distance_fn distance = cache->distance;
     void *context = cache->distance_context;
     size_t dim = cache->dimension;
-    for (size_t i = 0; i < cache->count; ++i) {
-        double d = distance(point, reps[i]->coordinates, dim, context);
+    while (representative != NULL) {
+        double d = distance(point, representative->coordinates, dim, context);
         if (d < min_d) min_d = d;
+        representative = representative->next;
     }
     return min_d;
 }
@@ -352,7 +664,7 @@ static futcache_status_t backend_nearest(const futcache_pack_t *cache,
                                          const double *point,
                                          double *out_distance)
 {
-    if (cache->backend != NULL) {
+    if (cache->backend_active) {
         return cache->backend->nearest(cache->backend_state, point,
                                        cache->dimension, out_distance,
                                        cache->backend_context);
@@ -361,32 +673,109 @@ static futcache_status_t backend_nearest(const futcache_pack_t *cache,
     return FUTCACHE_OK;
 }
 
-static futcache_status_t grow_capacity(futcache_pack_t *cache, size_t needed)
+static void disable_backend_locked(futcache_pack_t *cache)
 {
-    if (needed <= cache->capacity) return FUTCACHE_OK;
-    size_t new_cap = cache->capacity == 0 ? 16U : cache->capacity;
-    while (new_cap < needed) {
-        if (new_cap > SIZE_MAX / 2U) {
-            new_cap = needed;
-            break;
-        }
-        new_cap *= 2U;
+    if (!cache->backend_active) return;
+    cache->backend->destroy(cache->backend_state, &cache->allocator,
+                            cache->backend_context);
+    cache->backend_state = NULL;
+    cache->backend_active = false;
+}
+
+static void link_representative_tail(futcache_pack_t *cache,
+                                     pack_representative_t *representative)
+{
+    representative->next = NULL;
+    if (cache->representatives_tail != NULL) {
+        cache->representatives_tail->next = representative;
+    } else {
+        cache->representatives = representative;
     }
-    size_t new_bytes = new_cap * sizeof(pack_representative_t *);
-    pack_representative_t **new_arr =
-        (pack_representative_t **)cache->allocator.allocate(
-            cache->allocator.context, new_bytes);
-    if (new_arr == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
-    if (cache->representatives != NULL) {
-        if (cache->count > 0) {
-            memcpy(new_arr, cache->representatives,
-                   cache->count * sizeof(pack_representative_t *));
+    cache->representatives_tail = representative;
+}
+
+static futcache_status_t append_representative_locked(
+    futcache_pack_t *cache, const double *point)
+{
+    pack_representative_t *representative = make_representative(
+        &cache->allocator, point, cache->dimension);
+    if (representative == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
+
+    if (cache->backend_active) {
+        futcache_status_t status = cache->backend->insert(
+            cache->backend_state, point, cache->dimension,
+            cache->backend_context);
+        if (status != FUTCACHE_OK) {
+            if (cache->memory_limit_bytes == 0U ||
+                status != FUTCACHE_ERROR_OUT_OF_MEMORY) {
+                free_representative(&cache->allocator, representative);
+                return status;
+            }
+            /* A bounded backend can run out of scratch space before the
+             * representative store does. The exact linear scan is a safe,
+             * allocation-free fallback. */
+            disable_backend_locked(cache);
         }
-        cache->allocator.deallocate(cache->allocator.context,
-                                     cache->representatives);
     }
-    cache->representatives = new_arr;
-    cache->capacity = new_cap;
+
+    link_representative_tail(cache, representative);
+    cache->count++;
+    if (cache->count > cache->peak_count) cache->peak_count = cache->count;
+    return FUTCACHE_OK;
+}
+
+/* Rebuild the derived backend after FIFO replacement.  Once clear succeeds,
+ * a later insert failure degrades to the exact linear scan rather than
+ * exposing a partially indexed set. */
+static futcache_status_t prepare_backend_for_eviction_locked(
+    futcache_pack_t *cache)
+{
+    if (!cache->backend_active) return FUTCACHE_OK;
+    return cache->backend->clear(cache->backend_state,
+                                 cache->backend_context);
+}
+
+static void rebuild_backend_after_eviction_locked(futcache_pack_t *cache)
+{
+    pack_representative_t *representative;
+    if (!cache->backend_active) return;
+
+    representative = cache->representatives;
+    while (representative != NULL) {
+        futcache_status_t status = cache->backend->insert(
+            cache->backend_state, representative->coordinates,
+            cache->dimension, cache->backend_context);
+        if (status != FUTCACHE_OK) {
+            disable_backend_locked(cache);
+            return;
+        }
+        representative = representative->next;
+    }
+}
+
+static futcache_status_t evict_oldest_and_replace_locked(
+    futcache_pack_t *cache, const double *point)
+{
+    pack_representative_t *oldest;
+    futcache_status_t status;
+
+    if (cache->count == 0U || cache->representatives == NULL) {
+        return FUTCACHE_ERROR_OUT_OF_MEMORY;
+    }
+
+    status = prepare_backend_for_eviction_locked(cache);
+    if (status != FUTCACHE_OK) return status;
+
+    oldest = cache->representatives;
+    if (cache->count > 1U) {
+        cache->representatives = oldest->next;
+        cache->representatives_tail->next = oldest;
+        cache->representatives_tail = oldest;
+        oldest->next = NULL;
+    }
+    memcpy(oldest->coordinates, point, cache->dimension * sizeof(double));
+    cache->evictions = increment_saturating(cache->evictions);
+    rebuild_backend_after_eviction_locked(cache);
     return FUTCACHE_OK;
 }
 
@@ -448,31 +837,29 @@ futcache_status_t futcache_pack_observe(
     }
 
     if (novel) {
-        futcache_status_t st = grow_capacity(cache, cache->count + 1U);
+        size_t representative_bytes = sizeof(pack_representative_t) +
+            cache->dimension * sizeof(double);
+        futcache_status_t st;
+
+        if (cache->memory_limit_bytes != 0U &&
+            !tracked_allocation_fits(cache, representative_bytes)) {
+            /* An empty bounded cache may be crowded only by optional backend
+             * state. Drop that derived state before declaring the configured
+             * limit unusable. */
+            if (cache->count == 0U && cache->backend_active) {
+                disable_backend_locked(cache);
+            }
+            if (tracked_allocation_fits(cache, representative_bytes)) {
+                st = append_representative_locked(cache, point);
+            } else {
+                st = evict_oldest_and_replace_locked(cache, point);
+            }
+        } else {
+            st = append_representative_locked(cache, point);
+        }
         if (st != FUTCACHE_OK) {
             pthread_rwlock_unlock(lock);
             return st;
-        }
-        pack_representative_t *rep = make_representative(
-            &cache->allocator, point, cache->dimension);
-        if (rep == NULL) {
-            pthread_rwlock_unlock(lock);
-            return FUTCACHE_ERROR_OUT_OF_MEMORY;
-        }
-        if (cache->backend != NULL) {
-            futcache_status_t backend_st = cache->backend->insert(
-                cache->backend_state, point, cache->dimension,
-                cache->backend_context);
-            if (backend_st != FUTCACHE_OK) {
-                free_representative(&cache->allocator, rep);
-                pthread_rwlock_unlock(lock);
-                return backend_st;
-            }
-        }
-        cache->representatives[cache->count] = rep;
-        cache->count++;
-        if (cache->count > cache->peak_count) {
-            cache->peak_count = cache->count;
         }
     }
 
@@ -500,16 +887,14 @@ futcache_status_t futcache_pack_get_stats(
     out_stats->observations = cache->observations;
     out_stats->novel_observations = cache->novel_observations;
     out_stats->generation = cache->generation;
+    out_stats->evictions = cache->evictions;
     out_stats->representative_count = cache->count;
     out_stats->peak_count = cache->peak_count;
-    /* Approximate memory: struct, bounds arrays, rep slots, rep coords.
-     * Excludes any allocator-internal overhead. */
-    out_stats->memory_bytes =
-        sizeof(*cache) +
-        2U * cache->dimension * sizeof(double) +
-        cache->capacity * sizeof(pack_representative_t *) +
-        cache->count * (sizeof(pack_representative_t) +
-                        cache->dimension * sizeof(double));
+    out_stats->memory_bytes = atomic_load_explicit(
+        &cache->memory_bytes, memory_order_relaxed);
+    out_stats->peak_memory_bytes = atomic_load_explicit(
+        &cache->peak_memory_bytes, memory_order_relaxed);
+    out_stats->memory_limit_bytes = cache->memory_limit_bytes;
 
     pthread_rwlock_unlock(lock);
     return FUTCACHE_OK;
@@ -541,10 +926,14 @@ futcache_status_t futcache_pack_copy_representatives(
         return FUTCACHE_ERROR_BUFFER_TOO_SMALL;
     }
 
-    for (size_t i = 0; i < cache->count; ++i) {
+    const pack_representative_t *representative = cache->representatives;
+    size_t i = 0U;
+    while (representative != NULL) {
         memcpy(out_points + i * cache->dimension,
-               cache->representatives[i]->coordinates,
+               representative->coordinates,
                cache->dimension * sizeof(double));
+        representative = representative->next;
+        ++i;
     }
 
     *inout_count = cache->count;
@@ -571,16 +960,19 @@ futcache_status_t futcache_pack_nearest(
 
     double min_d = INFINITY;
     size_t min_i = SIZE_MAX;
-    pack_representative_t *const *reps = cache->representatives;
+    const pack_representative_t *representative = cache->representatives;
     futcache_distance_fn distance = cache->distance;
     void *context = cache->distance_context;
     size_t dim = cache->dimension;
-    for (size_t i = 0; i < cache->count; ++i) {
-        double d = distance(point, reps[i]->coordinates, dim, context);
+    size_t i = 0U;
+    while (representative != NULL) {
+        double d = distance(point, representative->coordinates, dim, context);
         if (d < min_d) {
             min_d = d;
             min_i = i;
         }
+        representative = representative->next;
+        ++i;
     }
 
     pthread_rwlock_unlock(lock);
@@ -593,7 +985,7 @@ futcache_status_t futcache_pack_clear(futcache_pack_t *cache)
 {
     if (cache == NULL) return FUTCACHE_ERROR_INVALID_ARGUMENT;
     pthread_rwlock_wrlock(&cache->lock);
-    if (cache->backend != NULL) {
+    if (cache->backend_active) {
         futcache_status_t st = cache->backend->clear(
             cache->backend_state, cache->backend_context);
         if (st != FUTCACHE_OK) {
@@ -605,7 +997,11 @@ futcache_status_t futcache_pack_clear(futcache_pack_t *cache)
     cache->peak_count = 0U;
     cache->observations = 0U;
     cache->novel_observations = 0U;
+    cache->evictions = 0U;
     cache->generation = increment_saturating(cache->generation);
+    atomic_store_explicit(&cache->peak_memory_bytes,
+        atomic_load_explicit(&cache->memory_bytes, memory_order_relaxed),
+        memory_order_relaxed);
     pthread_rwlock_unlock(&cache->lock);
     return FUTCACHE_OK;
 }
@@ -618,10 +1014,29 @@ futcache_status_t futcache_pack_validate(const futcache_pack_t *cache)
     pthread_rwlock_rdlock(lock);
 
     /* Telemetry lifecycle invariants (mirror the interval engine). */
+    size_t live_memory = atomic_load_explicit(&cache->memory_bytes,
+                                               memory_order_relaxed);
+    size_t peak_memory = atomic_load_explicit(&cache->peak_memory_bytes,
+                                               memory_order_relaxed);
     if (cache->generation < cache->observations ||
         cache->novel_observations > cache->observations ||
-        cache->count != cache->novel_observations ||
-        cache->count > cache->peak_count) {
+        cache->count > (size_t)UINT64_MAX ||
+        (uint64_t)cache->count > cache->novel_observations ||
+        cache->evictions > cache->novel_observations ||
+        cache->count > cache->peak_count ||
+        live_memory > peak_memory ||
+        (cache->memory_limit_bytes != 0U &&
+         (live_memory > cache->memory_limit_bytes ||
+          peak_memory > cache->memory_limit_bytes))) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+
+    if (cache->novel_observations != UINT64_MAX &&
+        cache->evictions != UINT64_MAX &&
+        ((uint64_t)cache->count > UINT64_MAX - cache->evictions ||
+         (uint64_t)cache->count + cache->evictions !=
+             cache->novel_observations)) {
         pthread_rwlock_unlock(lock);
         return FUTCACHE_ERROR_CORRUPT_DATA;
     }
@@ -632,22 +1047,353 @@ futcache_status_t futcache_pack_validate(const futcache_pack_t *cache)
     size_t dim = cache->dimension;
     double eps = cache->epsilon;
 
-    for (size_t i = 0; i < cache->count; ++i) {
-        if (cache->representatives[i]->dimension != dim) {
+    const pack_representative_t *left = cache->representatives;
+    size_t actual_count = 0U;
+    while (left != NULL) {
+        if (left->dimension != dim || !point_in_domain(cache,
+                                                       left->coordinates)) {
             pthread_rwlock_unlock(lock);
             return FUTCACHE_ERROR_CORRUPT_DATA;
         }
-        for (size_t j = i + 1U; j < cache->count; ++j) {
-            double d = distance(cache->representatives[i]->coordinates,
-                                 cache->representatives[j]->coordinates,
-                                 dim, context);
+        const pack_representative_t *right = left->next;
+        while (right != NULL) {
+            double d = distance(left->coordinates, right->coordinates,
+                                dim, context);
             if (!(d > eps)) {  /* reject d <= eps, including NaN */
                 pthread_rwlock_unlock(lock);
                 return FUTCACHE_ERROR_CORRUPT_DATA;
             }
+            right = right->next;
         }
+        actual_count++;
+        if (actual_count > cache->count) {
+            pthread_rwlock_unlock(lock);
+            return FUTCACHE_ERROR_CORRUPT_DATA;
+        }
+        if (left->next == NULL && left != cache->representatives_tail) {
+            pthread_rwlock_unlock(lock);
+            return FUTCACHE_ERROR_CORRUPT_DATA;
+        }
+        left = left->next;
+    }
+    if (actual_count != cache->count ||
+        ((cache->count == 0U) != (cache->representatives_tail == NULL))) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_CORRUPT_DATA;
     }
 
     pthread_rwlock_unlock(lock);
+    return FUTCACHE_OK;
+}
+
+futcache_status_t futcache_pack_serialize(
+    const futcache_pack_t *cache,
+    void *buffer,
+    size_t buffer_size,
+    size_t *out_size)
+{
+    uint8_t *bytes = (uint8_t *)buffer;
+    uint32_t distance_id;
+    uint32_t backend_id;
+    size_t required;
+    size_t offset;
+    size_t serialized_representatives = 0U;
+    const pack_representative_t *representative;
+
+    if (cache == NULL || out_size == NULL) {
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+    if (!pack_double_serialization_supported()) {
+        return FUTCACHE_ERROR_UNSUPPORTED_PLATFORM;
+    }
+
+    pthread_rwlock_t *lock = (pthread_rwlock_t *)&cache->lock;
+    pthread_rwlock_rdlock(lock);
+
+    distance_id = pack_distance_identifier(cache->distance);
+    if (distance_id == UINT32_C(0)) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_UNSUPPORTED_PLATFORM;
+    }
+    if (cache->dimension > (size_t)UINT64_MAX ||
+        cache->count > (size_t)UINT64_MAX ||
+        cache->peak_count > (size_t)UINT64_MAX ||
+        cache->memory_limit_bytes > (size_t)UINT64_MAX ||
+        atomic_load_explicit(&cache->peak_memory_bytes,
+                             memory_order_relaxed) > (size_t)UINT64_MAX ||
+        !pack_snapshot_size(cache->dimension, cache->count, &required)) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_OUT_OF_RANGE;
+    }
+    *out_size = required;
+    if (buffer == NULL) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_OK;
+    }
+    if (buffer_size < required) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    backend_id = cache->backend_active &&
+                 cache->backend == &futcache_pack_vptree_backend
+        ? FUTCACHE_PACK_BACKEND_VPTREE
+        : FUTCACHE_PACK_BACKEND_LINEAR;
+    memcpy(bytes, futcache_pack_serial_magic,
+           sizeof(futcache_pack_serial_magic));
+    pack_write_u16_le(bytes + 8U,
+                      (uint16_t)FUTCACHE_PACK_SERIAL_VERSION);
+    pack_write_u16_le(bytes + 10U,
+                      (uint16_t)FUTCACHE_PACK_SERIAL_HEADER_SIZE);
+    pack_write_u32_le(bytes + 12U, UINT32_C(0));
+    pack_write_double_le(bytes + 16U, cache->epsilon);
+    pack_write_u64_le(bytes + 24U, (uint64_t)cache->dimension);
+    pack_write_u64_le(bytes + 32U, cache->observations);
+    pack_write_u64_le(bytes + 40U, cache->novel_observations);
+    pack_write_u64_le(bytes + 48U, cache->generation);
+    pack_write_u64_le(bytes + 56U, (uint64_t)cache->count);
+    pack_write_u64_le(bytes + 64U, (uint64_t)cache->peak_count);
+    pack_write_u64_le(bytes + 72U, cache->evictions);
+    pack_write_u64_le(bytes + 80U, (uint64_t)cache->memory_limit_bytes);
+    pack_write_u32_le(bytes + 88U, distance_id);
+    pack_write_u32_le(bytes + 92U, backend_id);
+    pack_write_u64_le(bytes + 96U, (uint64_t)atomic_load_explicit(
+        &cache->peak_memory_bytes, memory_order_relaxed));
+
+    offset = FUTCACHE_PACK_SERIAL_HEADER_SIZE;
+    for (size_t coordinate = 0U; coordinate < cache->dimension;
+         ++coordinate) {
+        pack_write_double_le(bytes + offset, cache->domain_min[coordinate]);
+        offset += sizeof(double);
+    }
+    for (size_t coordinate = 0U; coordinate < cache->dimension;
+         ++coordinate) {
+        pack_write_double_le(bytes + offset, cache->domain_max[coordinate]);
+        offset += sizeof(double);
+    }
+    representative = cache->representatives;
+    while (representative != NULL) {
+        for (size_t coordinate = 0U; coordinate < cache->dimension;
+             ++coordinate) {
+            pack_write_double_le(bytes + offset,
+                representative->coordinates[coordinate]);
+            offset += sizeof(double);
+        }
+        serialized_representatives++;
+        representative = representative->next;
+    }
+    if (serialized_representatives != cache->count ||
+        offset != required - FUTCACHE_PACK_SERIAL_CRC_SIZE) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+    pack_write_u32_le(bytes + offset, pack_crc32_bytes(bytes, offset));
+    pthread_rwlock_unlock(lock);
+    return FUTCACHE_OK;
+}
+
+futcache_status_t futcache_pack_deserialize(
+    const void *data,
+    size_t data_size,
+    const futcache_allocator_t *allocator,
+    futcache_pack_t **out_cache)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    futcache_allocator_t normalized;
+    futcache_pack_config_t config;
+    futcache_pack_t *cache = NULL;
+    double *bounds = NULL;
+    double *point = NULL;
+    futcache_distance_fn distance;
+    futcache_status_t status;
+    uint64_t serialized_dimension;
+    uint64_t serialized_count;
+    uint64_t serialized_peak_count;
+    uint64_t serialized_limit;
+    uint64_t serialized_peak_memory;
+    uint64_t observations;
+    uint64_t novel_observations;
+    uint64_t generation;
+    uint64_t evictions;
+    uint32_t backend_id;
+    size_t dimension;
+    size_t count;
+    size_t expected_size;
+    size_t bounds_bytes;
+    size_t offset;
+
+    if (out_cache == NULL) return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    *out_cache = NULL;
+    if (data == NULL || data_size < FUTCACHE_PACK_SERIAL_HEADER_SIZE +
+                                      FUTCACHE_PACK_SERIAL_CRC_SIZE) {
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+    if (!pack_double_serialization_supported()) {
+        return FUTCACHE_ERROR_UNSUPPORTED_PLATFORM;
+    }
+    if (memcmp(bytes, futcache_pack_serial_magic,
+               sizeof(futcache_pack_serial_magic)) != 0 ||
+        pack_read_u16_le(bytes + 8U) !=
+            (uint16_t)FUTCACHE_PACK_SERIAL_VERSION ||
+        pack_read_u16_le(bytes + 10U) !=
+            (uint16_t)FUTCACHE_PACK_SERIAL_HEADER_SIZE ||
+        pack_read_u32_le(bytes + 12U) != UINT32_C(0)) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+
+    serialized_dimension = pack_read_u64_le(bytes + 24U);
+    serialized_count = pack_read_u64_le(bytes + 56U);
+    serialized_peak_count = pack_read_u64_le(bytes + 64U);
+    serialized_limit = pack_read_u64_le(bytes + 80U);
+    serialized_peak_memory = pack_read_u64_le(bytes + 96U);
+    if (serialized_dimension == UINT64_C(0) ||
+        serialized_dimension > (uint64_t)SIZE_MAX ||
+        serialized_count > (uint64_t)SIZE_MAX ||
+        serialized_peak_count > (uint64_t)SIZE_MAX ||
+        serialized_limit > (uint64_t)SIZE_MAX ||
+        serialized_peak_memory > (uint64_t)SIZE_MAX) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+    dimension = (size_t)serialized_dimension;
+    count = (size_t)serialized_count;
+    if (!pack_snapshot_size(dimension, count, &expected_size) ||
+        data_size != expected_size) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+    if (pack_read_u32_le(bytes + data_size -
+                         FUTCACHE_PACK_SERIAL_CRC_SIZE) !=
+        pack_crc32_bytes(bytes, data_size - FUTCACHE_PACK_SERIAL_CRC_SIZE)) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+
+    distance = pack_distance_from_identifier(pack_read_u32_le(bytes + 88U));
+    backend_id = pack_read_u32_le(bytes + 92U);
+    if (distance == NULL ||
+        (backend_id != FUTCACHE_PACK_BACKEND_LINEAR &&
+         backend_id != FUTCACHE_PACK_BACKEND_VPTREE)) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+
+    observations = pack_read_u64_le(bytes + 32U);
+    novel_observations = pack_read_u64_le(bytes + 40U);
+    generation = pack_read_u64_le(bytes + 48U);
+    evictions = pack_read_u64_le(bytes + 72U);
+    if (novel_observations > observations || generation < observations ||
+        serialized_count > novel_observations ||
+        serialized_peak_count < serialized_count ||
+        evictions > novel_observations ||
+        (serialized_limit != UINT64_C(0) &&
+         serialized_peak_memory > serialized_limit) ||
+        (novel_observations != UINT64_MAX && evictions != UINT64_MAX &&
+         (serialized_count > UINT64_MAX - evictions ||
+          serialized_count + evictions != novel_observations))) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+
+    status = normalize_allocator(allocator, &normalized);
+    if (status != FUTCACHE_OK) return status;
+    if (dimension > SIZE_MAX / sizeof(double)) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+    bounds_bytes = dimension * sizeof(double);
+    if (bounds_bytes > SIZE_MAX / 2U) return FUTCACHE_ERROR_CORRUPT_DATA;
+    bounds = (double *)normalized.allocate(normalized.context,
+                                            2U * bounds_bytes);
+    point = (double *)normalized.allocate(normalized.context, bounds_bytes);
+    if (bounds == NULL || point == NULL) {
+        if (bounds != NULL) normalized.deallocate(normalized.context, bounds);
+        if (point != NULL) normalized.deallocate(normalized.context, point);
+        return FUTCACHE_ERROR_OUT_OF_MEMORY;
+    }
+
+    offset = FUTCACHE_PACK_SERIAL_HEADER_SIZE;
+    for (size_t coordinate = 0U; coordinate < dimension; ++coordinate) {
+        bounds[coordinate] = pack_read_double_le(bytes + offset);
+        offset += sizeof(double);
+    }
+    for (size_t coordinate = 0U; coordinate < dimension; ++coordinate) {
+        bounds[dimension + coordinate] = pack_read_double_le(bytes + offset);
+        offset += sizeof(double);
+    }
+
+    futcache_pack_config_init(&config);
+    config.dimension = dimension;
+    config.epsilon = pack_read_double_le(bytes + 16U);
+    config.distance = distance;
+    config.domain_min = bounds;
+    config.domain_max = bounds + dimension;
+    config.allocator = normalized;
+    config.backend = backend_id == FUTCACHE_PACK_BACKEND_VPTREE
+        ? &futcache_pack_vptree_backend
+        : NULL;
+    config.max_memory_bytes = (size_t)serialized_limit;
+    if (!valid_config(&config)) {
+        normalized.deallocate(normalized.context, bounds);
+        normalized.deallocate(normalized.context, point);
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+    status = futcache_pack_create(&config, &cache);
+    normalized.deallocate(normalized.context, bounds);
+    bounds = NULL;
+    if (status != FUTCACHE_OK) {
+        normalized.deallocate(normalized.context, point);
+        return status == FUTCACHE_ERROR_INVALID_ARGUMENT
+            ? FUTCACHE_ERROR_CORRUPT_DATA
+            : status;
+    }
+
+    for (size_t representative_index = 0U;
+         representative_index < count; ++representative_index) {
+        bool was_novel = false;
+        for (size_t coordinate = 0U; coordinate < dimension; ++coordinate) {
+            point[coordinate] = pack_read_double_le(bytes + offset);
+            offset += sizeof(double);
+        }
+        if (!point_in_domain(cache, point)) {
+            normalized.deallocate(normalized.context, point);
+            futcache_pack_destroy(cache);
+            return FUTCACHE_ERROR_CORRUPT_DATA;
+        }
+        status = futcache_pack_observe(cache, point, &was_novel);
+        if (status != FUTCACHE_OK || !was_novel) {
+            normalized.deallocate(normalized.context, point);
+            futcache_pack_destroy(cache);
+            return status != FUTCACHE_OK ? status
+                                         : FUTCACHE_ERROR_CORRUPT_DATA;
+        }
+    }
+    normalized.deallocate(normalized.context, point);
+    point = NULL;
+
+    if (cache->count != count ||
+        offset != data_size - FUTCACHE_PACK_SERIAL_CRC_SIZE) {
+        futcache_pack_destroy(cache);
+        return FUTCACHE_ERROR_OUT_OF_MEMORY;
+    }
+    cache->observations = observations;
+    cache->novel_observations = novel_observations;
+    cache->generation = generation;
+    cache->peak_count = (size_t)serialized_peak_count;
+    cache->evictions = evictions;
+    {
+        size_t restored_peak = (size_t)serialized_peak_memory;
+        size_t local_peak = atomic_load_explicit(&cache->peak_memory_bytes,
+                                                  memory_order_relaxed);
+        if (local_peak > restored_peak) restored_peak = local_peak;
+        if (cache->memory_limit_bytes != 0U &&
+            restored_peak > cache->memory_limit_bytes) {
+            futcache_pack_destroy(cache);
+            return FUTCACHE_ERROR_CORRUPT_DATA;
+        }
+        atomic_store_explicit(&cache->peak_memory_bytes, restored_peak,
+                              memory_order_relaxed);
+    }
+
+    status = futcache_pack_validate(cache);
+    if (status != FUTCACHE_OK) {
+        futcache_pack_destroy(cache);
+        return status;
+    }
+    *out_cache = cache;
     return FUTCACHE_OK;
 }

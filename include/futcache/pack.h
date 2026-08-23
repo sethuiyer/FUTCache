@@ -20,16 +20,20 @@ extern "C" {
  *   Let H be the observation history and rho_H(x) = min_{h in H} d(x, h)
  *   the distance transform. Metric novelty is the event { rho_H(x) > eps }.
  *
- *   Let R be a maximal eps-separated subset of H. The Voronoi cells of R
- *   tile the domain: every point lies in exactly one cell, whose site is
- *   the nearest representative. Novelty of a query x therefore reduces to
+ *   In unbounded mode, let R be a maximal eps-separated subset of H. The
+ *   Voronoi cells of R tile the domain: every point lies in exactly one cell,
+ *   whose site is the nearest representative. Novelty of a query x therefore
+ *   reduces to
  *   a single nearest-site lookup, d(x, R) > eps. Representative count
  *   is bounded by the packing number P(K, eps), independent of stream
  *   length. The cache state *is* the Voronoi seed set R.
  *
- *   Distance comparisons are monotone in the stream: a representative is
- *   added once and never removed. The state grows monotonically and
- *   saturates when no further eps-separated point exists in the domain.
+ *   Without an explicit memory ceiling, distance comparisons are monotone in
+ *   the stream: a representative is added once and never removed. With
+ *   `max_memory_bytes`, the same geometric packing is layered over a strict
+ *   physical allocation bound; memory pressure recycles the oldest
+ *   representative. Eviction may report extra novelty for a forgotten
+ *   region, but cannot create a false cache hit.
  *
  * Trade-off vs the exact union-of-balls cache.
  *
@@ -50,13 +54,13 @@ extern "C" {
  *
  * Storage and lookup.
  *
- *   The current implementation uses a dynamic array of representatives and
- *   performs an O(|R|) linear scan per observe or query. For moderate |R|
- *   this is fast and branch-free, and the cache stays compact because each
- *   representative is a single d-dimensional point plus header. For large
- *   |R| in high-dimensional embedding workloads, the linear scan can be
- *   swapped for a k-d tree or an approximate nearest-neighbor structure
- *   (HNSW, IVF-PQ, etc.) without changing the public API.
+ *   The current implementation keeps representatives in FIFO order and
+ *   performs an O(|R|) linear scan per observe or query. Each representative
+ *   is one allocation containing its d-dimensional point and list header;
+ *   this lets bounded mode recycle the oldest allocation without a transient
+ *   memory spike. For large |R|, the scan can be replaced by the built-in
+ *   VP-tree or another nearest-neighbour backend without changing the public
+ *   query API.
  */
 
 /*
@@ -70,6 +74,8 @@ typedef double (*futcache_distance_fn)(const double *a, const double *b,
  * Optional nearest-neighbour backend.  The cache remains the owner of the
  * representative coordinates; a backend owns only its index/state.  A
  * backend must not retain `points` from nearest() or insert().
+ * All backend state and scratch memory must be obtained from the allocator
+ * supplied to create(); this is required for max_memory_bytes enforcement.
  *
  * nearest() returns the distance to the closest indexed representative.  It
  * may return a conservative (over-estimated) distance when approximate: that
@@ -111,6 +117,21 @@ typedef struct futcache_pack_config {
     const futcache_pack_backend_ops_t *backend;
     /* Opaque backend context, passed to every backend callback. */
     void *backend_context;
+    /*
+     * Hard ceiling for cache-owned live allocation requests, in bytes.
+     * Zero leaves the geometric packing bound as the only limit.  A non-zero
+     * value includes the cache object, domain bounds, representatives, backend
+     * state, and backend scratch allocations made through the supplied
+     * allocator.  When a novel point cannot be added without crossing the
+     * ceiling, the oldest representative is evicted and its allocation is
+     * recycled in place (FIFO pressure eviction).
+     * The value must be large enough for the cache, two bound vectors, and
+     * at least one representative; smaller non-zero limits are invalid.
+     *
+     * Backends must allocate exclusively through the allocator passed to
+     * create() for this ceiling to cover their memory.
+     */
+    size_t max_memory_bytes;
 } futcache_pack_config_t;
 
 /*
@@ -152,14 +173,28 @@ typedef struct futcache_pack_stats {
     uint64_t observations;
     uint64_t novel_observations;
     uint64_t generation;
+    /* FIFO pressure evictions since create or the most recent clear. */
+    uint64_t evictions;
     size_t representative_count;
+    /* High-water representative count since create or the most recent clear. */
     size_t peak_count;
+    /* Exact live bytes requested from the configured allocator by the cache. */
     size_t memory_bytes;
+    /*
+     * High-water mark since create or clear, including transient backend
+     * scratch.
+     */
+    size_t peak_memory_bytes;
+    /* Configured hard limit; zero means unlimited. */
+    size_t memory_limit_bytes;
 } futcache_pack_stats_t;
 
 typedef struct futcache_pack futcache_pack_t;
 
-/* Fills `config` with sensible defaults: dimension=1, epsilon=0.0, L_inf. */
+/*
+ * Fills `config` with sensible defaults: dimension=1, epsilon=0.0, L_inf,
+ * and max_memory_bytes=0 (unlimited).
+ */
 FUTCACHE_API void futcache_pack_config_init(futcache_pack_config_t *config);
 
 /* Built-in distance functions. `context` is ignored. */
@@ -203,7 +238,9 @@ FUTCACHE_API futcache_status_t futcache_pack_is_novel(
 /*
  * Atomically tests novelty of `point` and, if novel, adds it as a new
  * representative. A point within epsilon of an existing representative is
- * reported as redundant and the state is unchanged.
+ * reported as redundant and the state is unchanged. Under a non-zero memory
+ * ceiling, adding a novel point may FIFO-evict the oldest representative;
+ * `out_was_novel` remains true and stats.evictions advances.
  */
 FUTCACHE_API futcache_status_t futcache_pack_observe(
     futcache_pack_t *cache,
@@ -238,10 +275,11 @@ FUTCACHE_API futcache_status_t futcache_pack_copy_representatives(
  * Reports the distance to, and slot index of, the nearest representative.
  * On an empty cache, `*out_distance` is +infinity and `*out_index` is
  * SIZE_MAX. The index matches the ordering used by
- * futcache_pack_copy_representatives(). This always scans the linear
- * representative array (a custom nearest-neighbour backend does not
- * expose per-representative identities), so it is O(|R|) and never
- * mutates state.
+ * futcache_pack_copy_representatives(). This always scans the representative
+ * list (a custom nearest-neighbour backend does not expose identities), so it
+ * is O(|R|) and never mutates state. Indices remain stable across appends but
+ * may shift after a pressure eviction; callers must not retain them across a
+ * mutating call when max_memory_bytes is non-zero.
  */
 FUTCACHE_API futcache_status_t futcache_pack_nearest(
     const futcache_pack_t *cache,
@@ -250,16 +288,50 @@ FUTCACHE_API futcache_status_t futcache_pack_nearest(
     size_t *out_index
 );
 
-/* Empties the representative set; bumps generation. */
+/*
+ * Empties the representative set; resets observation, eviction, and peak
+ * telemetry while advancing generation.
+ */
 FUTCACHE_API futcache_status_t futcache_pack_clear(futcache_pack_t *cache);
 
 /*
  * Validates the epsilon-separation invariant (every pair of representatives
- * is strictly farther than epsilon apart) and the telemetry lifecycle
- * invariants (generation >= observations, novel <= observations, count ==
- * novel, count <= peak). O(n^2) in the representative count.
+ * is strictly farther than epsilon apart), the telemetry lifecycle
+ * invariants (generation >= observations, novel <= observations, count +
+ * evictions == novel before counter saturation, count <= peak), and the hard
+ * live/peak memory ceiling. O(n^2) in the representative count.
  */
 FUTCACHE_API futcache_status_t futcache_pack_validate(const futcache_pack_t *cache);
+
+/*
+ * Serializes an atomic packing-state snapshot into a versioned,
+ * endian-independent, CRC32-protected format. Pass buffer=NULL to query the
+ * required size. The snapshot contains representatives, bounds, counters,
+ * eviction telemetry, the memory ceiling, and the selected built-in metric.
+ * Custom distance functions cannot be serialized and return
+ * FUTCACHE_ERROR_UNSUPPORTED_PLATFORM.
+ *
+ * The output buffer is caller-owned and is not charged to max_memory_bytes.
+ */
+FUTCACHE_API futcache_status_t futcache_pack_serialize(
+    const futcache_pack_t *cache,
+    void *buffer,
+    size_t buffer_size,
+    size_t *out_size
+);
+
+/*
+ * Restores a packing snapshot. Derived nearest-neighbour state is rebuilt;
+ * snapshots made with the built-in VP-tree restore that backend, while a
+ * custom backend restores to the exact linear scan. `allocator` may be NULL
+ * to use malloc/free. On failure, *out_cache is NULL.
+ */
+FUTCACHE_API futcache_status_t futcache_pack_deserialize(
+    const void *data,
+    size_t data_size,
+    const futcache_allocator_t *allocator,
+    futcache_pack_t **out_cache
+);
 
 #ifdef __cplusplus
 }

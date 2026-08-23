@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
   FUTCache
-  VERSION 1.1.0
+  VERSION 1.2.0
   DESCRIPTION "Future-equivalence novelty caches"
   LANGUAGES C
 )
@@ -264,6 +264,7 @@ install(FILES
   README.md
   LICENSE
   docs/serialization.md
+  docs/pack-serialization.md
   docs/verification.md
   docs/nitrosat_optimization.md
   DESTINATION ${CMAKE_INSTALL_DOCDIR}

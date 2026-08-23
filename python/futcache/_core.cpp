@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <nanobind/nanobind.h>
@@ -29,7 +30,7 @@ namespace nb = nanobind;
 namespace {
 
 constexpr int FUTCACHE_PY_VERSION_MAJOR = 1;
-constexpr int FUTCACHE_PY_VERSION_MINOR = 1;
+constexpr int FUTCACHE_PY_VERSION_MINOR = 2;
 constexpr int FUTCACHE_PY_VERSION_PATCH = 0;
 
 futcache_distance_fn resolve_distance(const std::string &name) {
@@ -65,7 +66,8 @@ public:
               std::string distance,
               nb::object domain_min,
               nb::object domain_max,
-              std::string backend = "linear")
+              std::string backend = "linear",
+              size_t max_memory_bytes = 0)
         : dimension_(static_cast<size_t>(dimension)),
           epsilon_(epsilon),
           payload_mutex_(),
@@ -113,6 +115,7 @@ public:
                 "backend must be \"linear\" or \"vptree\"");
         }
         cfg.backend_context = nullptr;
+        cfg.max_memory_bytes = max_memory_bytes;
 
         futcache_pack_t *raw = nullptr;
         futcache_status_t st = futcache_pack_create(&cfg, &raw);
@@ -164,13 +167,15 @@ public:
         check_point(point);
 
         const bool has_payload = !payload.is_none();
-        const char *payload_data = nullptr;
-        size_t payload_len = 0;
+        std::string payload_value;
         if (has_payload) {
             nb::bytes b = nb::cast<nb::bytes>(payload);
-            payload_data = b.c_str();
-            payload_len = b.size();
+            payload_value.assign(b.c_str(), b.size());
         }
+
+        /* Serialise Python-level observe bookkeeping with C observe.  This is
+         * required when pressure eviction shifts every representative id. */
+        std::lock_guard<std::mutex> payload_lock(payload_mutex_);
 
         size_t before_count = 0;
         {
@@ -200,16 +205,28 @@ public:
                 futcache_pack_get_stats(cache_, &stats);
                 after_count = stats.representative_count;
             }
-            if (after_count != before_count + 1) {
+            const bool appended = after_count == before_count + 1;
+            const bool evicted = before_count > 0 &&
+                                 after_count == before_count;
+            if (!appended && !evicted) {
                 throw std::runtime_error(
-                    "internal: representative count did not advance on novel");
+                    "internal: unexpected representative count after novel observe");
+            }
+            if (evicted) {
+                std::unordered_map<size_t, std::string> shifted;
+                shifted.reserve(payloads_.size());
+                for (auto &entry : payloads_) {
+                    if (entry.first > 0 && entry.first < before_count) {
+                        shifted.emplace(entry.first - 1U,
+                                        std::move(entry.second));
+                    }
+                }
+                payloads_.swap(shifted);
             }
             size_t rep_id = after_count - 1;
             r.representative_id = static_cast<int>(rep_id);
             if (has_payload) {
-                std::lock_guard<std::mutex> lock(payload_mutex_);
-                payloads_[rep_id] =
-                    std::string(payload_data, payload_len);
+                payloads_[rep_id] = std::move(payload_value);
             }
         } else {
             /* Redundant: recover the matched representative and its
@@ -287,6 +304,24 @@ public:
         return stats.novel_observations;
     }
 
+    uint64_t evictions() const {
+        futcache_pack_stats_t stats;
+        futcache_pack_get_stats(cache_, &stats);
+        return stats.evictions;
+    }
+
+    size_t peak_memory_bytes() const {
+        futcache_pack_stats_t stats;
+        futcache_pack_get_stats(cache_, &stats);
+        return stats.peak_memory_bytes;
+    }
+
+    size_t memory_limit_bytes() const {
+        futcache_pack_stats_t stats;
+        futcache_pack_get_stats(cache_, &stats);
+        return stats.memory_limit_bytes;
+    }
+
     nb::list copy_representatives() {
         /* Returns a Python list of lists, one per representative.
          * The Python wrapper reshapes to a numpy ndarray of shape
@@ -322,11 +357,11 @@ public:
     }
 
     void clear() {
+        std::lock_guard<std::mutex> lock(payload_mutex_);
         futcache_status_t st = futcache_pack_clear(cache_);
         if (st != FUTCACHE_OK) {
             throw std::runtime_error("clear failed");
         }
-        std::lock_guard<std::mutex> lock(payload_mutex_);
         payloads_.clear();
     }
 
@@ -336,14 +371,14 @@ public:
 
 private:
     void check_point(nb::ndarray<double, nb::ndim<1>> &point) {
-        if (static_cast<int>(point.shape(0)) != dimension_) {
+        if (point.shape(0) != dimension_) {
             throw std::invalid_argument(
                 "point dimension mismatch: cache has " +
                 std::to_string(dimension_) + ", got " +
                 std::to_string(point.shape(0)));
         }
         const double *data = point.data();
-        for (int i = 0; i < dimension_; ++i) {
+        for (size_t i = 0U; i < dimension_; ++i) {
             if (!std::isfinite(data[i])) {
                 throw std::invalid_argument(
                     "point coordinates must be finite; got non-finite at index " +
@@ -388,7 +423,7 @@ NB_MODULE(futcache_ext, m) {
 
     nb::class_<NoveltyResult>(m, "NoveltyResult")
         .def_rw("representative_id", &NoveltyResult::representative_id,
-                "Slot index of the matched or new representative; -1 if novel")
+                "Matched/new slot index; -1 only for a novel non-mutating query")
         .def_rw("is_novel", &NoveltyResult::is_novel,
                 "True when the point is farther than epsilon from every existing rep")
         .def_rw("distance", &NoveltyResult::distance,
@@ -398,13 +433,14 @@ NB_MODULE(futcache_ext, m) {
 
     nb::class_<PackCache>(m, "PackCache")
         .def(nb::init<int, double, std::string, nb::object, nb::object,
-                      std::string>(),
+                      std::string, size_t>(),
              nb::arg("dimension"),
              nb::arg("epsilon"),
              nb::arg("distance") = std::string("linf"),
              nb::arg("domain_min") = nb::none(),
              nb::arg("domain_max") = nb::none(),
-             nb::arg("backend") = std::string("linear"))
+             nb::arg("backend") = std::string("linear"),
+             nb::arg("max_memory_bytes") = 0U)
         .def("query", &PackCache::query, nb::arg("point"))
         .def("observe", &PackCache::observe,
              nb::arg("point"),
@@ -418,6 +454,9 @@ NB_MODULE(futcache_ext, m) {
         .def("memory_bytes", &PackCache::memory_bytes)
         .def("observations", &PackCache::observations)
         .def("novel_observations", &PackCache::novel_observations)
+        .def("evictions", &PackCache::evictions)
+        .def("peak_memory_bytes", &PackCache::peak_memory_bytes)
+        .def("memory_limit_bytes", &PackCache::memory_limit_bytes)
         .def("copy_representatives", &PackCache::copy_representatives)
         .def("clear", &PackCache::clear)
         .def_static("version_major", &PackCache::version_major)

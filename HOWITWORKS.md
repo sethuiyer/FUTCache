@@ -35,7 +35,7 @@ The library ships five engines behind five headers:
 There is also a Python binding, `futcache`, that wraps the packing engine and
 adds payload storage for semantic caching.
 
-The library is version 1.1.0. The version is defined in
+The library is version 1.2.0. The version is defined in
 `include/futcache/futcache.h` and mirrored in `CMakeLists.txt` and
 `pyproject.toml`.
 
@@ -155,6 +155,7 @@ include/futcache/              public headers
 src/                           one .c file per engine
     futcache.c                 interval union (AVL)
     pack.c                     Voronoi packing
+    pack_vptree.c              exact metric VP-tree backend
     box.c                      box union
     tower.c                    dyadic tower
     crdt.c                     CRDT engine
@@ -162,7 +163,8 @@ tests/                         test harness and per-engine suites
     test.h                     harness macros
     test_main.c                driver and registration
     test_futcache.c            18 tests
-    test_pack.c                12 tests
+    test_pack.c                18 tests
+    test_pack_vptree.c         8 backend tests
     test_tower.c               7 tests
     test_box.c                 5 tests
     test_crdt.c                13 tests
@@ -187,6 +189,7 @@ python/
     examples/rag_semantic_cache.py  end-to-end RAG cache demo
 docs/
     serialization.md           interval snapshot format
+    pack-serialization.md      packing snapshot format
     verification.md            build and test results
     nitrosat_optimization.md   offline packing formulation and evidence
 third_party/nitrosat/          vendored optional NitroSAT V3 optimizer
@@ -297,9 +300,10 @@ The common counters are:
   plus merges, in the CRDT).
 - `novel_observations` — number of `observe` calls that changed state.
 - `generation` — bumped on every state mutation, including `clear`.
-- `memory_bytes` — an approximate accounting of engine-owned memory,
-  recomputed from the live structure on `clear` and incrementally adjusted
-  otherwise; it is a diagnostic, not a promise.
+- `memory_bytes` — engine-owned memory. Most engines report a structural
+  estimate. The packing engine reports exact bytes requested through its
+  accounting allocator; with `max_memory_bytes`, this is an enforced promise
+  and `peak_memory_bytes` is guaranteed not to cross the limit.
 
 `validate` is an O(n) (or worse) internal consistency check intended for
 diagnostics and tests. It returns `FUTCACHE_OK` or
@@ -311,7 +315,7 @@ diagnostics and tests. It returns `FUTCACHE_OK` or
 
 Header `futcache/futcache.h`, implementation `src/futcache.c`. This is the
 reference engine: it is exact for the one-dimensional case on a closed domain
-`[domain_min, domain_max]`, and it is the only engine with serialization.
+`[domain_min, domain_max]`, and it serializes its canonical interval state.
 
 ### 7.1 Representation
 
@@ -369,8 +373,8 @@ described in section 3.
 `futcache_serialize` produces an atomic snapshot under the read lock;
 `futcache_deserialize` restores it. The format is versioned, endian-independent
 (little-endian), and CRC32-protected, and is documented in
-`docs/serialization.md` and section 13. This is the only engine that persists
-to bytes; the others are in-memory, and the CRDT's `snapshot` is a
+`docs/serialization.md` and section 13. The packing engine now has an analogous
+format in `docs/pack-serialization.md`; the CRDT's `snapshot` remains a
 zero-copy gossip structure rather than a disk format.
 
 ---
@@ -383,22 +387,21 @@ embedding spaces, where a closed-form canonical union does not exist.
 
 ### 8.1 Representation
 
-The cache keeps a set R of representative points. A point x is redundant if
+The cache keeps a FIFO-ordered set R of representative points. A point x is redundant if
 its distance to the nearest representative is at most epsilon; otherwise x is
 novel and is added to R. This is a greedy farthest-point-style insertion: a
 new representative is always at distance strictly greater than epsilon from
 every existing representative, so R is epsilon-separated, and its size is
 bounded by the packing number of the domain at scale epsilon.
 
-The invariant follows directly from the insertion rule. A point is added only
+The separation invariant follows directly from the insertion rule. A point is added only
 when it is farther than epsilon from every current representative, so the new
 representative is farther than epsilon from all of them, and separation is
-preserved by induction. Conversely, a point is rejected only when it is
-within epsilon of some representative, so every observed point is either a
-representative or within epsilon of one. That second fact is the coverage
-side of the trade: the representative set "covers" the history in the sense
-that every history point lies inside some representative's ball, which is why
-the cache can discard the history point itself.
+preserved by induction. Without a hard memory ceiling, a point is rejected
+only when it is within epsilon of some representative, so every observed point
+is either a representative or within epsilon of one. That is the coverage side
+of the unbounded packing trade. Pressure eviction deliberately relaxes full-
+history coverage while preserving separation and one-sided cache safety.
 
 ### 8.2 One-sided error
 
@@ -434,7 +437,9 @@ distance that is too small, which over-reports novelty, but it must never
 return a distance that is too large for a point that is genuinely novel,
 because that would suppress novelty. The backend does not expose per-index
 identities, which is why `futcache_pack_nearest` (below) always uses the
-linear representative array.
+linear representative list. Backends must obtain all state and scratch memory
+from the allocator supplied at creation so the hard byte ceiling can include
+the index as well as representative coordinates.
 
 ### 8.5 Nearest-site lookup
 
@@ -442,16 +447,53 @@ linear representative array.
 nearest representative. On an empty cache it reports `+infinity` and
 `SIZE_MAX`. The slot index matches the ordering used by
 `futcache_pack_copy_representatives`. This function is what the Python
-binding uses to populate a hit's `representative_id` and `distance`.
+binding uses to populate a hit's `representative_id` and `distance`. Appends
+preserve existing indices; FIFO pressure eviction removes index zero and
+shifts surviving indices, so bounded-mode ids are valid only until the next
+mutation.
 
-### 8.6 Validation
+### 8.6 Hard memory pressure
+
+`futcache_pack_config_t.max_memory_bytes` is a hard ceiling over every live
+allocation requested by the packing cache: the cache object, copied bounds,
+representatives, backend state, and backend rebuild scratch. Each child
+allocation carries an aligned size prefix, and allocation reserves bytes with
+an atomic compare/exchange before calling the configured allocator. An
+allocation that would cross the ceiling is never issued, so transient VP-tree
+rebuilds cannot overshoot it either.
+
+When a novel representative does not fit, the engine recycles the oldest
+representative's fixed-size allocation and moves it to the tail of the FIFO
+list. The incoming point was farther than epsilon from the entire pre-eviction
+set, so the remaining set stays epsilon-separated. Forgetting the old point
+can turn a future hit into a miss, but cannot turn a genuinely novel query into
+a hit. If a bounded backend cannot rebuild within the ceiling, it is destroyed
+and queries fall back to the exact allocation-free linear scan.
+
+### 8.7 Crash-recovery snapshots
+
+`futcache_pack_serialize` captures representatives in FIFO/slot order along
+with the metric, domain, epsilon, counters, evictions, memory ceiling, and
+high-water telemetry. `futcache_pack_deserialize` validates strict framing and
+CRC32, restores the representative set, and reconstructs the built-in VP-tree
+when applicable. Custom distance callbacks are deliberately unsupported
+because their function pointer and opaque context are not portable recovery
+state; custom indexes restore as a linear scan because an index is derived
+from the representatives.
+
+The byte format is specified in `docs/pack-serialization.md`. For machine-crash
+durability, write a complete snapshot to a same-directory temporary file,
+flush it, and atomically rename it over the prior checkpoint.
+
+### 8.8 Validation
 
 `futcache_pack_validate` checks the telemetry relations (`generation >=
-observations`, `novel_observations <= observations`, `representative_count ==
-novel_observations`, `representative_count <= peak_count`) and the
-epsilon-separation invariant (every pair of representatives is strictly
-farther than epsilon apart). The separation check is O(|R|^2), which is why
-it is a diagnostic rather than a per-operation check.
+observations`, `novel_observations <= observations`, `representative_count +
+evictions == novel_observations` before saturation, and
+`representative_count <= peak_count`), verifies live and peak bytes against
+the hard ceiling, and checks that every pair of representatives is strictly
+farther than epsilon apart. The separation check is O(|R|^2), which is why it
+is a diagnostic rather than a per-operation check.
 
 ---
 
@@ -680,7 +722,9 @@ assert that pre-operation state, counters, and locks survive the failure.
 
 ---
 
-## 13. Serialization (interval engine)
+## 13. Serialization and recovery
+
+### 13.1 Interval engine
 
 `docs/serialization.md` specifies the version-1 format. The layout is a
 little-endian sequence: an 8-byte ASCII magic `FUTCACHE`, a 2-byte format
@@ -708,8 +752,16 @@ The checksum is the last line of defense for anything the structural rules do
 not catch.
 
 The serializer snapshots under the read lock, so the bytes are a consistent
-state even when writers are active. This is the only persistence surface in
-the library.
+state even when writers are active.
+
+### 13.2 Packing engine
+
+`docs/pack-serialization.md` specifies the packing format. Its `FUTPACK\0`
+magic distinguishes it from interval snapshots. The fixed header records the
+dimension, epsilon, built-in metric id, derived-backend id, lifecycle and
+eviction counters, memory limit, and peak bytes. Domain vectors and FIFO-ordered
+representatives follow, then a CRC32. Restore validates every coordinate and
+the pairwise epsilon-separation invariant before exposing the cache.
 
 ---
 
@@ -721,8 +773,9 @@ are engine-specific but share a shape.
 - Interval: `generation >= observations`, `novel_observations <=
   observations`, `interval_count <= novel_observations`.
 - Pack: `generation >= observations`, `novel_observations <= observations`,
-  `representative_count == novel_observations`, `representative_count <=
-  peak_count`, plus pairwise epsilon-separation.
+  `representative_count + evictions == novel_observations` before saturation,
+  `representative_count <= peak_count`, live/peak bytes within the configured
+  limit, plus pairwise epsilon-separation.
 - Box: `generation >= observations`, `novel_observations <= observations`,
   `box_count == novel_observations`, `box_count <= peak_box_count`.
 - Tower: occupancy, prefix sums, and discovery logs are checked against
@@ -748,15 +801,17 @@ case: the C layer owns novelty decisions, and a Python dict owns payloads
 keyed by representative slot index.
 
 The main class is `PackCache(dimension, epsilon, distance, domain_min,
-domain_max)`, where `distance` is one of `"linf"` (default), `"l1"`, `"l2"`,
-or `"cosine"`, and the domain bounds are scalars broadcast to every
-dimension. Points are `numpy.float64` one-dimensional arrays.
+domain_max, backend, max_memory_bytes)`, where `distance` is one of `"linf"`
+(default), `"l1"`, `"l2"`, or `"cosine"`, and the domain bounds are scalars
+broadcast to every dimension. A zero memory limit is unlimited; a positive
+limit enables native FIFO pressure eviction and drops the corresponding
+Python payload. Points are `numpy.float64` one-dimensional arrays.
 
 `observe(point, payload=None)` and `query(point)` return a `NoveltyResult`
 with four fields:
 
-- `representative_id` — the slot index of the matched or new representative,
-  or `-1` when the point is novel (there is no representative to name).
+- `representative_id` — the slot index of the matched or newly inserted
+  representative; a novel non-mutating `query` returns `-1`.
 - `is_novel` — whether the point is farther than epsilon from every existing
   representative.
 - `distance` — distance to the nearest representative; `0.0` for a novel
@@ -770,18 +825,19 @@ if not novel, `get_payload` the cached result. The slot index from a hit is
 exactly the key to `get_payload`.
 
 The class also exposes `copy_representatives()` (an `(N, dimension)` array),
-`clear()`, `len()`, `peak_count()`, `memory_bytes()`, `observations()`,
-`novel_observations()`, and a class method `PackCache.version()` returning
-`"1.1.0"`.
+`clear()`, `len()`, `peak_count()`, `memory_bytes()`,
+`peak_memory_bytes()`, `memory_limit_bytes()`, `evictions()`,
+`observations()`, `novel_observations()`, and a class method
+`PackCache.version()` returning `"1.2.0"`.
 
 ---
 
 ## 16. Testing and verification
 
 The test suite is the primary specification of behavior. It runs as a single
-executable with one line per test, 55 tests across five suites at the time of
-writing: 18 for the interval engine, 12 for packing, 7 for the tower, 5 for
-the box cache, and 13 for the CRDT.
+executable with one line per test, 69 tests across six suites at the time of
+writing: 18 for the interval engine, 18 for packing, 8 for the VP-tree
+backend, 7 for the tower, 5 for the box cache, and 13 for the CRDT.
 
 The verification strategy, recorded in `docs/verification.md`, is:
 
@@ -791,8 +847,10 @@ The verification strategy, recorded in `docs/verification.md`, is:
   verify the inward-rounded endpoints.
 - **Fault injection**: counting allocators that fail at each allocation site
   verify allocation-before-commit atomicity and leak-freedom.
-- **Concurrency**: multithreaded observers, readers, and serializers under
-  ThreadSanitizer.
+- **Concurrency**: multithreaded observers, readers, and serializers in the
+  Debug, Release, and ASan/UBSan suites. The TSan build is also maintained,
+  although this managed host currently fails during TSan shadow-memory setup
+  before the tests start.
 - **Adversarial snapshots**: every one-byte mutation and truncation of a
   serialized snapshot must be rejected.
 - **Static analysis**: `-fanalyzer` and the strongest project warnings with
@@ -809,9 +867,10 @@ plus a 384-dimensional cosine embedding stream. The randomized streams use
 fixed seeds that are printed in the source, so a failing case can be replayed
 exactly.
 
-The gates are: a `-Werror` debug build, a `-Werror` release build, ASan +
-UBSan, TSan, and `-fanalyzer`, all clean. The verification document records
-these results so a regression is visible.
+The passing gates are a `-Werror` debug build, a `-Werror` release/shared
+build, ASan + UBSan, and `-fanalyzer`. The TSan binary builds, but its runtime
+cannot start in the current managed host because of a shadow-memory mapping
+conflict. The verification document records that limitation explicitly.
 
 ---
 
@@ -820,15 +879,15 @@ these results so a regression is visible.
 The decision is governed by dimensionality, exactness requirements, and
 distribution.
 
-- **Exact one-dimensional novelty, or persistence needed** — use the
-  interval engine (`futcache.h`). It is the only exact engine and the only
-  one that serializes.
+- **Exact one-dimensional novelty** — use the interval engine (`futcache.h`).
+  It persists canonical interval state.
 - **Exact multi-dimensional L_inf novelty, dimensions 1–8** — the box
   engine (`box.h`) is the intended tool, but see the one-sided caveat in
   section 9.2. Until the code or the docs are fixed, treat it as conservative.
 - **Arbitrary-dimension embeddings, approximate novelty, payload caching** —
   use the packing engine (`pack.h`) with the cosine or L2 distance. This is
-  the semantic-cache workhorse and the engine behind the Python binding.
+  the semantic-cache workhorse and the engine behind the Python binding. It
+  supports both crash-recovery snapshots and an optional hard byte ceiling.
 - **One-dimensional coarse prefilter, prefix counts, discovery order** — use
   the tower (`tower.h`).
 - **Multiple replicas that must converge without coordination** — use the
@@ -846,10 +905,10 @@ semantic cache replicas that must agree without a coordinator: CRDT engine
 with a fixed anchor net dense enough for the chosen epsilon.
 
 The non-goals are worth stating: none of the engines implements TTL or
-sliding windows, none implements LRU or other bounded-memory eviction, and
-none trains or adapts a model. State size is bounded by domain geometry
-(packing number or cell count), not by an eviction policy. Applications that
-need recency or bounded memory must layer those on top.
+sliding windows, none trains or adapts a model, and the pressure policy is a
+deterministic FIFO bound rather than LRU/LFU reuse prediction. Without an
+explicit packing byte ceiling, state size remains bounded by domain geometry
+(packing number or cell count).
 
 ---
 
@@ -891,13 +950,17 @@ per workload, so the trade is visible rather than asserted.
 - The CRDT engine does not verify the caller-supplied delta-net contract; a
   caller that supplies anchors too sparse for epsilon silently loses the
   epsilon guarantee.
-- Serialization exists only for the interval engine.
+- Portable serialization is available for interval state and packing caches
+  that use built-in metrics. A custom packing distance callback cannot be
+  recovered portably and is intentionally rejected by the serializer.
 - The Python binding exposes only the packing engine; the interval, box,
   tower, and CRDT engines are C-only.
 - LeakSanitizer cannot run in the authoring environment (a ptrace limitation
   of the managed container); leak-freedom is instead established with
   counting allocators. Valgrind is not installed.
-- ThreadSanitizer runs under a documented non-PIE, ASLR-disabled workaround.
+- ThreadSanitizer cannot currently start on this managed host, even for a
+  non-PIE build, because its shadow-memory reservation collides with an
+  existing mapping.
 - Clang is not installed in the authoring environment, so the compiler matrix
   covers GCC only.
 
