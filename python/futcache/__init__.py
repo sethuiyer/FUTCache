@@ -84,6 +84,11 @@ class PackCache:
             broadcast to a length-``dimension`` vector. Default
             ``-1.0`` / ``1.0`` for every coordinate. Inputs must lie
             inside the inclusive bounds.
+        backend: nearest-neighbour index. ``"linear"`` (default) scans
+            every representative (O(|R|) per observation); ``"vptree"``
+            uses an exact scapegoat VP-tree with triangle-inequality
+            pruning (logarithmic inserts, exact queries) — identical
+            novelty semantics, faster at large representative counts.
     """
 
     def __init__(self,
@@ -91,7 +96,8 @@ class PackCache:
                  epsilon: float,
                  distance: str = "linf",
                  domain_min=None,
-                 domain_max=None) -> None:
+                 domain_max=None,
+                 backend: str = "linear") -> None:
         lo, hi = _broadcast_domain(dimension, domain_min, domain_max)
         self._dimension = dimension
         self._impl = _PackCacheRaw(
@@ -100,6 +106,7 @@ class PackCache:
             distance=distance,
             domain_min=lo,
             domain_max=hi,
+            backend=backend,
         )
 
     def query(self, point) -> NoveltyResult:

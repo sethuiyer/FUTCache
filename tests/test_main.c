@@ -22,6 +22,7 @@ int main(void)
     failures += futcache_test_suite();
     failures += tower_test_suite();
     failures += pack_test_suite();
+    failures += pack_vptree_test_suite();
     failures += box_test_suite();
     failures += crdt_test_suite();
     if (failures != 0) {

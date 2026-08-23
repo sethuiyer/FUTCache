@@ -64,7 +64,8 @@ public:
               double epsilon,
               std::string distance,
               nb::object domain_min,
-              nb::object domain_max)
+              nb::object domain_max,
+              std::string backend = "linear")
         : dimension_(static_cast<size_t>(dimension)),
           epsilon_(epsilon),
           payload_mutex_(),
@@ -103,6 +104,15 @@ public:
         cfg.allocator.allocate = nullptr;
         cfg.allocator.deallocate = nullptr;
         cfg.allocator.context = nullptr;
+        if (backend == "linear") {
+            cfg.backend = nullptr;
+        } else if (backend == "vptree") {
+            cfg.backend = &futcache_pack_vptree_backend;
+        } else {
+            throw std::invalid_argument(
+                "backend must be \"linear\" or \"vptree\"");
+        }
+        cfg.backend_context = nullptr;
 
         futcache_pack_t *raw = nullptr;
         futcache_status_t st = futcache_pack_create(&cfg, &raw);
@@ -387,12 +397,14 @@ NB_MODULE(futcache_ext, m) {
                 "True when observe() added a new representative");
 
     nb::class_<PackCache>(m, "PackCache")
-        .def(nb::init<int, double, std::string, nb::object, nb::object>(),
+        .def(nb::init<int, double, std::string, nb::object, nb::object,
+                      std::string>(),
              nb::arg("dimension"),
              nb::arg("epsilon"),
              nb::arg("distance") = std::string("linf"),
              nb::arg("domain_min") = nb::none(),
-             nb::arg("domain_max") = nb::none())
+             nb::arg("domain_max") = nb::none(),
+             nb::arg("backend") = std::string("linear"))
         .def("query", &PackCache::query, nb::arg("point"))
         .def("observe", &PackCache::observe,
              nb::arg("point"),

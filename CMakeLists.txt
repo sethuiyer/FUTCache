@@ -58,6 +58,7 @@ add_library(futcache ${FUTCACHE_LIBRARY_TYPE}
   src/futcache.c
   src/tower.c
   src/pack.c
+  src/pack_vptree.c
   src/box.c
   src/crdt.c
 )
@@ -103,6 +104,7 @@ if(BUILD_TESTING)
     tests/test_futcache.c
     tests/test_tower.c
     tests/test_pack.c
+    tests/test_pack_vptree.c
     tests/test_box.c
     tests/test_crdt.c
   )
@@ -156,6 +158,11 @@ if(FUTCACHE_BUILD_BENCHMARKS)
   target_link_libraries(futcache_bekko_semantic_cache PRIVATE FUTCache::futcache m)
   target_compile_features(futcache_bekko_semantic_cache PRIVATE c_std_11)
   futcache_enable_warnings(futcache_bekko_semantic_cache)
+
+  add_executable(futcache_pack_backend_bench bench/pack_backend_bench.c)
+  target_link_libraries(futcache_pack_backend_bench PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_pack_backend_bench PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_pack_backend_bench)
 endif()
 
 if(FUTCACHE_BUILD_NITROSAT)

@@ -113,6 +113,41 @@ typedef struct futcache_pack_config {
     void *backend_context;
 } futcache_pack_config_t;
 
+/*
+ * Built-in exact nearest-neighbour backend: a scapegoat VP-tree.
+ *
+ * A VP-tree partitions the space by distance to a vantage point and
+ * prunes with the triangle inequality, so it works in any metric space
+ * (L1, L2, L_inf, or a custom metric) and its query cost tracks the
+ * intrinsic dimensionality (the doubling constant), not the ambient
+ * dimension: on low-intrinsic-dimension data (real embeddings) it is
+ * 10-100x faster than the linear scan even at 384 dimensions, while
+ * on adversarial uniform data in high dimensions it degrades toward
+ * the linear scan (the curse of dimensionality; see the backend bench).
+ *
+ * Inserts are amortized O(log n): the tree is a scapegoat tree with
+ * local rebuilds. nearest() is exact: the returned distance equals the
+ * linear-scan result, so observe()/is_novel() semantics are identical
+ * to the built-in backend (differential-tested).
+ *
+ * Cosine: 1 - dot(a, b) is not a metric, but for L2-normalized inputs
+ * the chordal distance d = |a - b| satisfies 1 - dot = d^2 / 2, and the
+ * chordal distance is a metric (Euclidean on the unit sphere). The
+ * backend therefore indexes with the chordal metric and converts the
+ * result back, which is exact for normalized inputs. To preserve the
+ * one-sided guarantee when the normalization contract is violated, the
+ * backend detects non-unit-norm inputs (at insert and per query) and
+ * falls back to an exact linear scan over the engine's cosine distance
+ * for those points — a wrong epsilon can never turn a genuinely novel
+ * point into a hit.
+ *
+ * Memory is allocated through the cache's allocator (counting-
+ * allocator / fault-injection compatible), and every insert is
+ * all-or-nothing: an allocation failure leaves the index exactly as
+ * it was before the call.
+ */
+extern FUTCACHE_API const futcache_pack_backend_ops_t futcache_pack_vptree_backend;
+
 typedef struct futcache_pack_stats {
     uint64_t observations;
     uint64_t novel_observations;

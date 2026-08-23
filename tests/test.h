@@ -54,6 +54,7 @@ int run_test_cases(const char *suite_name, const test_case_t *tests, size_t coun
 int futcache_test_suite(void);
 int tower_test_suite(void);
 int pack_test_suite(void);
+int pack_vptree_test_suite(void);
 int box_test_suite(void);
 int crdt_test_suite(void);
 
