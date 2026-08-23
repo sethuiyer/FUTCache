@@ -10,9 +10,12 @@
  *   2. Idempotence:   merge(A, A) = A.
  *   3. Commutativity: merge(A, B) = merge(B, A).
  *
- * Constructs a 3x3 anchor net on [0, 1]^2 with epsilon = 0.30. The
- * Voronoi partition induces 9 cells; any two points in the same cell
- * are within 2 * max_dist_to_anchor of each other, well under 0.30.
+ * Constructs a 3x3 anchor net on [0, 1]^2 with epsilon = 0.50. The
+ * Voronoi partition induces 9 cells. max_dist_to_anchor = sqrt(2)/6
+ * ~= 0.236, so any two points in the same cell are within
+ * 2*sqrt(2)/6 = sqrt(2)/3 ~= 0.471 < 0.50 = epsilon. This satisfies
+ * the delta-net contract (delta <= epsilon/2) from crdt.h, which is
+ * what makes cell occupancy a safe epsilon-equivalence test.
  *
  * The "network" between replicas is two buffers in this process; in
  * production it would be TCP/UDP. The merge logic is identical.
@@ -62,7 +65,7 @@ static futcache_crdt_t *make_replica(const double anchors[ANCHORS][DIM])
     cfg.dimension = DIM;
     cfg.anchor_count = ANCHORS;
     cfg.anchors = &anchors[0][0];
-    cfg.epsilon = 0.30;
+    cfg.epsilon = 0.50;
     cfg.distance = NULL;
     cfg.distance_context = NULL;
 
@@ -158,7 +161,7 @@ int main(void)
     };
 
     printf("=== FUTCache CRDT demo: two-replica convergence ===\n");
-    printf("dimension=%d, anchor_count=%d, epsilon=0.30\n\n", DIM, ANCHORS);
+    printf("dimension=%d, anchor_count=%d, epsilon=0.50\n\n", DIM, ANCHORS);
 
     /* Stage 1: disjoint histories, no merge yet. */
     printf("Stage 1: replicas observe disjoint streams\n");
