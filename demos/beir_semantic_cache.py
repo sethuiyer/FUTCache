@@ -7,15 +7,15 @@ same questions (paraphrases of the same intent). FUTCache remembers
 semantic regions, not exact strings, so a repeat intent is served
 from a cached answer without re-running retrieval or the LLM.
 
-  1. Data   - BEIR/SciFact (5,183 abstracts, 300 eval queries,
-              human relevance judgments in qrels).
+  1. Data   - BEIR/SciFact by default, or CQAdupStack for genuine
+              duplicate questions marked by human relevance judgments.
   2. Embed  - hotchpotch/bekko-embedding-v1-a8m (384-d, cosine).
   3. Oracle - brute-force top-3 retrieval; quality vs the qrels.
   4. Cache  - replay the query stream through futcache.PackCache:
               memory (reps), reuse rate, and answer quality: does
               the cached answer still contain a document a human
               judged relevant to the current query?
-  5. Live   - cold stream, then re-ask the same questions: they hit
+  5. Live   - cold stream, then replay the same questions: they hit
               the cache and return the stored answer instantly.
 
 Correctness ground truth = the human qrels. A cache HIT on query q
@@ -25,12 +25,13 @@ contains >= 1 document human-relevant to q.
 Run:
     python3 demos/beir_semantic_cache.py
     python3 demos/beir_semantic_cache.py --dataset nfcorpus
+    python3 demos/beir_semantic_cache.py --dataset cqadupstack-stats
     python3 demos/beir_semantic_cache.py --eps 0.55
     python3 demos/beir_semantic_cache.py --skip-embed   # reuse cache
 
-Requires: sentence-transformers, numpy, futcache (pip install .).
-First run downloads the BEIR zip (~3 MB) and the model (~120 MB,
-cached on HuggingFace) and embeds the corpus (a few minutes on GPU).
+Requires: sentence-transformers, datasets, numpy, futcache (pip install .).
+First run downloads the selected dataset and the model (~120 MB,
+cached locally) and embeds the corpus (a few minutes on GPU).
 """
 from __future__ import annotations
 
@@ -55,9 +56,20 @@ TOP_K = 3                       # documents retrieved per query
 BEIR_BASE = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets"
 
 DATASETS = {
-    "scifact":  ("scifact",  "BEIR/SciFact (scientific claim verification)"),
-    "nfcorpus": ("nfcorpus", "BEIR/NFCorpus (medical IR)"),
-    "fiqa":     ("fiqa",     "BEIR/FiQA (finance Q&A)"),
+    "scifact": (
+        "scifact", None, "BEIR/SciFact (scientific claim verification)"
+    ),
+    "nfcorpus": (
+        "nfcorpus", None, "BEIR/NFCorpus (medical IR)"
+    ),
+    "fiqa": (
+        "fiqa", None, "BEIR/FiQA (finance Q&A)"
+    ),
+    "cqadupstack-stats": (
+        "hf:BeIR/cqadupstack",
+        "stats",
+        "BEIR/CQAdupStack Stats",
+    ),
 }
 
 COST_PER_CALL_USD = 0.0005      # simulated LLM call cost
@@ -72,13 +84,25 @@ def eprint(*a):
 # Data loading (official BEIR distribution, cached locally)
 # ----------------------------------------------------------------------
 
-def load_beir(name: str, cache_dir: str) -> tuple[dict, list, dict]:
+def load_beir(dataset_key: str, cache_dir: str) -> tuple[dict, list, dict]:
     """Return (corpus {doc_id: (title, text)}, queries [(qid, text)],
-    qrels {qid: set(relevant_doc_ids)}). Eval split only."""
-    zpath = os.path.join(cache_dir, f"{name}.zip")
+    qrels {qid: set(relevant_doc_ids)}). Eval split only.
+
+    ``dataset_key`` is a key in DATASETS; sources are either the official BEIR
+    zip (``scifact``, ``nfcorpus``, ``fiqa``) or a HuggingFace dataset
+    (``hf:org/repo`` + config) for datasets BEIR no longer hosts
+    (cqadupstack). HF parquet files are cached by the datasets library.
+    """
+    source, config, display = DATASETS[dataset_key]
+    if source.startswith("hf:"):
+        if config is None:
+            raise ValueError(f"{display} requires a Hugging Face config")
+        return _load_beir_hf(source[3:], config, cache_dir)
+
+    zpath = os.path.join(cache_dir, f"{source}.zip")
     if not os.path.exists(zpath):
-        eprint(f"downloading BEIR/{name} ...")
-        urllib.request.urlretrieve(f"{BEIR_BASE}/{name}.zip", zpath)
+        eprint(f"downloading BEIR/{source} ...")
+        urllib.request.urlretrieve(f"{BEIR_BASE}/{source}.zip", zpath)
 
     import json
 
@@ -87,7 +111,7 @@ def load_beir(name: str, cache_dir: str) -> tuple[dict, list, dict]:
     qrels: dict[str, set[str]] = defaultdict(set)
 
     with zipfile.ZipFile(zpath) as z:
-        prefix = f"{name}/"
+        prefix = f"{source}/"
         with z.open(prefix + "corpus.jsonl") as f:
             for line in f:
                 rec = json.loads(line)
@@ -116,6 +140,59 @@ def load_beir(name: str, cache_dir: str) -> tuple[dict, list, dict]:
     return corpus, queries, dict(qrels)
 
 
+def _load_beir_hf(repo: str, config: str,
+                  cache_dir: str) -> tuple[dict, list, dict]:
+    """Load a BEIR-style dataset from HuggingFace. qrels live in the
+    companion ``{repo}-qrels`` dataset (combined across sites); they are
+    filtered to the queries and corpus docs actually loaded here."""
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "Hugging Face datasets support requires: pip install datasets"
+        ) from exc
+
+    eprint(f"loading {repo} [{config}] from HuggingFace ...")
+    hf_cache_dir = os.path.join(cache_dir, "huggingface")
+    ds = load_dataset(repo, config, cache_dir=hf_cache_dir)
+    corpus: dict[str, tuple[str, str]] = {}
+    for rec in ds["corpus"]:
+        doc_id = str(rec["_id"])
+        corpus[doc_id] = (rec.get("title", ""), rec.get("text", ""))
+    queries: list[tuple[str, str]] = []
+    qids_in_split: set[str] = set()
+    for rec in ds["queries"]:
+        query_id = str(rec["_id"])
+        queries.append((query_id, rec.get("text", "")))
+        qids_in_split.add(query_id)
+
+    # This qrels dataset is combined across all CQAdupStack sites. The site
+    # config above selects only queries; filter both sides of every judgment.
+    qrel_ds = load_dataset(f"{repo}-qrels", cache_dir=hf_cache_dir)
+    qrels: dict[str, set[str]] = defaultdict(set)
+    for rec in qrel_ds["test"]:
+        query_id = str(rec["query-id"])
+        if query_id not in qids_in_split:
+            continue
+        doc_id = str(rec["corpus-id"])
+        if int(rec.get("score", 1)) >= 1 and doc_id in corpus:
+            qrels[query_id].add(doc_id)
+
+    # Keep only queries that have human judgments.
+    queries = [
+        (query_id, text)
+        for query_id, text in queries
+        if query_id in qrels
+    ]
+    qrel_count = sum(len(doc_ids) for doc_ids in qrels.values())
+    combined_qrel_count = len(qrel_ds["test"])
+    eprint(
+        f"{len(corpus)} corpus docs, {len(queries)} judged queries, "
+        f"{qrel_count} filtered qrels from {combined_qrel_count} combined"
+    )
+    return corpus, queries, dict(qrels)
+
+
 # ----------------------------------------------------------------------
 # Embedding (cached to disk so re-runs are instant)
 # ----------------------------------------------------------------------
@@ -134,15 +211,62 @@ def embed_texts(texts: list[str], cache_path: str) -> np.ndarray:
     model = SentenceTransformer(MODEL)
     eprint(f"model ready in {time.monotonic() - t0:.1f}s")
 
-    eprint(f"embedding {len(texts)} texts ...")
+    device = os.environ.get("FUTCACHE_DEVICE", "")
+    if not device:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+    # Bekko accepts sequences up to 8,192 tokens. CQAdupStack has long posts,
+    # so start conservatively on 4 GB GPUs and halve the batch on CUDA OOM.
+    batch = 4 if device == "cuda" else 64
+    if os.environ.get("FUTCACHE_BATCH_SIZE"):
+        batch = int(os.environ["FUTCACHE_BATCH_SIZE"])
+        if batch < 1:
+            raise ValueError("FUTCACHE_BATCH_SIZE must be positive")
+    if device == "cpu":
+        try:
+            import torch
+            torch.set_num_threads(max(1, min(12, os.cpu_count() or 1)))
+        except Exception:
+            pass
+
+    eprint(f"embedding {len(texts)} texts on {device} (batch {batch}) ...")
     t0 = time.monotonic()
-    emb = model.encode(
-        texts,
-        batch_size=64,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=True,
-    )
+    while True:
+        try:
+            emb = model.encode(
+                texts,
+                batch_size=batch,
+                device=device,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=True,
+            )
+            break
+        except RuntimeError as exc:
+            is_cuda_oom = (device == "cuda" and
+                           "out of memory" in str(exc).lower())
+            if not is_cuda_oom:
+                raise
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            if batch > 1:
+                batch = max(1, batch // 2)
+                eprint(f"CUDA out of memory - retrying with batch {batch}")
+                continue
+            eprint("CUDA out of memory at batch 1 - retrying on CPU batch 8")
+            device, batch = "cpu", 8
+            try:
+                model.to(device)
+                import torch
+                torch.set_num_threads(max(1, min(12, os.cpu_count() or 1)))
+            except Exception:
+                pass
     eprint(f"embedded in {time.monotonic() - t0:.1f}s")
     if emb.shape[1] != DIM:
         raise ValueError(f"unexpected model dim {emb.shape[1]}")
@@ -181,45 +305,23 @@ def qrel_coverage(ranked: list[str], relevant: set[str]) -> float:
 # ----------------------------------------------------------------------
 
 def evidence_groups(qrels: dict[str, set[str]], qids: list[str]):
-    """Group queries sharing >=1 human-relevant document (union-find).
+    """Return human-evidence groups as {doc_id: [query indexes]}.
 
-    Two queries citing the same evidence are interchangeable for a
-    user: an answer that cites that evidence answers both. This is
-    the defensible ground truth for 'repeat intents'.
-    Returns {query_index: group_id} for multi-member groups.
+    Every returned group contains two or more queries for which the same
+    document is explicitly relevant. Groups may overlap when a query has
+    multiple relevant documents. Keeping the groups direct (rather than
+    unioning transitive links) avoids labeling queries as re-asks when they
+    do not themselves share any judged evidence.
     """
-    parent = list(range(len(qids)))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: int, b: int) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
     doc_to_queries: dict[str, list[int]] = defaultdict(list)
-    for qi, qid in enumerate(qids):
-        for d in qrels.get(qid, set()):
-            doc_to_queries[d].append(qi)
-    for members in doc_to_queries.values():
-        for m in members[1:]:
-            union(members[0], m)
-
-    groups: dict[int, list[int]] = defaultdict(list)
-    for qi in range(len(qids)):
-        groups[find(qi)].append(qi)
-    member_of: dict[int, int] = {}
-    gid = 0
-    for members in groups.values():
-        if len(members) > 1:
-            for m in members:
-                member_of[m] = gid
-            gid += 1
-    return member_of
+    for query_index, query_id in enumerate(qids):
+        for doc_id in qrels.get(query_id, set()):
+            doc_to_queries[doc_id].append(query_index)
+    return {
+        doc_id: members
+        for doc_id, members in doc_to_queries.items()
+        if len(members) > 1
+    }
 
 
 def paraphrase_groups(emb: np.ndarray, threshold: float) -> dict[int, int]:
@@ -267,52 +369,66 @@ def print_table(rows, headers, widths):
 
 def sweep_epsilon(qemb: np.ndarray, qrels: dict[str, set[str]],
                   qids: list[str], payloads: dict[str, list[str]],
-                  evidence_of: dict[int, int], epsilons: list[float]):
+                  evidence_of: dict[int, set[str]],
+                  epsilons: list[float]):
     """Replay the query stream through PackCache at each ε.
 
     A HIT on query i served from representative r is *correct* iff
     the cached payload (docs retrieved for r's original query)
     contains >= 1 doc human-relevant to query i.
 
-    Returns rows: eps, reps, reuse_rate, answer_prec, missed, us/op
+    Relevance labels score the decisions after the fact; they never alter the
+    exact VP-tree backend's hit/novel decision.
     """
-    rows = []
+    results = []
     for eps in epsilons:
         cache = PackCache(dimension=DIM, epsilon=eps, distance="cosine",
-                                backend="vptree")
+                          backend="vptree")
         slot_to_q = {}          # representative slot -> original query index
         hits = judged_hits = correct = 0
-        missed = 0
+        missed_reuse = repeat_opportunities = 0
+        seen_evidence_groups: set[str] = set()
         t0 = time.monotonic()
         for i, qv in enumerate(qemb):
+            group_ids = evidence_of.get(i, set())
+            is_repeat_opportunity = bool(
+                group_ids & seen_evidence_groups
+            )
+            if is_repeat_opportunity:
+                repeat_opportunities += 1
+
             res = cache.observe(qv)
             if res.is_novel:
                 slot_to_q[res.representative_id] = i
-                # semantic miss: same evidence group already seen
-                if evidence_of.get(i, -1) in {
-                        evidence_of.get(j, -1) for j in range(i)}:
-                    missed += 1
-                continue
-            hits += 1
-            rel = qrels.get(qids[i], set())
-            if not rel:
-                continue
-            judged_hits += 1
-            rep_q = slot_to_q[res.representative_id]   # original query
-            cached_docs = payloads[qids[rep_q]]
-            if any(d in rel for d in cached_docs):
-                correct += 1
+                if is_repeat_opportunity:
+                    missed_reuse += 1
+            else:
+                hits += 1
+                relevant_docs = qrels.get(qids[i], set())
+                if relevant_docs:
+                    judged_hits += 1
+                    rep_q = slot_to_q[res.representative_id]
+                    cached_docs = payloads[qids[rep_q]]
+                    if any(d in relevant_docs for d in cached_docs):
+                        correct += 1
+
+            seen_evidence_groups.update(group_ids)
+
         elapsed = time.monotonic() - t0
-        reuse = hits / len(qemb)
-        rows.append([
-            f"{eps:.2f}", cache.representative_count,
-            fmt(reuse),
-            fmt(correct / judged_hits if judged_hits else 1.0),
-            fmt(missed / len(qemb)),
-            f"{elapsed * 1e6 / len(qemb):.1f}",
-        ])
+        results.append({
+            "epsilon": eps,
+            "representatives": cache.representative_count,
+            "semantic_reuse_rate": hits / len(qemb),
+            "reuse_precision": (
+                correct / judged_hits if judged_hits else None
+            ),
+            "missed_reuse": missed_reuse,
+            "repeat_opportunities": repeat_opportunities,
+            "llm_calls_avoided": hits,
+            "microseconds_per_op": elapsed * 1e6 / len(qemb),
+        })
         cache.clear()
-    return rows
+    return results
 
 
 def main() -> int:
@@ -323,7 +439,7 @@ def main() -> int:
     ap.add_argument("--cache-dir", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), ".cache"))
     ap.add_argument("--eps", type=float, default=None,
-                    help="single epsilon (default: sweep 0.40..0.65)")
+                    help="single epsilon (default: dataset-specific sweep)")
     ap.add_argument("--paraphrase-threshold", type=float, default=0.90,
                     help="cosine similarity for the secondary paraphrase view")
     ap.add_argument("--skip-embed", action="store_true",
@@ -332,7 +448,8 @@ def main() -> int:
                     help="limit query stream (0 = all)")
     args = ap.parse_args()
 
-    name, display = DATASETS[args.dataset]
+    dataset_key = args.dataset
+    source, config, display = DATASETS[dataset_key]
     os.makedirs(args.cache_dir, exist_ok=True)
     print("=" * 74)
     print("FUTCache Semantic Cache Demo  —  " + display)
@@ -340,13 +457,16 @@ def main() -> int:
 
     # ---- Stage 1: data ------------------------------------------------
     t0 = time.monotonic()
-    corpus, queries, qrels = load_beir(name, args.cache_dir)
+    corpus, queries, qrels = load_beir(dataset_key, args.cache_dir)
     if args.max_queries:
         queries = queries[:args.max_queries]
     n = len(queries)
-    qids = [q for q, _ in queries]
-    judged = sum(1 for qid in qids if qrels.get(qid))
-    print(f"\n[1] Data          BEIR/{name}: {len(corpus):,} documents, "
+    if n == 0:
+        raise RuntimeError(f"{display} has no judged queries to evaluate")
+    qids = [query_id for query_id, _ in queries]
+    judged = sum(1 for query_id in qids if qrels.get(query_id))
+    data_source = f"{source[3:]} [{config}]" if config else f"BEIR/{source}"
+    print(f"\n[1] Data          {data_source}: {len(corpus):,} documents, "
           f"{n} eval queries, {judged}/{n} with human relevance "
           f"judgments  ({time.monotonic() - t0:.1f}s)")
 
@@ -357,8 +477,10 @@ def main() -> int:
 
     if not args.skip_embed:
         demb = embed_texts(doc_texts, os.path.join(args.cache_dir,
-                                                   f"{name}_docs"))
-        qemb = embed_texts(qtexts, os.path.join(args.cache_dir, f"{name}_q"))
+                                                   f"{dataset_key}_docs"))
+        qemb = embed_texts(
+            qtexts, os.path.join(args.cache_dir, f"{dataset_key}_q")
+        )
     else:
         # pick the cached npz matching this split's row count (the cache
         # dir may hold embeddings from earlier runs with other splits)
@@ -372,8 +494,8 @@ def main() -> int:
             if best is None:
                 sys.exit("no cached embeddings found; run without --skip-embed")
             return np.load(best)["emb"]
-        demb = _pick(f"{name}_docs.*.npz", len(doc_texts))
-        qemb = _pick(f"{name}_q.*.npz", len(qtexts))
+        demb = _pick(f"{dataset_key}_docs.*.npz", len(doc_texts))
+        qemb = _pick(f"{dataset_key}_q.*.npz", len(qtexts))
     print(f"[2] Embeddings    {len(qemb)} queries + {len(demb)} docs "
           f"@{DIM}d (bekko-embedding-v1-a8m)")
 
@@ -395,142 +517,241 @@ def main() -> int:
           "cache replaces)")
 
     # ---- Stage 4: repeat-intent ground truth -----------------------------
-    evidence_of = evidence_groups(qrels, qids)
-    n_groups = len(set(evidence_of.values())) if evidence_of else 0
-    print(f"\n[4] Repeats       {len(evidence_of)} queries form {n_groups} "
-          f"evidence groups (queries sharing >=1 human-relevant "
-          f"document):")
-    by_group: dict[int, list[int]] = defaultdict(list)
-    for qi, gid in evidence_of.items():
-        by_group[gid].append(qi)
-    for gid, members in sorted(by_group.items(),
-                               key=lambda kv: -len(kv[1]))[:5]:
+    groups_by_doc = evidence_groups(qrels, qids)
+    evidence_of: dict[int, set[str]] = defaultdict(set)
+    for doc_id, members in groups_by_doc.items():
+        for query_index in members:
+            evidence_of[query_index].add(doc_id)
+    participating_queries = set(evidence_of)
+    seen_evidence_groups: set[str] = set()
+    repeat_opportunities = 0
+    for query_index in range(n):
+        group_ids = evidence_of.get(query_index, set())
+        if group_ids & seen_evidence_groups:
+            repeat_opportunities += 1
+        seen_evidence_groups.update(group_ids)
+    print(f"\n[4] Human re-asks {len(participating_queries)} queries form "
+          f"{len(groups_by_doc)} direct shared-evidence groups")
+    print(f"    {repeat_opportunities} real repeat-intent opportunities "
+          f"have a matching group member earlier in the stream")
+    for doc_id, members in sorted(groups_by_doc.items(),
+                                  key=lambda item: -len(item[1]))[:5]:
         print(f"    - group of {len(members)}: "
               f"{queries[members[0]][1][:56]!r}  ~  "
               f"{queries[members[1]][1][:56]!r}")
-    if len(by_group) > 5:
-        print(f"      ... and {len(by_group) - 5} more groups")
+    if len(groups_by_doc) > 5:
+        print(f"      ... and {len(groups_by_doc) - 5} more groups")
 
     # Separation diagnostic: can the embedding model tell same-evidence
-    # queries from different-evidence queries? This sets the safe ε.
-    S = qemb @ qemb.T
+    # queries from different-evidence queries? Labels are diagnostics only;
+    # PackCache still makes every decision from the exact VP-tree result.
+    similarity_matrix = qemb @ qemb.T
     same_sims, cross_sims = [], []
     for i in range(n):
         for j in range(i + 1, n):
-            s = float(S[i, j])
-            (same_sims if qrels[qids[i]] & qrels[qids[j]] else cross_sims
-             ).append(s)
-    max_cross = max(cross_sims)
-    safe_dist = 1.0 - max_cross
+            similarity = float(similarity_matrix[i, j])
+            target = (same_sims if qrels[qids[i]] & qrels[qids[j]]
+                      else cross_sims)
+            target.append(similarity)
+    del similarity_matrix
+
     eps_diag = 0.20
-    same_within = 100.0 * np.mean([s >= 1.0 - eps_diag for s in same_sims])
-    print(f"    separation: same-evidence pair sim mean "
-          f"{np.mean(same_sims):.2f} (max same {np.max(same_sims):.2f}), "
-          f"cross-evidence mean {np.mean(cross_sims):.2f}")
-    print(f"    first cross-claim confusion at sim {max_cross:.3f} -> "
-          f"safe epsilon (cosine distance) <= {safe_dist:.3f}")
-    print(f"    embedding recall ceiling: only {same_within:.0f}% of "
-          f"same-evidence pairs land within ε={eps_diag:.2f} — repeats "
-          f"the model cannot recognize stay novel (honest miss rate)")
+    if same_sims:
+        same_within = 100.0 * np.mean([s >= 1.0 - eps_diag for s in same_sims])
+        print(f"    same-evidence similarity ({len(same_sims)} pairs): "
+              f"min {np.min(same_sims):.3f}, median "
+              f"{np.median(same_sims):.3f}, mean {np.mean(same_sims):.3f}, "
+              f"max {np.max(same_sims):.3f}")
+        print(f"    embedding recall ceiling: only {same_within:.0f}% of "
+              f"same-evidence pairs land within ε={eps_diag:.2f} — repeats "
+              f"the model cannot recognize stay novel (honest miss rate)")
+    else:
+        print("    no repeat group exists in this query stream; "
+              "same-evidence similarity and missed reuse are not applicable")
+
+    safe_dist = None
+    if cross_sims:
+        max_cross = max(cross_sims)
+        safe_dist = max(0.0, 1.0 - max_cross)
+        print(f"    cross-evidence similarity: mean {np.mean(cross_sims):.3f}, "
+              f"max {max_cross:.3f} -> collision-free observed epsilon "
+              f"<= {safe_dist:.3f}")
+    else:
+        print("    no cross-evidence query pair exists; a separation "
+              "boundary cannot be estimated")
 
     # ---- Stage 5: ε sweep -------------------------------------------------
-    epsilons = ([args.eps] if args.eps is not None
-                else [0.20, 0.25, 0.30, 0.35, 0.40, 0.45])
+    if args.eps is not None:
+        epsilons = [args.eps]
+    elif dataset_key.startswith("cqadupstack-"):
+        # CQAdupStack's observed duplicate pairs are much farther apart than
+        # SciFact's. Cover both the precision-safe region and their measured
+        # distance so the miss/false-reuse tradeoff is visible.
+        epsilons = [0.03, 0.04, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60,
+                    0.70, 0.76]
+    else:
+        epsilons = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
     print(f"\n[5] Cache sweep   replay the {n}-query stream through "
-          f"PackCache (cosine, 384-d):")
-    rows = sweep_epsilon(qemb, qrels, qids, payloads, evidence_of, epsilons)
-    print_table(
-        rows,
-        ["eps", "reps", "reuse_rate", "answer_prec", "missed", "us/op"],
-        [6, 6, 11, 12, 8, 7],
+          f"PackCache (exact VP-tree, cosine, 384-d):")
+    sweep_results = sweep_epsilon(
+        qemb, qrels, qids, payloads, evidence_of, epsilons
     )
-    print("    reps        = cache size (vs N queries; bounded by packing)")
-    print("    reuse_rate  = fraction of queries answered from cache")
-    print("    answer_prec = P(cached answer contains a doc a human judged")
-    print("                   relevant to this query | hit was judged)")
-    print("    missed      = fraction reported novel although the same")
-    print("                   evidence group was already cached")
+    table_rows = []
+    for result in sweep_results:
+        reuse_precision = result["reuse_precision"]
+        missed = result["missed_reuse"]
+        opportunities = result["repeat_opportunities"]
+        table_rows.append([
+            f"{result['epsilon']:.2f}",
+            result["representatives"],
+            fmt(result["semantic_reuse_rate"]),
+            fmt(reuse_precision) if reuse_precision is not None else "n/a",
+            f"{missed}/{opportunities}" if opportunities else "n/a",
+            result["llm_calls_avoided"],
+            f"{result['microseconds_per_op']:.1f}",
+        ])
+    print_table(
+        table_rows,
+        ["eps", "reps", "semantic reuse", "reuse prec", "missed reuse",
+         "LLM avoided", "us/op"],
+        [5, 6, 14, 10, 12, 11, 7],
+    )
+    print("    semantic reuse = fraction of the initial stream served by cache")
+    print("    reuse prec     = P(cached top-3 contains human-relevant evidence")
+    print("                     for this query | semantic hit)")
+    print("    missed reuse   = real repeat opportunities reported novel")
+    print("    LLM avoided    = semantic hits in the initial query stream")
 
     # ---- Stage 6: closed-loop live demo ------------------------------------
-    best = None
-    for r in rows:
-        if r[3] != "1.0000":
-            continue
-        if best is None or float(r[2]) > float(best[2]):
-            best = r
-    if best is None:            # no perfect-precision row: best precision
-        best = max(rows, key=lambda r: (float(r[3]), float(r[2])))
-    eps = float(best[0])
-    best_prec = best[3]
-    print(f"\n[6] Live demo     ε = {eps:.2f} (max reuse at best "
-          f"answer_prec = {best_prec}, near the measured safe "
-          f"boundary {safe_dist:.2f})")
+    perfect_results = [
+        result for result in sweep_results
+        if result["reuse_precision"] == 1.0
+    ]
+    if perfect_results:
+        best = max(perfect_results,
+                   key=lambda result: result["semantic_reuse_rate"])
+    else:
+        best = max(
+            sweep_results,
+            key=lambda result: (
+                result["reuse_precision"]
+                if result["reuse_precision"] is not None else -1.0,
+                result["semantic_reuse_rate"],
+            ),
+        )
+    eps = best["epsilon"]
+    best_precision = best["reuse_precision"]
+    precision_text = (fmt(best_precision)
+                      if best_precision is not None else "n/a")
+    boundary_text = (f"; observed collision-free boundary "
+                     f"{safe_dist:.2f}" if safe_dist is not None else "")
+    print(f"\n[6] Replay        ε = {eps:.2f} (max reuse at best reuse "
+          f"precision {precision_text}{boundary_text})")
 
     cache = PackCache(dimension=DIM, epsilon=eps, distance="cosine",
-                                backend="vptree")
+                      backend="vptree")
     llm_calls = 0
-    for qi, (qid, qtext) in enumerate(queries):
-        qv = qemb[qi]
-        res = cache.observe(qv, payload=("|".join(payloads[qid])).encode())
-        if res.is_novel:
+    semantic_hits = 0
+    human_reasks = human_reask_hits = human_reask_correct = 0
+    seen_evidence_groups = set()
+    slot_to_query_index: dict[int, int] = {}
+    example_hit = None
+    for query_index, (query_id, _) in enumerate(queries):
+        group_ids = evidence_of.get(query_index, set())
+        is_human_reask = bool(group_ids & seen_evidence_groups)
+        if is_human_reask:
+            human_reasks += 1
+
+        result = cache.observe(
+            qemb[query_index],
+            payload=("|".join(payloads[query_id])).encode(),
+        )
+        if result.is_novel:
+            slot_to_query_index[result.representative_id] = query_index
             llm_calls += 1
+        else:
+            semantic_hits += 1
+            representative_query_index = slot_to_query_index[
+                result.representative_id
+            ]
+            cached_payload = cache.get_payload(result.representative_id)
+            cached_docs = (cached_payload.decode().split("|")
+                           if cached_payload else [])
+            is_correct = any(
+                doc_id in qrels[query_id] for doc_id in cached_docs
+            )
+            if is_human_reask:
+                human_reask_hits += 1
+                if is_correct:
+                    human_reask_correct += 1
+                if example_hit is None:
+                    example_hit = (
+                        query_index, representative_query_index, cached_docs
+                    )
 
-    # (a) verbatim replay: the same users come back and ask the same
-    #     questions. Every replay must be served, with the identical
-    #     answer quality the oracle produced.
-    replay_hits = replay_ok = 0
-    for qi, (qid, qtext) in enumerate(queries):
-        res = cache.observe(qemb[qi])
-        if not res.is_novel:
-            replay_hits += 1
-            payload = cache.get_payload(res.representative_id)
-            if payload and any(d in qrels[qid] for d in
-                               payload.decode().split("|")):
-                replay_ok += 1
-    print(f"    (a) verbatim replay: {replay_hits}/{n} served from cache, "
-          f"{replay_ok} answers still contain a relevant doc "
-          f"(oracle coverage {fmt(cov_sum / n)})")
+        seen_evidence_groups.update(group_ids)
 
-    # (b) paraphrase replay: re-ask every evidence-group member after
-    #     the first (the group's first member was seen in the stream).
-    reasks = served = answer_ok = 0
-    for members in by_group.values():
-        for qi in members[1:]:
-            res = cache.observe(qemb[qi])
-            reasks += 1
-            if not res.is_novel:
-                served += 1
-                payload = cache.get_payload(res.representative_id)
-                if payload and any(d in qrels[qids[qi]] for d in
-                                   payload.decode().split("|")):
-                    answer_ok += 1
-    print(f"    (b) paraphrase replay ({reasks} same-evidence re-asks): "
-          f"{served} served from cache, {answer_ok}/{served} answers "
-          f"still contain a relevant doc")
-    print(f"    total LLM calls: {llm_calls} for {n + replay_hits + reasks} "
-          f"queries ({100.0 * llm_calls / (n + replay_hits + reasks):.0f}%)")
+    if (cache.representative_count != best["representatives"] or
+            semantic_hits != best["llm_calls_avoided"]):
+        raise RuntimeError("replay disagrees with the epsilon sweep")
 
-    # show one hit's payload
-    for members in by_group.values():
-        qi = members[1]
-        res = cache.observe(qemb[qi])
-        if not res.is_novel and cache.get_payload(res.representative_id):
-            original = queries[members[0]][1]
-            docs = cache.get_payload(res.representative_id).decode().split("|")
-            print(f"\n    Example hit — '{queries[qi][1][:60]}'")
-            print(f"      served cached answer originally retrieved for "
-                  f"'{original[:60]}'")
-            for d in docs[:TOP_K]:
-                title = corpus[d][0][:70] or corpus[d][1][:70]
-                print(f"      * {title}")
-            break
+    print(f"    cold stream: {semantic_hits}/{n} semantic hits "
+          f"({fmt(semantic_hits / n)} reuse), "
+          f"{cache.representative_count} representatives, "
+          f"{llm_calls} LLM calls")
+
+    if human_reasks:
+        missed_human_reasks = human_reasks - human_reask_hits
+        correctness = (human_reask_correct / human_reask_hits
+                       if human_reask_hits else 0.0)
+        print(f"    human re-asks: {human_reask_hits}/{human_reasks} reused, "
+              f"{missed_human_reasks} missed; reuse correctness "
+              f"{human_reask_correct}/{human_reask_hits} "
+              f"({fmt(correctness)})")
+    else:
+        print("    human re-asks: no shared-evidence repeat opportunity "
+              "exists in this query stream")
+
+    # Verbatim replay is a cache-integrity check. It uses the exact backend
+    # decision and validates the representative's stored retrieval payload.
+    replay_hits = replay_correct = 0
+    for query_index, (query_id, _) in enumerate(queries):
+        result = cache.observe(qemb[query_index])
+        if result.is_novel:
+            continue
+        replay_hits += 1
+        cached_payload = cache.get_payload(result.representative_id)
+        cached_docs = (cached_payload.decode().split("|")
+                       if cached_payload else [])
+        if any(doc_id in qrels[query_id] for doc_id in cached_docs):
+            replay_correct += 1
+    replay_correctness = (replay_correct / replay_hits
+                          if replay_hits else 0.0)
+    print(f"    verbatim replay: {replay_hits}/{n} served from cache; "
+          f"replay correctness {replay_correct}/{replay_hits} "
+          f"({fmt(replay_correctness)}), oracle coverage "
+          f"{fmt(cov_sum / n)}")
+
+    if example_hit is not None:
+        query_index, representative_query_index, docs = example_hit
+        print(f"\n    Example human re-ask — "
+              f"'{queries[query_index][1][:60]}'")
+        print(f"      backend selected the cached answer for "
+              f"'{queries[representative_query_index][1][:60]}'")
+        for doc_id in docs[:TOP_K]:
+            title, text = corpus[doc_id]
+            print(f"      * {(title or text)[:70]}")
+    elif human_reasks:
+        print("    no human re-ask was reused at the selected epsilon")
 
     # ---- Stage 7: savings -------------------------------------------------
-    avoided = replay_hits + served
+    avoided = semantic_hits + replay_hits
+    total_requests = n + n
     print("\n[7] Savings       (simulated, per query: "
           f"${COST_PER_CALL_USD:.4f} / {LATENCY_LLM_MS:.0f} ms)")
-    print(f"    avoided LLM calls     {avoided} (verbatim replay "
-          f"{replay_hits} + paraphrase {served})")
+    print(f"    LLM calls avoided     {avoided} (cold semantic reuse "
+          f"{semantic_hits} + verbatim replay {replay_hits})")
+    print(f"    actual LLM calls      {llm_calls}/{total_requests}")
     print(f"    cost saved            ${avoided * COST_PER_CALL_USD:.4f}")
     print(f"    latency saved         {avoided * LATENCY_LLM_MS / 1000:.2f}s "
           "of LLM time")
@@ -540,10 +761,11 @@ def main() -> int:
 
     print("\n" + "=" * 74)
     print("    Takeaway: FUTCache stores semantic regions, not strings.")
-    print("    Repeat intents are served in microseconds from a bounded,")
-    print("    geometrically-sized cache instead of re-running the LLM.")
-    print("    The safe epsilon is set by the embedding model's separation")
-    print("    boundary (measured in stage 4), never guessed.")
+    print("    Human-marked repeat intents are measured from shared qrels;")
+    print("    relevance labels score exact VP-tree decisions after the fact.")
+    if safe_dist is not None:
+        print("    The observed separation boundary is reported alongside")
+        print("    reuse, precision, misses, representatives, and replay.")
     print("=" * 74)
     return 0
 
