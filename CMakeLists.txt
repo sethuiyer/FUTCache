@@ -123,6 +123,16 @@ if(FUTCACHE_BUILD_EXAMPLES)
   add_executable(futcache_rag_embedding_example examples/rag_embedding.c)
   target_link_libraries(futcache_rag_embedding_example PRIVATE FUTCache::futcache m)
   futcache_enable_warnings(futcache_rag_embedding_example)
+
+  add_executable(futcache_crdt_example examples/crdt.c)
+  target_link_libraries(futcache_crdt_example PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_crdt_example PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_crdt_example)
+
+  add_executable(futcache_box_example examples/box.c)
+  target_link_libraries(futcache_box_example PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_box_example PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_box_example)
 endif()
 
 if(FUTCACHE_BUILD_BENCHMARKS)
