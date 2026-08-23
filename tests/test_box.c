@@ -166,13 +166,58 @@ static bool test_box_allocation_failure_atomicity(void)
     return true;
 }
 
+static bool test_box_validate_telemetry(void)
+{
+    double lower[] = {0.0};
+    double upper[] = {1.0};
+    double first[] = {0.2};
+    double second[] = {0.8};
+    double covered[] = {0.25};
+    futcache_box_config_t config;
+    futcache_box_stats_t stats;
+    futcache_box_t *cache = NULL;
+    bool novel = false;
+
+    futcache_box_config_init(&config);
+    config.dimension = 1U;
+    config.epsilon = 0.1;
+    config.domain_min = lower;
+    config.domain_max = upper;
+    TEST_STATUS(futcache_box_create(&config, &cache), FUTCACHE_OK);
+
+    TEST_STATUS(futcache_box_validate(cache), FUTCACHE_OK);
+
+    TEST_STATUS(futcache_box_observe(cache, first, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    TEST_STATUS(futcache_box_observe(cache, second, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    /* covered lies inside the first box; redundant, no new box. */
+    TEST_STATUS(futcache_box_observe(cache, covered, &novel), FUTCACHE_OK);
+    TEST_ASSERT(!novel);
+    TEST_STATUS(futcache_box_validate(cache), FUTCACHE_OK);
+
+    TEST_STATUS(futcache_box_get_stats(cache, &stats), FUTCACHE_OK);
+    uint64_t generation_before = stats.generation;
+    TEST_STATUS(futcache_box_clear(cache), FUTCACHE_OK);
+    TEST_STATUS(futcache_box_get_stats(cache, &stats), FUTCACHE_OK);
+    TEST_ASSERT(stats.generation == generation_before + UINT64_C(1));
+    TEST_ASSERT(stats.observations == UINT64_C(0));
+    TEST_ASSERT(stats.novel_observations == UINT64_C(0));
+    TEST_ASSERT(stats.box_count == 0U && stats.peak_box_count == 0U);
+    TEST_STATUS(futcache_box_validate(cache), FUTCACHE_OK);
+
+    futcache_box_destroy(cache);
+    return true;
+}
+
 int box_test_suite(void)
 {
     static const test_case_t tests[] = {
         {"box configuration", test_box_configuration},
         {"exact hand-checked L_inf union", test_box_hand_checked_union},
         {"domain validation and query purity", test_box_domain_and_query_purity},
-        {"allocation failure atomicity", test_box_allocation_failure_atomicity}
+        {"allocation failure atomicity", test_box_allocation_failure_atomicity},
+        {"telemetry and containment validation", test_box_validate_telemetry}
     };
     return run_test_cases("box", tests, sizeof(tests) / sizeof(tests[0]));
 }

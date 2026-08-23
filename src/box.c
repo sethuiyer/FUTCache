@@ -1,15 +1,28 @@
 /*
  * box.c — exact bounded-dim L_inf box-union novelty cache.
  *
- * The state is a sorted-by-construction-but-not-canonical list of
- * overlapping d-dimensional axis-aligned boxes (lo, hi). A point is
- * redundant iff it lies inside any stored box. Boxes are appended on
- * novel observations and never merged; for true future-equivalence
- * equivalence under box-union semantics, the interval-union cache in
- * futcache.c handles d=1 and the packing cache in pack.c handles
- * arbitrary metric (approximate). The box cache is the *exact* state
- * for L_inf novelty in 1..8 dimensions, kept simple rather than
- * canonical.
+ * The state is a list of closed d-dimensional axis-aligned boxes
+ * (lo, hi); a point is redundant iff it lies inside any stored box.
+ * A box is appended on every novel observation.
+ *
+ * Why the representation is exact but non-canonical (not minimal).
+ *
+ *   Each admitted box is the clipped epsilon-ball of a novel center x,
+ *   i.e. every prior center c satisfies d_inf(x, c) > epsilon. A newly
+ *   admitted box can therefore never strictly contain a previously
+ *   admitted box: if it did, it would contain that box's center c, so
+ *   d_inf(x, c) <= epsilon, contradicting novelty. The symmetric case
+ *   (new box contained in a prior box) is likewise impossible, and a
+ *   fortiori no two admitted boxes are exact duplicates. Boxes may
+ *   still partially overlap, which is what makes the union generally
+ *   non-canonical; the representation is never merged or split.
+ *
+ * Consequently box_count is a storage diagnostic (equal to the number
+ * of novel observations), bounded above by the packing number P(K,
+ * epsilon) but not a canonical minimal cell count. For a canonical
+ * 1-D union use the interval cache in futcache.c; a future disjoint
+ * cell backend could replace this representation without changing the
+ * public API.
  */
 
 #include "futcache/box.h"
@@ -116,6 +129,18 @@ static bool box_covered(const futcache_box_t *x, const double *p)
         if (inside) return true;
     }
     return false;
+}
+
+/* True when `outer` fully contains `inner` (inclusive bounds). */
+static bool box_rect_contains(const box_rect_t *outer, const box_rect_t *inner,
+                              size_t dimension)
+{
+    for (size_t i = 0; i < dimension; ++i) {
+        if (outer->lo[i] > inner->lo[i] || outer->hi[i] < inner->hi[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void futcache_box_config_init(futcache_box_config_t *c)
@@ -240,6 +265,7 @@ futcache_status_t futcache_box_observe(futcache_box_t *x, const double *p,
 
     if (box_covered(x, p)) {
         x->observations = box_saturating(x->observations);
+        x->generation = box_saturating(x->generation);
         if (out != NULL) *out = false;
         pthread_rwlock_unlock(&x->lock);
         return FUTCACHE_OK;
@@ -322,8 +348,19 @@ futcache_status_t futcache_box_validate(const futcache_box_t *x)
     if (x == NULL) return FUTCACHE_ERROR_INVALID_ARGUMENT;
     pthread_rwlock_t *lock = (pthread_rwlock_t *)&x->lock;
     pthread_rwlock_rdlock(lock);
+
+    /* Telemetry lifecycle invariants (mirror the interval engine). */
+    if (x->generation < x->observations ||
+        x->novel > x->observations ||
+        x->count != x->novel ||
+        x->count > x->peak_count) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+
+    size_t d = x->c.dimension;
     for (size_t j = 0; j < x->count; ++j) {
-        for (size_t i = 0; i < x->c.dimension; ++i) {
+        for (size_t i = 0; i < d; ++i) {
             if (x->rects[j].lo[i] < x->min[i] ||
                 x->rects[j].hi[i] > x->max[i] ||
                 x->rects[j].lo[i] > x->rects[j].hi[i]) {
@@ -332,6 +369,21 @@ futcache_status_t futcache_box_validate(const futcache_box_t *x)
             }
         }
     }
+
+    /* Containment invariant: no stored box contains another. By the
+     * novelty admission argument this always holds for genuinely novel
+     * centers; the check is a diagnostic guard against future changes
+     * to the append logic. O(n^2 * d), diagnostic only. */
+    for (size_t j = 0; j < x->count; ++j) {
+        for (size_t k = j + 1U; k < x->count; ++k) {
+            if (box_rect_contains(&x->rects[j], &x->rects[k], d) ||
+                box_rect_contains(&x->rects[k], &x->rects[j], d)) {
+                pthread_rwlock_unlock(lock);
+                return FUTCACHE_ERROR_CORRUPT_DATA;
+            }
+        }
+    }
+
     pthread_rwlock_unlock(lock);
     return FUTCACHE_OK;
 }

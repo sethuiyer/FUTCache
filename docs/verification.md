@@ -28,10 +28,10 @@ operations; destruction requires external quiescence.
 
 | Configuration | Result | Warnings/findings |
 |---|---|---|
-| GCC Debug, static, strongest project warnings, `-Werror` | 40 tests pass | none |
-| GCC Release, shared, strongest project warnings, `-Werror` | 40 tests pass | none |
-| GCC ASan + UBSan, Debug | 40 tests pass | none; leak detector disabled as noted below |
-| GCC TSan, Debug, non-PIE plus ASLR-disabled environment workaround | 40 tests pass | no races or lock findings |
+| GCC Debug, static, strongest project warnings, `-Werror` | 49 tests pass | none |
+| GCC Release, shared, strongest project warnings, `-Werror` | 49 tests pass | none |
+| GCC ASan + UBSan, Debug | 49 tests pass | none; leak detector disabled as noted below |
+| GCC TSan, Debug, non-PIE plus ASLR-disabled environment workaround | 49 tests pass | no races or lock findings |
 | Release examples and benchmarks, `-Werror` | build and run | RAG, n-d packing, LRU comparison clean |
 | GCC `-fanalyzer` | library builds | no analyzer findings |
 | Installed shared package + external `find_package` consumer | builds and runs | none |
@@ -69,15 +69,23 @@ This is a verification limitation, not an observed leak.
   novelty implication, adjacent projection, and composed projection match
   independent arrays and arithmetic. A focused two-level test checks the exact
   discovery-word identity `q_(1,0)(D_1(L)) = D_0(L)` element by element.
-- The packing cache has eleven tests covering configurable metrics, Voronoi
+- The packing cache has twelve tests covering configurable metrics, Voronoi
   representative separation, query purity, allocator failure, concurrency,
-  and the pluggable nearest-neighbour backend lifecycle. Approximate backend
+  the pluggable nearest-neighbour backend lifecycle, and the nearest-site
+  id/distance lookup (`futcache_pack_nearest`). Approximate backend
   semantics are explicitly one-sided: over-estimation may report extra
   novelty, but must not suppress a genuinely novel point.
-- The exact `L_inf` box cache has four tests covering bounded 2D/3D unions,
-  clipping, domain errors, query purity, clear semantics, and allocation
-  failure atomicity. Its append-only overlapping boxes are exact but not a
+- The exact `L_inf` box cache has five tests covering bounded 2D/3D unions,
+  clipping, domain errors, query purity, clear semantics, allocation
+  failure atomicity, and lifecycle-telemetry/containment validation. Its
+  boxes may partially overlap but, by the novelty admission invariant, can
+  never strictly contain one another; the representation is exact but not a
   canonical minimal cell decomposition.
+- The deterministic-Voronoi CRDT cache has seven tests covering
+  configuration validation, hand-checked quantization (including tie
+  breaking), cell test-and-set and semantic reuse, priority-based merge,
+  idempotence, two-way gossip convergence, snapshot roundtrip, clear, and
+  allocation-failure atomicity.
 - Concurrent observations, queries, serialization/restoration, tower reads,
   and tower writes remain valid under TSan.
 

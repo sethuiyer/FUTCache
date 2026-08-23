@@ -199,12 +199,30 @@ FUTCACHE_API futcache_status_t futcache_pack_copy_representatives(
     size_t *inout_count
 );
 
+/*
+ * Reports the distance to, and slot index of, the nearest representative.
+ * On an empty cache, `*out_distance` is +infinity and `*out_index` is
+ * SIZE_MAX. The index matches the ordering used by
+ * futcache_pack_copy_representatives(). This always scans the linear
+ * representative array (a custom nearest-neighbour backend does not
+ * expose per-representative identities), so it is O(|R|) and never
+ * mutates state.
+ */
+FUTCACHE_API futcache_status_t futcache_pack_nearest(
+    const futcache_pack_t *cache,
+    const double *point,
+    double *out_distance,
+    size_t *out_index
+);
+
 /* Empties the representative set; bumps generation. */
 FUTCACHE_API futcache_status_t futcache_pack_clear(futcache_pack_t *cache);
 
 /*
- * Validates the epsilon-separation invariant: every pair of representatives
- * is strictly farther than epsilon apart. O(n^2) in the representative count.
+ * Validates the epsilon-separation invariant (every pair of representatives
+ * is strictly farther than epsilon apart) and the telemetry lifecycle
+ * invariants (generation >= observations, novel <= observations, count ==
+ * novel, count <= peak). O(n^2) in the representative count.
  */
 FUTCACHE_API futcache_status_t futcache_pack_validate(const futcache_pack_t *cache);
 

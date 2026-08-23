@@ -682,6 +682,14 @@ FUTCACHE_API futcache_status_t futcache_crdt_validate(
     const futcache_crdt_t *cache);
 ```
 
+> **Implementation status:** this skeleton is now implemented in
+> `include/futcache/crdt.h` and `src/crdt.c`. The shipped API matches the
+> sketch above and additionally provides `futcache_crdt_config_init`,
+> `futcache_crdt_get_stats`, `futcache_crdt_get_payload`, and
+> `futcache_crdt_clear` for consistency with the other engines. The
+> priority is `pi = FNV-1a(x || payload)` over canonical little-endian
+> coordinates; merge keeps the higher priority, ties keep the local entry.
+
 The three engines share a common algebraic backbone:
 
 $$\boxed{

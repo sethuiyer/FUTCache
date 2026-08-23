@@ -58,6 +58,7 @@ add_library(futcache ${FUTCACHE_LIBRARY_TYPE}
   src/tower.c
   src/pack.c
   src/box.c
+  src/crdt.c
 )
 add_library(FUTCache::futcache ALIAS futcache)
 
@@ -102,6 +103,7 @@ if(BUILD_TESTING)
     tests/test_tower.c
     tests/test_pack.c
     tests/test_box.c
+    tests/test_crdt.c
   )
   target_link_libraries(futcache_tests PRIVATE FUTCache::futcache)
   target_compile_features(futcache_tests PRIVATE c_std_11)
@@ -206,6 +208,7 @@ install(FILES
 )
 install(FILES
   README.md
+  LICENSE
   docs/serialization.md
   docs/verification.md
   DESTINATION ${CMAKE_INSTALL_DOCDIR}

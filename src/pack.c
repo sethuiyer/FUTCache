@@ -552,6 +552,43 @@ futcache_status_t futcache_pack_copy_representatives(
     return FUTCACHE_OK;
 }
 
+futcache_status_t futcache_pack_nearest(
+    const futcache_pack_t *cache,
+    const double *point,
+    double *out_distance,
+    size_t *out_index)
+{
+    if (cache == NULL || point == NULL || out_distance == NULL ||
+        out_index == NULL) {
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+    if (!point_in_domain(cache, point)) {
+        return FUTCACHE_ERROR_OUT_OF_RANGE;
+    }
+
+    pthread_rwlock_t *lock = (pthread_rwlock_t *)&cache->lock;
+    pthread_rwlock_rdlock(lock);
+
+    double min_d = INFINITY;
+    size_t min_i = SIZE_MAX;
+    pack_representative_t *const *reps = cache->representatives;
+    futcache_distance_fn distance = cache->distance;
+    void *context = cache->distance_context;
+    size_t dim = cache->dimension;
+    for (size_t i = 0; i < cache->count; ++i) {
+        double d = distance(point, reps[i]->coordinates, dim, context);
+        if (d < min_d) {
+            min_d = d;
+            min_i = i;
+        }
+    }
+
+    pthread_rwlock_unlock(lock);
+    *out_distance = min_d;
+    *out_index = min_i;
+    return FUTCACHE_OK;
+}
+
 futcache_status_t futcache_pack_clear(futcache_pack_t *cache)
 {
     if (cache == NULL) return FUTCACHE_ERROR_INVALID_ARGUMENT;
@@ -579,6 +616,15 @@ futcache_status_t futcache_pack_validate(const futcache_pack_t *cache)
 
     pthread_rwlock_t *lock = (pthread_rwlock_t *)&cache->lock;
     pthread_rwlock_rdlock(lock);
+
+    /* Telemetry lifecycle invariants (mirror the interval engine). */
+    if (cache->generation < cache->observations ||
+        cache->novel_observations > cache->observations ||
+        cache->count != cache->novel_observations ||
+        cache->count > cache->peak_count) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
 
     /* Pairwise epsilon-separation. O(n^2) — diagnostic only. */
     futcache_distance_fn distance = cache->distance;

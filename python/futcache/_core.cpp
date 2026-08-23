@@ -66,6 +66,7 @@ public:
               nb::object domain_min,
               nb::object domain_max)
         : dimension_(static_cast<size_t>(dimension)),
+          epsilon_(epsilon),
           payload_mutex_(),
           payloads_() {
         if (dimension <= 0) {
@@ -127,20 +128,19 @@ public:
         check_point(point);
 
         futcache_pack_t *c = cache_;
-        bool novel = false;
-        futcache_status_t st = futcache_pack_is_novel(c, point.data(), &novel);
+        double nearest_distance = 0.0;
+        size_t nearest_idx = 0;
+        futcache_status_t st = futcache_pack_nearest(
+            c, point.data(), &nearest_distance, &nearest_idx);
         if (st != FUTCACHE_OK) {
             throw std::runtime_error("query failed with status " +
                                      std::to_string(static_cast<int>(st)));
         }
-        // query is non-mutating; the C API does not currently expose
-        // which representative matched, so rep_id is -1 on novel and
-        // an unset placeholder otherwise. A future API exposing the
-        // nearest-site id will let us populate it cleanly.
+        bool novel = nearest_distance > epsilon_;
         NoveltyResult r;
-        r.representative_id = novel ? -1 : 0;
+        r.representative_id = novel ? -1 : static_cast<int>(nearest_idx);
         r.is_novel = novel;
-        r.distance = 0.0;
+        r.distance = nearest_distance;
         r.inserted = false;
         return r;
     }
@@ -202,10 +202,19 @@ public:
                     std::string(payload_data, payload_len);
             }
         } else {
-            /* redundant: id of the matched rep is not exposed by the
-             * C API yet. Caller should consult get_payload() after
-             * determining novelty through a domain-specific key. */
-            r.representative_id = -1;
+            /* Redundant: recover the matched representative and its
+             * distance so callers can do confidence-aware caching. */
+            double nearest_distance = 0.0;
+            size_t nearest_idx = 0;
+            futcache_status_t nst = futcache_pack_nearest(
+                cache_, point.data(), &nearest_distance, &nearest_idx);
+            if (nst != FUTCACHE_OK) {
+                throw std::runtime_error(
+                    "nearest lookup failed with status " +
+                    std::to_string(static_cast<int>(nst)));
+            }
+            r.representative_id = static_cast<int>(nearest_idx);
+            r.distance = nearest_distance;
         }
 
         return r;
@@ -349,6 +358,7 @@ private:
     }
 
     size_t dimension_;
+    double epsilon_;
     futcache_pack_t *cache_;
     std::vector<double> domain_lo_;
     std::vector<double> domain_hi_;
@@ -372,7 +382,7 @@ NB_MODULE(futcache_ext, m) {
         .def_rw("is_novel", &NoveltyResult::is_novel,
                 "True when the point is farther than epsilon from every existing rep")
         .def_rw("distance", &NoveltyResult::distance,
-                "Distance to nearest representative (currently 0; reserved)")
+                "Distance to the nearest representative (0.0 for a novel insertion)")
         .def_rw("inserted", &NoveltyResult::inserted,
                 "True when observe() added a new representative");
 

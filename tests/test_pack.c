@@ -874,6 +874,55 @@ static bool test_pluggable_backend_lifecycle_and_atomicity(void)
     return backend_stats.destroys == 1U;
 }
 
+static bool test_nearest(void)
+{
+    futcache_pack_config_t cfg;
+    futcache_pack_t *cache = NULL;
+    double lo[2] = {0.0, 0.0};
+    double hi[2] = {1.0, 1.0};
+    double a[2] = {0.1, 0.1};
+    double b[2] = {0.9, 0.9};
+    double q[2] = {0.12, 0.12};
+    double far[2] = {0.5, 0.5};
+    double distance = 0.0;
+    size_t index = 0U;
+    bool novel = false;
+
+    futcache_pack_config_init(&cfg);
+    cfg.dimension = 2U;
+    cfg.epsilon = 0.1;
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+    TEST_STATUS(futcache_pack_create(&cfg, &cache), FUTCACHE_OK);
+
+    /* Empty cache reports +inf and SIZE_MAX. */
+    TEST_STATUS(futcache_pack_nearest(cache, a, &distance, &index),
+                FUTCACHE_OK);
+    TEST_ASSERT(isinf(distance) && distance > 0.0);
+    TEST_ASSERT(index == SIZE_MAX);
+
+    TEST_STATUS(futcache_pack_observe(cache, a, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    TEST_STATUS(futcache_pack_observe(cache, b, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+
+    /* q is nearest to a (L_inf distance 0.02). */
+    TEST_STATUS(futcache_pack_nearest(cache, q, &distance, &index),
+                FUTCACHE_OK);
+    TEST_ASSERT(index == 0U);
+    TEST_NEAR(distance, 0.02, 1e-12);
+
+    /* far is equidistant from a and b under L_inf (0.4): ties take the
+     * smallest index. */
+    TEST_STATUS(futcache_pack_nearest(cache, far, &distance, &index),
+                FUTCACHE_OK);
+    TEST_ASSERT(index == 0U);
+    TEST_NEAR(distance, 0.4, 1e-12);
+
+    futcache_pack_destroy(cache);
+    return true;
+}
+
 /* ============================================================
  * Test suite registration
  * ============================================================ */
@@ -895,6 +944,7 @@ int pack_test_suite(void)
         {"concurrent observers", test_pack_concurrent_observers},
         {"pluggable backend lifecycle and atomicity",
             test_pluggable_backend_lifecycle_and_atomicity},
+        {"nearest representative and distance", test_nearest},
     };
     return run_test_cases("pack", tests, sizeof(tests) / sizeof(tests[0]));
 }

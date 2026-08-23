@@ -24,13 +24,14 @@ class NoveltyResult:
 
     Attributes:
         representative_id: slot index of the matched or new
-            representative, or -1 if the point was novel (and therefore
-            no representative existed yet to match against) or if the
-            matched representative id could not be recovered (current
-            limitation of the underlying C API).
+            representative. It is -1 only for a novel query/observation
+            (no representative existed yet to match against). On a
+            semantic HIT this is the index to pass to ``get_payload()``.
         is_novel: True when the point is farther than epsilon from
             every existing representative.
-        distance: reserved for future C API exposing nearest distance.
+        distance: distance to the nearest representative. For a novel
+            ``observe()`` this is 0.0 (the point became its own
+            representative); for a HIT it is ``<= epsilon``.
         inserted: True when ``observe()`` added a new representative.
     """
 

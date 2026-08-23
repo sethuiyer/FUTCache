@@ -48,6 +48,9 @@ specify fidelity (`epsilon`), and the geometry determines memory use.
 - An exact bounded-dimensional `L_inf` box-union cache (`<futcache/box.h>`)
   for applications that need full d-dimensional ball coverage rather than
   representative packing.
+- A deterministic-Voronoi, gossip-mergeable CRDT cache
+  (`<futcache/crdt.h>`) whose replicas converge without coordination by
+  joining cell entries under a deterministic priority (see `PHASE2.md`).
 - Randomized differential, boundary, fault-injection, persistence, and
   multithreaded tests.
 - A `bench/cache_comparison.c` benchmark pitting FUTCache against LRU and an
@@ -356,11 +359,15 @@ at all, and at what threshold.
 Include `<futcache/box.h>` when the exact full-history predicate is required
 in dimensions higher than one. Each observation contributes its clipped
 axis-aligned `epsilon`-box, and queries test membership in the exact union.
-The current implementation supports dimensions 1 through 8 and uses an
-append-only overlapping-box representation: `box_count` is storage size,
-not a packing bound or a canonical minimal decomposition. This deliberately
-keeps the exact semantics simple while leaving a future disjoint-cell
-backend replaceable behind the same API.
+The current implementation supports dimensions 1 through 8. The
+representation is exact but non-canonical: each novel observation appends its
+clipped `epsilon`-box, and stored boxes may partially overlap but, by the
+novelty admission invariant, can never strictly contain one another (a new
+box containing a prior box would place that prior center within `epsilon`,
+contradicting novelty). `box_count` is therefore a storage diagnostic (equal
+to the number of novel observations), not a canonical minimal cell count. A
+future disjoint-cell backend could replace this representation without
+changing the API.
 
 `futcache_rag_embedding_example` demonstrates a 384-dimensional normalized
 embedding stream with a cosine-distance callback, representative export, and
@@ -405,6 +412,11 @@ The wrapper exposes:
 - `PackCache.version() -> "1.1.0"`
 
 Supported distance names: `"linf"` (default), `"l1"`, `"l2"`, `"cosine"`.
+
+On a semantic HIT, `NoveltyResult.representative_id` is the slot index to
+pass to `get_payload()`, and `NoveltyResult.distance` is the distance to the
+nearest representative (a HIT has `distance <= epsilon`). On a novel
+observation `representative_id` is `-1` and `distance` is `0.0`.
 
 ## Empirical comparison vs LRU
 
@@ -511,3 +523,7 @@ similarity. Replicas gossip occupied cells; set union is commutative,
 associative, and idempotent; convergence is unconditional. The
 asymptotic cache dimension is unchanged — only the constant factor
 shifts by $2^D$.
+
+The CRDT engine described there is now implemented in `<futcache/crdt.h>`
+(`src/crdt.c`): deterministic Voronoi quantization, per-cell join under a
+deterministic priority, snapshot/merge gossip, and validation.

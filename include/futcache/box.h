@@ -12,14 +12,19 @@ extern "C" {
 #endif
 
 /* Exact L_inf novelty coverage for a bounded, fixed-dimensional domain.
- * The current implementation supports dimensions 1..8 and stores the union
- * as an append-only list of closed epsilon boxes.  Overlap is intentional:
- * the representation is exact but not canonical/minimal; box_count is a
- * storage diagnostic.  The per-box centers (p) are L_inf-eps-separated
- * (because novelty gating is by d(x, R) > eps at observation time), so the
- * box count is bounded above by the packing number P(K, eps), though it may
- * exceed P(K, eps) due to overlap.  A future canonical cell backend can
- * replace the representation without changing this API. */
+ * Supports dimensions 1..8 and stores the union as a list of closed
+ * epsilon boxes (one per novel observation).
+ *
+ * The representation is exact but non-canonical (not a minimal box
+ * union). Under the novelty admission invariant a newly admitted box
+ * can never strictly contain, be contained in, or duplicate a previously
+ * admitted box — doing so would place the prior center within epsilon of
+ * the new center, contradicting novelty — so stored boxes are pairwise
+ * non-redundant under containment and only partially overlap. box_count
+ * is therefore a storage diagnostic (equal to the number of novel
+ * observations), bounded above by the packing number P(K, eps) but not a
+ * canonical minimal cell count. A future disjoint-cell backend could
+ * replace this representation without changing this API. */
 typedef struct futcache_box_config {
     size_t dimension;
     double epsilon;

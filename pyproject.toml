@@ -28,7 +28,7 @@ Homepage = "https://github.com/example/futcache"
 [tool.scikit-build]
 cmake.version = ">=3.16"
 wheel.packages = ["python/futcache"]
-wheel.license-files = []
+wheel.license-files = ["LICENSE"]
 
 [tool.scikit-build.cmake.define]
 FUTCACHE_BUILD_PYTHON = "ON"
