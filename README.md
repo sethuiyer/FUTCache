@@ -1,5 +1,9 @@
 # FUTCache
 
+<p align="center">
+  <img src="logo.webp" alt="FUTCache logo" width="420" />
+</p>
+
 FUTCache is a C11 implementation of future-equivalence caching for metric
 novelty. It stores what future novelty queries can observe, rather than storing
 the observation history or evicting recent items.
