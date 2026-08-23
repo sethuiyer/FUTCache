@@ -28,10 +28,10 @@ operations; destruction requires external quiescence.
 
 | Configuration | Result | Warnings/findings |
 |---|---|---|
-| GCC Debug, static, strongest project warnings, `-Werror` | 49 tests pass | none |
-| GCC Release, shared, strongest project warnings, `-Werror` | 49 tests pass | none |
-| GCC ASan + UBSan, Debug | 49 tests pass | none; leak detector disabled as noted below |
-| GCC TSan, Debug, non-PIE plus ASLR-disabled environment workaround | 49 tests pass | no races or lock findings |
+| GCC Debug, static, strongest project warnings, `-Werror` | 55 tests pass | none |
+| GCC Release, shared, strongest project warnings, `-Werror` | 55 tests pass | none |
+| GCC ASan + UBSan, Debug | 55 tests pass | none; leak detector disabled as noted below |
+| GCC TSan, Debug, non-PIE plus ASLR-disabled environment workaround | 55 tests pass | no races or lock findings |
 | Release examples and benchmarks, `-Werror` | build and run | RAG, n-d packing, LRU comparison clean |
 | GCC `-fanalyzer` | library builds | no analyzer findings |
 | Installed shared package + external `find_package` consumer | builds and runs | none |
@@ -81,11 +81,20 @@ This is a verification limitation, not an observed leak.
   boxes may partially overlap but, by the novelty admission invariant, can
   never strictly contain one another; the representation is exact but not a
   canonical minimal cell decomposition.
-- The deterministic-Voronoi CRDT cache has seven tests covering
+- The deterministic-Voronoi CRDT cache has thirteen tests covering
   configuration validation, hand-checked quantization (including tie
   breaking), cell test-and-set and semantic reuse, priority-based merge,
-  idempotence, two-way gossip convergence, snapshot roundtrip, clear, and
-  allocation-failure atomicity.
+  idempotence, two-way gossip convergence, snapshot roundtrip, clear,
+  allocation-failure atomicity, and the anchor-construction family
+  (`futcache_crdt_generate_halton_anchors`,
+  `futcache_crdt_generate_grid_anchors`,
+  `futcache_crdt_grid_covering_radius`,
+  `futcache_crdt_estimate_covering_radius`, and
+  `futcache_crdt_generate_safe_anchors`). The grid construction carries a
+  certified covering radius under L1/L2/L_inf (no sampling); the Halton net
+  uses successive primes as radical-inverse bases and carries only an
+  estimated (lower-bound) radius, which the tests assert never exceeds the
+  certified grid radius for the same resolution.
 - Concurrent observations, queries, serialization/restoration, tower reads,
   and tower writes remain valid under TSan.
 

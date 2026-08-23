@@ -530,4 +530,11 @@ shifts by $2^D$.
 
 The CRDT engine described there is now implemented in `<futcache/crdt.h>`
 (`src/crdt.c`): deterministic Voronoi quantization, per-cell join under a
-deterministic priority, snapshot/merge gossip, and validation.
+deterministic priority, snapshot/merge gossip, and validation. It also ships
+anchor-construction helpers that close the delta-net gap: a certified
+uniform-grid generator (`futcache_crdt_generate_grid_anchors` +
+`futcache_crdt_grid_covering_radius`), a low-discrepancy Halton generator
+(`futcache_crdt_generate_halton_anchors`, successive primes as radical-inverse
+bases), a sampled covering-radius estimator, and
+`futcache_crdt_generate_safe_anchors` to build the smallest net whose
+covering radius is at most epsilon/2.

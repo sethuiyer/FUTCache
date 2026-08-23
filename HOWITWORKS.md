@@ -165,7 +165,7 @@ tests/                         test harness and per-engine suites
     test_pack.c                12 tests
     test_tower.c               7 tests
     test_box.c                 5 tests
-    test_crdt.c                7 tests
+    test_crdt.c                13 tests
 examples/                      C demonstration programs
     basic.c                    interval engine walkthrough
     rag_embedding.c            384-d cosine packing demo
@@ -776,9 +776,9 @@ The class also exposes `copy_representatives()` (an `(N, dimension)` array),
 ## 16. Testing and verification
 
 The test suite is the primary specification of behavior. It runs as a single
-executable with one line per test, 49 tests across five suites at the time of
+executable with one line per test, 55 tests across five suites at the time of
 writing: 18 for the interval engine, 12 for packing, 7 for the tower, 5 for
-the box cache, and 7 for the CRDT.
+the box cache, and 13 for the CRDT.
 
 The verification strategy, recorded in `docs/verification.md`, is:
 

@@ -170,6 +170,124 @@ FUTCACHE_API futcache_status_t futcache_crdt_clear(futcache_crdt_t *cache);
 FUTCACHE_API futcache_status_t futcache_crdt_validate(
     const futcache_crdt_t *cache);
 
+/* ============================================================
+ * Anchor construction (delta-net generators and coverage checks)
+ *
+ * The CRDT theorem requires the anchor set A to be a delta-net of the
+ * domain with covering radius rho(A) <= epsilon/2. These helpers close
+ * that gap: they either construct such a net or measure how close a
+ * candidate comes.
+ *
+ * The construction strategies are:
+ *   - FUTCACHE_CRDT_ANCHOR_GRID:   a uniform tensor grid. Its covering
+ *     radius is *certified* exactly (no sampling) under L1/L2/L_inf.
+ *   - FUTCACHE_CRDT_ANCHOR_HALTON: a low-discrepancy Halton net, whose
+ *     coordinates use successive primes as radical-inverse bases. Its
+ *     covering radius is only *estimated* by sampling, so a passing net
+ *     is a heuristic, not a certificate.
+ *   - USER (the existing config path): the caller supplies anchors and
+ *     remains responsible for the delta-net contract.
+ * ============================================================ */
+
+typedef enum futcache_crdt_anchor_strategy {
+    FUTCACHE_CRDT_ANCHOR_GRID = 0,
+    FUTCACHE_CRDT_ANCHOR_HALTON = 1
+} futcache_crdt_anchor_strategy_t;
+
+/*
+ * Fills `out_anchors` ([anchor_count * dimension], caller-owned) with a
+ * Halton low-discrepancy net: anchor n has coordinate i equal to
+ *   domain_min[i] + (domain_max[i] - domain_min[i]) * phi_{p_i}(n),
+ * where phi_b is the base-b radical inverse and p_i is the (i+1)-th prime.
+ */
+FUTCACHE_API futcache_status_t futcache_crdt_generate_halton_anchors(
+    size_t dimension,
+    const double *domain_min,
+    const double *domain_max,
+    size_t anchor_count,
+    double *out_anchors);
+
+/*
+ * Fills `out_anchors` with a uniform tensor grid of `cells_per_axis` cells
+ * per coordinate (anchors at cell centers) and writes the total anchor
+ * count (cells_per_axis^dimension) to `*out_anchor_count`. Caller owns the
+ * buffer, which must hold cells_per_axis^dimension * dimension doubles.
+ */
+FUTCACHE_API futcache_status_t futcache_crdt_generate_grid_anchors(
+    size_t dimension,
+    const double *domain_min,
+    const double *domain_max,
+    size_t cells_per_axis,
+    double *out_anchors,
+    size_t *out_anchor_count);
+
+/*
+ * Estimates rho(A) = sup_{x in K} min_{a in A} d(x, a) by sampling
+ * `probe_count` deterministic quasi-random points in the domain and
+ * returning the largest min-distance seen. This is a LOWER bound on the
+ * true covering radius (sampling can miss the worst point), so a result
+ * <= epsilon/2 is a heuristic, not a certificate. `distance` NULL selects
+ * L_inf. Deterministic: same inputs give the same result.
+ */
+FUTCACHE_API futcache_status_t futcache_crdt_estimate_covering_radius(
+    const double *anchors,
+    size_t anchor_count,
+    size_t dimension,
+    const double *domain_min,
+    const double *domain_max,
+    futcache_distance_fn distance,
+    void *distance_context,
+    size_t probe_count,
+    double *out_radius);
+
+/*
+ * Returns the EXACT covering radius of a centered uniform grid under
+ * L1/L2/L_inf: rho = (1/(2*cells_per_axis)) * ||domain_max - domain_min||_p,
+ * where ||.||_p is the metric's norm. This is a certificate, not an
+ * estimate. `distance` NULL selects L_inf. Cosine or a custom distance has
+ * no grid bound and returns FUTCACHE_ERROR_INVALID_ARGUMENT.
+ */
+FUTCACHE_API futcache_status_t futcache_crdt_grid_covering_radius(
+    size_t dimension,
+    const double *domain_min,
+    const double *domain_max,
+    size_t cells_per_axis,
+    futcache_distance_fn distance,
+    void *distance_context,
+    double *out_radius);
+
+/*
+ * Builds the smallest anchor set whose covering radius is <= epsilon/2,
+ * bounded by `max_anchors`.
+ *
+ * GRID: computes the minimal cells-per-axis (certified radius) and returns
+ *   it if cells_per_axis^dimension <= max_anchors; otherwise returns
+ *   FUTCACHE_ERROR_OUT_OF_RANGE with `*out_anchor_count` set to the
+ *   required count and `*out_covering_radius` to the certified radius that
+ *   grid would achieve.
+ * HALTON: doubles the anchor count from 1 until the sampled radius estimate
+ *   is <= epsilon/2 or the count exceeds max_anchors. On success the result
+ *   is heuristic (estimate, not certificate). On failure `*out_anchor_count`
+ *   is 0 and `*out_covering_radius` is the estimate at the largest count
+ *   tried.
+ *
+ * `out_anchors` must hold max_anchors * dimension doubles (caller-owned).
+ * `probe_count` is used only by HALTON. `distance` NULL selects L_inf.
+ */
+FUTCACHE_API futcache_status_t futcache_crdt_generate_safe_anchors(
+    size_t dimension,
+    double epsilon,
+    const double *domain_min,
+    const double *domain_max,
+    futcache_distance_fn distance,
+    void *distance_context,
+    futcache_crdt_anchor_strategy_t strategy,
+    size_t max_anchors,
+    size_t probe_count,
+    double *out_anchors,
+    size_t *out_anchor_count,
+    double *out_covering_radius);
+
 #ifdef __cplusplus
 }
 #endif

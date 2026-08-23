@@ -445,6 +445,229 @@ static bool test_crdt_allocation_failure_atomicity(void)
     return true;
 }
 
+/* ---- Anchor construction: halton / grid / coverage ---- */
+
+static bool test_crdt_halton_anchors(void)
+{
+    double lo1[] = {0.0};
+    double hi1[] = {1.0};
+    double a1[4];
+    double lo2[] = {0.0, 0.0};
+    double hi2[] = {1.0, 1.0};
+    double a2[8];
+
+    /* 1-D, base 2 van der Corput: {0.0, 0.5, 0.25, 0.75}. */
+    TEST_STATUS(futcache_crdt_generate_halton_anchors(1U, lo1, hi1, 4U, a1),
+                FUTCACHE_OK);
+    TEST_NEAR(a1[0], 0.00, 1e-12);
+    TEST_NEAR(a1[1], 0.50, 1e-12);
+    TEST_NEAR(a1[2], 0.25, 1e-12);
+    TEST_NEAR(a1[3], 0.75, 1e-12);
+
+    /* 2-D: coordinate 0 base 2, coordinate 1 base 3. */
+    TEST_STATUS(futcache_crdt_generate_halton_anchors(2U, lo2, hi2, 4U, a2),
+                FUTCACHE_OK);
+    TEST_NEAR(a2[0], 0.0, 1e-12); /* phi_2(0) */
+    TEST_NEAR(a2[1], 0.0, 1e-12); /* phi_3(0) */
+    TEST_NEAR(a2[2], 0.5, 1e-12); /* phi_2(1) */
+    TEST_NEAR(a2[3], 1.0 / 3.0, 1e-12); /* phi_3(1) */
+    TEST_NEAR(a2[4], 0.25, 1e-12); /* phi_2(2) */
+    TEST_NEAR(a2[5], 2.0 / 3.0, 1e-12); /* phi_3(2) */
+
+    /* In-domain for a shifted box. */
+    double lo3[] = {10.0, -5.0};
+    double hi3[] = {20.0, 5.0};
+    double a3[16];
+    TEST_STATUS(futcache_crdt_generate_halton_anchors(2U, lo3, hi3, 8U, a3),
+                FUTCACHE_OK);
+    for (size_t k = 0U; k < 8U; ++k) {
+        TEST_ASSERT(a3[2U * k] >= 10.0 && a3[2U * k] <= 20.0);
+        TEST_ASSERT(a3[2U * k + 1U] >= -5.0 && a3[2U * k + 1U] <= 5.0);
+    }
+
+    /* Invalid arguments. */
+    TEST_STATUS(futcache_crdt_generate_halton_anchors(0U, lo1, hi1, 4U, a1),
+                FUTCACHE_ERROR_INVALID_ARGUMENT);
+    TEST_STATUS(futcache_crdt_generate_halton_anchors(1U, lo1, hi1, 0U, a1),
+                FUTCACHE_ERROR_INVALID_ARGUMENT);
+    TEST_STATUS(futcache_crdt_generate_halton_anchors(1U, lo1, hi1, 4U, NULL),
+                FUTCACHE_ERROR_INVALID_ARGUMENT);
+    return true;
+}
+
+static bool test_crdt_grid_anchors(void)
+{
+    double lo1[] = {0.0};
+    double hi1[] = {1.0};
+    double g1[4];
+    size_t count = 0U;
+
+    TEST_STATUS(futcache_crdt_generate_grid_anchors(1U, lo1, hi1, 3U, g1,
+                &count), FUTCACHE_OK);
+    TEST_ASSERT(count == 3U);
+    TEST_NEAR(g1[0], 1.0 / 6.0, 1e-12);
+    TEST_NEAR(g1[1], 0.5, 1e-12);
+    TEST_NEAR(g1[2], 5.0 / 6.0, 1e-12);
+
+    /* 2-D, 2 cells per axis: 4 anchors at quadrant centers. */
+    double lo2[] = {0.0, 0.0};
+    double hi2[] = {1.0, 1.0};
+    double g2[8];
+    TEST_STATUS(futcache_crdt_generate_grid_anchors(2U, lo2, hi2, 2U, g2,
+                &count), FUTCACHE_OK);
+    TEST_ASSERT(count == 4U);
+    TEST_NEAR(g2[0], 0.25, 1e-12);
+    TEST_NEAR(g2[1], 0.25, 1e-12);
+    TEST_NEAR(g2[2], 0.75, 1e-12);
+    TEST_NEAR(g2[3], 0.25, 1e-12);
+    TEST_NEAR(g2[4], 0.25, 1e-12);
+    TEST_NEAR(g2[5], 0.75, 1e-12);
+    TEST_NEAR(g2[6], 0.75, 1e-12);
+    TEST_NEAR(g2[7], 0.75, 1e-12);
+
+    TEST_STATUS(futcache_crdt_generate_grid_anchors(1U, lo1, hi1, 0U, g1,
+                &count), FUTCACHE_ERROR_INVALID_ARGUMENT);
+    return true;
+}
+
+static bool test_crdt_grid_covering_radius(void)
+{
+    double lo1[] = {0.0};
+    double hi1[] = {1.0};
+    double lo2[] = {0.0, 0.0};
+    double hi2[] = {1.0, 1.0};
+    double lo3[] = {0.0};
+    double hi3[] = {2.0};
+    double radius = 0.0;
+
+    /* L_inf, 1-D [0,1], n=2: rho = 1/(2*2) = 0.25. */
+    TEST_STATUS(futcache_crdt_grid_covering_radius(1U, lo1, hi1, 2U, NULL,
+                NULL, &radius), FUTCACHE_OK);
+    TEST_NEAR(radius, 0.25, 1e-12);
+
+    /* L2, 2-D [0,1]^2, n=2: rho = sqrt(2)/(2*2). */
+    TEST_STATUS(futcache_crdt_grid_covering_radius(2U, lo2, hi2, 2U,
+                futcache_distance_l2, NULL, &radius), FUTCACHE_OK);
+    TEST_NEAR(radius, sqrt(2.0) / 4.0, 1e-12);
+
+    /* L1, 1-D [0,2], n=4: rho = 2/(2*4) = 0.25. */
+    TEST_STATUS(futcache_crdt_grid_covering_radius(1U, lo3, hi3, 4U,
+                futcache_distance_l1, NULL, &radius), FUTCACHE_OK);
+    TEST_NEAR(radius, 0.25, 1e-12);
+
+    /* Cosine has no grid bound. */
+    TEST_STATUS(futcache_crdt_grid_covering_radius(1U, lo1, hi1, 2U,
+                futcache_distance_cosine, NULL, &radius),
+                FUTCACHE_ERROR_INVALID_ARGUMENT);
+    return true;
+}
+
+static bool test_crdt_estimate_covering_radius(void)
+{
+    double lo[] = {0.0};
+    double hi[] = {1.0};
+    double one[] = {0.5};
+    double grid[8];
+    size_t count = 0U;
+    double radius = 0.0;
+
+    /* Single anchor at 0.5: true radius 0.5; estimate approaches it. */
+    TEST_STATUS(futcache_crdt_estimate_covering_radius(one, 1U, 1U, lo, hi,
+                NULL, NULL, 65536U, &radius), FUTCACHE_OK);
+    TEST_NEAR(radius, 0.5, 0.01);
+    TEST_ASSERT(radius <= 0.5 + 1e-12); /* lower bound never exceeds true */
+
+    /* A 4-cell grid has certified radius 0.125; estimate is a lower bound. */
+    TEST_STATUS(futcache_crdt_generate_grid_anchors(1U, lo, hi, 4U, grid,
+                &count), FUTCACHE_OK);
+    TEST_ASSERT(count == 4U);
+    TEST_STATUS(futcache_crdt_estimate_covering_radius(grid, 4U, 1U, lo, hi,
+                NULL, NULL, 65536U, &radius), FUTCACHE_OK);
+    TEST_ASSERT(radius <= 0.125 + 1e-12);
+    TEST_ASSERT(radius >= 0.12);
+
+    /* Invalid arguments. */
+    TEST_STATUS(futcache_crdt_estimate_covering_radius(one, 0U, 1U, lo, hi,
+                NULL, NULL, 8U, &radius), FUTCACHE_ERROR_INVALID_ARGUMENT);
+    TEST_STATUS(futcache_crdt_estimate_covering_radius(one, 1U, 1U, lo, hi,
+                NULL, NULL, 0U, &radius), FUTCACHE_ERROR_INVALID_ARGUMENT);
+    return true;
+}
+
+static bool test_crdt_safe_anchors_grid(void)
+{
+    double lo[] = {0.0};
+    double hi[] = {1.0};
+    double anchors[16];
+    size_t count = 0U;
+    double radius = 0.0;
+
+    /* eps=0.5 -> target 0.25; needs n=2 (2 anchors), certified 0.25. */
+    TEST_STATUS(futcache_crdt_generate_safe_anchors(
+                1U, 0.5, lo, hi, NULL, NULL, FUTCACHE_CRDT_ANCHOR_GRID,
+                16U, 0U, anchors, &count, &radius), FUTCACHE_OK);
+    TEST_ASSERT(count == 2U);
+    TEST_NEAR(radius, 0.25, 1e-12);
+    TEST_ASSERT(radius <= 0.25 + 1e-12); /* contract: rho <= eps/2 */
+    TEST_NEAR(anchors[0], 0.25, 1e-12);
+    TEST_NEAR(anchors[1], 0.75, 1e-12);
+
+    /* Budget too small: needs 2 anchors but only 1 allowed. */
+    TEST_STATUS(futcache_crdt_generate_safe_anchors(
+                1U, 0.5, lo, hi, NULL, NULL, FUTCACHE_CRDT_ANCHOR_GRID,
+                1U, 0U, anchors, &count, &radius), FUTCACHE_ERROR_OUT_OF_RANGE);
+    TEST_ASSERT(count == 2U);
+    TEST_NEAR(radius, 0.25, 1e-12);
+
+    /* Cosine cannot be grid-certified. */
+    TEST_STATUS(futcache_crdt_generate_safe_anchors(
+                1U, 0.5, lo, hi, futcache_distance_cosine, NULL,
+                FUTCACHE_CRDT_ANCHOR_GRID, 16U, 0U, anchors, &count, &radius),
+                FUTCACHE_ERROR_INVALID_ARGUMENT);
+
+    /* eps <= 0 is invalid. */
+    TEST_STATUS(futcache_crdt_generate_safe_anchors(
+                1U, 0.0, lo, hi, NULL, NULL, FUTCACHE_CRDT_ANCHOR_GRID,
+                16U, 0U, anchors, &count, &radius),
+                FUTCACHE_ERROR_INVALID_ARGUMENT);
+    return true;
+}
+
+static bool test_crdt_safe_anchors_halton(void)
+{
+    double lo[] = {0.0};
+    double hi[] = {1.0};
+    double anchors[16];
+    size_t count = 0U;
+    double radius = 0.0;
+
+    /* eps=0.5 -> target 0.25; van der Corput {0,.5,.25,.75} covers at 0.25. */
+    TEST_STATUS(futcache_crdt_generate_safe_anchors(
+                1U, 0.5, lo, hi, NULL, NULL, FUTCACHE_CRDT_ANCHOR_HALTON,
+                16U, 65536U, anchors, &count, &radius), FUTCACHE_OK);
+    TEST_ASSERT(count == 4U);
+    TEST_ASSERT(radius <= 0.25 + 1e-9);
+    TEST_ASSERT(radius >= 0.24);
+    for (size_t k = 0U; k < count; ++k) {
+        TEST_ASSERT(anchors[k] >= 0.0 && anchors[k] <= 1.0);
+    }
+
+    /* Too small a budget: eps=0.01 (target 0.005) needs far more anchors. */
+    TEST_STATUS(futcache_crdt_generate_safe_anchors(
+                1U, 0.01, lo, hi, NULL, NULL, FUTCACHE_CRDT_ANCHOR_HALTON,
+                4U, 65536U, anchors, &count, &radius),
+                FUTCACHE_ERROR_OUT_OF_RANGE);
+    TEST_ASSERT(count == 0U);
+    TEST_ASSERT(radius > 0.005);
+
+    /* probe_count must be >= 1 for HALTON. */
+    TEST_STATUS(futcache_crdt_generate_safe_anchors(
+                1U, 0.5, lo, hi, NULL, NULL, FUTCACHE_CRDT_ANCHOR_HALTON,
+                16U, 0U, anchors, &count, &radius),
+                FUTCACHE_ERROR_INVALID_ARGUMENT);
+    return true;
+}
+
 int crdt_test_suite(void)
 {
     static const test_case_t tests[] = {
@@ -455,6 +678,12 @@ int crdt_test_suite(void)
         {"two-way gossip convergence", test_crdt_merge_convergence},
         {"snapshot roundtrip and clear", test_crdt_snapshot_and_clear},
         {"allocation failure atomicity", test_crdt_allocation_failure_atomicity},
+        {"halton anchor generation", test_crdt_halton_anchors},
+        {"grid anchor generation", test_crdt_grid_anchors},
+        {"certified grid covering radius", test_crdt_grid_covering_radius},
+        {"estimated covering radius", test_crdt_estimate_covering_radius},
+        {"safe anchors grid", test_crdt_safe_anchors_grid},
+        {"safe anchors halton", test_crdt_safe_anchors_halton},
     };
     return run_test_cases("crdt", tests, sizeof(tests) / sizeof(tests[0]));
 }
