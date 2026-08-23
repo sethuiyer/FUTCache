@@ -1,0 +1,14 @@
+/build/
+/build-*/
+/cmake-build-*/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.gcda
+*.gcno
+*.gcov
+pi-session-*.html
