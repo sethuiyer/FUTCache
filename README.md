@@ -490,3 +490,24 @@ without IEEE-754 binary64 report `FUTCACHE_ERROR_UNSUPPORTED_PLATFORM`.
 The binary format is documented in [docs/serialization.md](docs/serialization.md).
 The adversarial build, sanitizer, differential, concurrency, and scaling results
 are recorded in [docs/verification.md](docs/verification.md).
+
+## Phase 2: distributed semantic cache
+
+The v1.1 design covers the single-node cache. Phase 2 formalises a
+**distributed semantic cache** whose replicas converge without
+coordination, by replacing the order-dependent greedy packing with a
+fixed geometric Voronoi quotient. The full treatment — the
+obstruction that motivates the move, the deterministic δ-net
+construction, the join-semilattice state space, the convergence and
+memory theorems, the three-engine taxonomy (interval, pack, crdt),
+and the gossip protocol — is in [PHASE2.md](PHASE2.md).
+
+The headline theorem (Theorem 12.10 in `PHASE2.md`):
+
+$$\boxed{q(x) = q(y) \implies d(x, y) \leq \epsilon.}$$
+
+Cell identity becomes an equivalence relation refining metric
+similarity. Replicas gossip occupied cells; set union is commutative,
+associative, and idempotent; convergence is unconditional. The
+asymptotic cache dimension is unchanged — only the constant factor
+shifts by $2^D$.
