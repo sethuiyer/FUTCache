@@ -32,12 +32,12 @@ quiescence.
 
 | Configuration | Result | Warnings/findings |
 |---|---|---|
-| GCC Debug, static, strongest project warnings, `-Werror` | 69 tests pass | none |
-| GCC Release, shared, strongest project warnings, `-Werror` | 69 tests pass | none |
-| GCC ASan + UBSan, Debug | 69 tests pass | none; leak detector disabled as noted below |
+| GCC Debug, static, strongest project warnings, `-Werror` | 75 C tests pass | none |
+| GCC Release, shared, strongest project warnings, `-Werror` | 75 C tests pass | none |
+| GCC ASan + UBSan, Debug | 75 C tests pass | none; leak detector disabled as noted below |
 | GCC TSan, Debug | startup blocked | managed host rejected TSan shadow mapping before tests (`unexpected memory mapping`) |
 | Release examples and benchmarks, `-Werror` | build and run | RAG, n-d packing, LRU comparison clean |
-| Python/nanobind extension | build + bounded payload smoke pass | FIFO eviction shifts payload ids correctly |
+| Python/nanobind extension and wheel | 5 adaptive tests pass | v1.3.0 wheel installs and imports cleanly |
 | GCC `-fanalyzer` | library builds | no analyzer findings |
 | Installed shared package + external `find_package` consumer | builds and runs | none |
 | Clang | not run | compiler is not installed on this host |
@@ -74,11 +74,13 @@ This is a verification limitation, not an observed leak.
   novelty implication, adjacent projection, and composed projection match
   independent arrays and arithmetic. A focused two-level test checks the exact
   discovery-word identity `q_(1,0)(D_1(L)) = D_0(L)` element by element.
-- The packing cache has eighteen core tests plus eight VP-tree tests covering
+- The packing cache has twenty-one core tests plus eleven VP-tree tests covering
   configurable metrics, representative separation, query purity, allocator
   failure, concurrency, backend lifecycle, nearest-site ids/distances, exact
   byte-ceiling enforcement, FIFO recycling, bounded VP-tree fallback, and
-  concurrent snapshot/recovery during writes. Every byte mutation, every
+  concurrent snapshot/recovery during writes, adaptive-radius ball stabbing,
+  Poincare-domain enforcement, v1/v2 snapshot compatibility, borrowed 384-D
+  vector storage, and balanced equidistant metrics. Every byte mutation, every
   truncation, and trailing data are rejected for a representative snapshot.
   An independent counting allocator confirms that both live and transient
   bytes requested upstream remain at or below the configured ceiling.

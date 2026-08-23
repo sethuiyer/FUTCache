@@ -2,6 +2,7 @@
 
 #include "futcache/pack.h"
 #include "futcache/futcache.h"
+#include "pack_vptree_internal.h"
 
 #include <float.h>
 #include <limits.h>
@@ -14,11 +15,14 @@
 enum {
     FUTCACHE_PACK_SERIAL_HEADER_SIZE = 104,
     FUTCACHE_PACK_SERIAL_CRC_SIZE = 4,
-    FUTCACHE_PACK_SERIAL_VERSION = 1,
+    FUTCACHE_PACK_SERIAL_VERSION_LEGACY = 1,
+    FUTCACHE_PACK_SERIAL_VERSION = 2,
+    FUTCACHE_PACK_SERIAL_FLAG_RADII = 1,
     FUTCACHE_PACK_DISTANCE_LINF = 1,
     FUTCACHE_PACK_DISTANCE_L1 = 2,
     FUTCACHE_PACK_DISTANCE_L2 = 3,
     FUTCACHE_PACK_DISTANCE_COSINE = 4,
+    FUTCACHE_PACK_DISTANCE_POINCARE = 5,
     FUTCACHE_PACK_BACKEND_LINEAR = 0,
     FUTCACHE_PACK_BACKEND_VPTREE = 1
 };
@@ -136,6 +140,29 @@ double futcache_distance_cosine(const double *a, const double *b,
     return 1.0 - dot;
 }
 
+double futcache_distance_poincare(const double *a, const double *b,
+                                   size_t dimension, void *context)
+{
+    (void)context;
+    double norm_a_squared = 0.0;
+    double norm_b_squared = 0.0;
+    double difference_squared = 0.0;
+    for (size_t i = 0U; i < dimension; ++i) {
+        double difference = a[i] - b[i];
+        norm_a_squared += a[i] * a[i];
+        norm_b_squared += b[i] * b[i];
+        difference_squared += difference * difference;
+    }
+    if (!(norm_a_squared < 1.0) || !(norm_b_squared < 1.0) ||
+        !isfinite(difference_squared)) {
+        return NAN;
+    }
+    double denominator = sqrt((1.0 - norm_a_squared) *
+                              (1.0 - norm_b_squared));
+    if (!(denominator > 0.0)) return NAN;
+    return 2.0 * asinh(sqrt(difference_squared) / denominator);
+}
+
 /* ============================================================
  * Representative: variable-size struct with inline coordinates.
  * One allocation per representative regardless of dimension.
@@ -143,7 +170,7 @@ double futcache_distance_cosine(const double *a, const double *b,
 
 typedef struct pack_representative {
     struct pack_representative *next;
-    size_t dimension;
+    double radius;
     double coordinates[];  /* [dimension] */
 } pack_representative_t;
 
@@ -159,7 +186,8 @@ static uint64_t increment_saturating(uint64_t value)
 static pack_representative_t *make_representative(
     const futcache_allocator_t *allocator,
     const double *point,
-    size_t dimension)
+    size_t dimension,
+    double radius)
 {
     if (dimension > (SIZE_MAX - sizeof(pack_representative_t)) /
                         sizeof(double)) {
@@ -171,7 +199,7 @@ static pack_representative_t *make_representative(
         (pack_representative_t *)allocator->allocate(allocator->context, bytes);
     if (rep == NULL) return NULL;
     rep->next = NULL;
-    rep->dimension = dimension;
+    rep->radius = radius;
     memcpy(rep->coordinates, point, dimension * sizeof(double));
     return rep;
 }
@@ -201,6 +229,7 @@ struct futcache_pack {
     void *backend_context;
     void *backend_state;
     bool backend_active;
+    bool variable_radii;
 
     /* Domain bounds. Copied at create time, freed at destroy. */
     double *domain_min;
@@ -410,6 +439,9 @@ static uint32_t pack_distance_identifier(futcache_distance_fn distance)
     if (distance == futcache_distance_cosine) {
         return FUTCACHE_PACK_DISTANCE_COSINE;
     }
+    if (distance == futcache_distance_poincare) {
+        return FUTCACHE_PACK_DISTANCE_POINCARE;
+    }
     return UINT32_C(0);
 }
 
@@ -424,16 +456,19 @@ static futcache_distance_fn pack_distance_from_identifier(uint32_t identifier)
         return futcache_distance_l2;
     case FUTCACHE_PACK_DISTANCE_COSINE:
         return futcache_distance_cosine;
+    case FUTCACHE_PACK_DISTANCE_POINCARE:
+        return futcache_distance_poincare;
     default:
         return NULL;
     }
 }
 
 static bool pack_snapshot_size(size_t dimension, size_t count,
-                               size_t *out_size)
+                               bool has_radii, size_t *out_size)
 {
     size_t vector_bytes;
     size_t vector_count;
+    size_t radii_bytes = 0U;
     size_t fixed = FUTCACHE_PACK_SERIAL_HEADER_SIZE +
                    FUTCACHE_PACK_SERIAL_CRC_SIZE;
     if (out_size == NULL || dimension > SIZE_MAX / sizeof(double) ||
@@ -446,7 +481,14 @@ static bool pack_snapshot_size(size_t dimension, size_t count,
         vector_count > (SIZE_MAX - fixed) / vector_bytes) {
         return false;
     }
-    *out_size = fixed + vector_count * vector_bytes;
+    if (has_radii) {
+        if (count > (SIZE_MAX - fixed - vector_count * vector_bytes) /
+                        sizeof(double)) {
+            return false;
+        }
+        radii_bytes = count * sizeof(double);
+    }
+    *out_size = fixed + vector_count * vector_bytes + radii_bytes;
     return true;
 }
 
@@ -546,6 +588,7 @@ futcache_status_t futcache_pack_create(
     cache->backend = config->backend;
     cache->backend_context = config->backend_context;
     cache->backend_active = false;
+    cache->variable_radii = false;
     cache->memory_limit_bytes = config->max_memory_bytes;
     atomic_init(&cache->memory_bytes, sizeof(*cache));
     atomic_init(&cache->peak_memory_bytes, sizeof(*cache));
@@ -619,11 +662,12 @@ void futcache_pack_destroy(futcache_pack_t *cache)
 {
     if (cache == NULL) return;
     /* Caller guarantees quiescence per header. */
-    free_all_representatives(cache);
     if (cache->backend_active) {
         cache->backend->destroy(cache->backend_state, &cache->allocator,
                                 cache->backend_context);
     }
+    free_all_representatives(cache);
+    cache->variable_radii = false;
     if (cache->domain_min != NULL) {
         cache->allocator.deallocate(cache->allocator.context, cache->domain_min);
     }
@@ -636,40 +680,79 @@ void futcache_pack_destroy(futcache_pack_t *cache)
 
 static bool point_in_domain(const futcache_pack_t *cache, const double *point)
 {
+    double norm_squared = 0.0;
     for (size_t i = 0; i < cache->dimension; ++i) {
         if (!isfinite(point[i])) return false;
         if (point[i] < cache->domain_min[i]) return false;
         if (point[i] > cache->domain_max[i]) return false;
+        if (cache->distance == futcache_distance_poincare) {
+            norm_squared += point[i] * point[i];
+        }
     }
+    if (cache->distance == futcache_distance_poincare &&
+        !(norm_squared < 1.0)) return false;
     return true;
 }
 
-static double min_distance_to_set(const futcache_pack_t *cache,
-                                   const double *point)
+static void min_covering_representative(
+    const futcache_pack_t *cache,
+    const double *point,
+    bool *out_found,
+    double *out_distance,
+    size_t *out_index)
 {
-    double min_d = INFINITY;
+    bool found = false;
+    double best_distance = INFINITY;
+    size_t best_index = SIZE_MAX;
     const pack_representative_t *representative = cache->representatives;
-    futcache_distance_fn distance = cache->distance;
-    void *context = cache->distance_context;
-    size_t dim = cache->dimension;
+    size_t index = 0U;
     while (representative != NULL) {
-        double d = distance(point, representative->coordinates, dim, context);
-        if (d < min_d) min_d = d;
+        double distance = cache->distance(
+            point, representative->coordinates, cache->dimension,
+            cache->distance_context);
+        if (distance <= representative->radius &&
+            (!found || distance < best_distance ||
+             (distance == best_distance && index < best_index))) {
+            found = true;
+            best_distance = distance;
+            best_index = index;
+        }
         representative = representative->next;
+        ++index;
     }
-    return min_d;
+    *out_found = found;
+    *out_distance = best_distance;
+    *out_index = best_index;
 }
 
-static futcache_status_t backend_nearest(const futcache_pack_t *cache,
-                                         const double *point,
-                                         double *out_distance)
+static futcache_status_t backend_covering(
+    const futcache_pack_t *cache,
+    const double *point,
+    bool *out_found,
+    double *out_distance,
+    size_t *out_index)
 {
-    if (cache->backend_active) {
-        return cache->backend->nearest(cache->backend_state, point,
-                                       cache->dimension, out_distance,
-                                       cache->backend_context);
+    if (cache->backend_active &&
+        cache->backend == &futcache_pack_vptree_backend) {
+        return futcache_pack_vptree_covering_internal(
+            cache->backend_state, point, cache->dimension, out_found,
+            out_distance, out_index, cache->backend_context);
     }
-    *out_distance = min_distance_to_set(cache, point);
+    if (cache->backend_active && !cache->variable_radii) {
+        double nearest = INFINITY;
+        futcache_status_t status = cache->backend->nearest(
+            cache->backend_state, point, cache->dimension, &nearest,
+            cache->backend_context);
+        if (status != FUTCACHE_OK) return status;
+        if (nearest > cache->epsilon) {
+            *out_found = false;
+            *out_distance = INFINITY;
+            *out_index = SIZE_MAX;
+            return FUTCACHE_OK;
+        }
+    }
+    min_covering_representative(cache, point, out_found, out_distance,
+                                out_index);
     return FUTCACHE_OK;
 }
 
@@ -695,16 +778,24 @@ static void link_representative_tail(futcache_pack_t *cache,
 }
 
 static futcache_status_t append_representative_locked(
-    futcache_pack_t *cache, const double *point)
+    futcache_pack_t *cache, const double *point, double radius)
 {
     pack_representative_t *representative = make_representative(
-        &cache->allocator, point, cache->dimension);
+        &cache->allocator, point, cache->dimension, radius);
     if (representative == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
 
     if (cache->backend_active) {
-        futcache_status_t status = cache->backend->insert(
-            cache->backend_state, point, cache->dimension,
-            cache->backend_context);
+        futcache_status_t status;
+        if (cache->backend == &futcache_pack_vptree_backend) {
+            status = futcache_pack_vptree_insert_ball_internal(
+                cache->backend_state, representative->coordinates,
+                cache->dimension, radius, cache->count,
+                cache->backend_context);
+        } else {
+            status = cache->backend->insert(
+                cache->backend_state, representative->coordinates,
+                cache->dimension, cache->backend_context);
+        }
         if (status != FUTCACHE_OK) {
             if (cache->memory_limit_bytes == 0U ||
                 status != FUTCACHE_ERROR_OUT_OF_MEMORY) {
@@ -738,23 +829,33 @@ static futcache_status_t prepare_backend_for_eviction_locked(
 static void rebuild_backend_after_eviction_locked(futcache_pack_t *cache)
 {
     pack_representative_t *representative;
+    size_t index = 0U;
     if (!cache->backend_active) return;
 
     representative = cache->representatives;
     while (representative != NULL) {
-        futcache_status_t status = cache->backend->insert(
-            cache->backend_state, representative->coordinates,
-            cache->dimension, cache->backend_context);
+        futcache_status_t status;
+        if (cache->backend == &futcache_pack_vptree_backend) {
+            status = futcache_pack_vptree_insert_ball_internal(
+                cache->backend_state, representative->coordinates,
+                cache->dimension, representative->radius, index,
+                cache->backend_context);
+        } else {
+            status = cache->backend->insert(
+                cache->backend_state, representative->coordinates,
+                cache->dimension, cache->backend_context);
+        }
         if (status != FUTCACHE_OK) {
             disable_backend_locked(cache);
             return;
         }
         representative = representative->next;
+        ++index;
     }
 }
 
 static futcache_status_t evict_oldest_and_replace_locked(
-    futcache_pack_t *cache, const double *point)
+    futcache_pack_t *cache, const double *point, double radius)
 {
     pack_representative_t *oldest;
     futcache_status_t status;
@@ -774,17 +875,21 @@ static futcache_status_t evict_oldest_and_replace_locked(
         oldest->next = NULL;
     }
     memcpy(oldest->coordinates, point, cache->dimension * sizeof(double));
+    oldest->radius = radius;
     cache->evictions = increment_saturating(cache->evictions);
     rebuild_backend_after_eviction_locked(cache);
     return FUTCACHE_OK;
 }
 
-futcache_status_t futcache_pack_is_novel(
+futcache_status_t futcache_pack_lookup(
     const futcache_pack_t *cache,
     const double *point,
-    bool *out_is_novel)
+    bool *out_found,
+    double *out_distance,
+    size_t *out_index)
 {
-    if (cache == NULL || point == NULL || out_is_novel == NULL) {
+    if (cache == NULL || point == NULL || out_found == NULL ||
+        out_distance == NULL || out_index == NULL) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
     if (!point_in_domain(cache, point)) {
@@ -794,28 +899,47 @@ futcache_status_t futcache_pack_is_novel(
     pthread_rwlock_t *lock = (pthread_rwlock_t *)&cache->lock;
     pthread_rwlock_rdlock(lock);
 
-    bool novel = true;
-    if (cache->count > 0) {
-        double d = INFINITY;
-        futcache_status_t st = backend_nearest(cache, point, &d);
-        if (st != FUTCACHE_OK) {
-            pthread_rwlock_unlock(lock);
-            return st;
-        }
-        novel = (d > cache->epsilon);
+    bool found = false;
+    double distance = INFINITY;
+    size_t index = SIZE_MAX;
+    futcache_status_t status = backend_covering(
+        cache, point, &found, &distance, &index);
+    if (status != FUTCACHE_OK) {
+        pthread_rwlock_unlock(lock);
+        return status;
     }
 
     pthread_rwlock_unlock(lock);
-    *out_is_novel = novel;
+    *out_found = found;
+    *out_distance = distance;
+    *out_index = index;
     return FUTCACHE_OK;
 }
 
-futcache_status_t futcache_pack_observe(
+futcache_status_t futcache_pack_is_novel(
+    const futcache_pack_t *cache,
+    const double *point,
+    bool *out_is_novel)
+{
+    bool found;
+    double distance;
+    size_t index;
+    if (out_is_novel == NULL) return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    futcache_status_t status = futcache_pack_lookup(
+        cache, point, &found, &distance, &index);
+    if (status == FUTCACHE_OK) *out_is_novel = !found;
+    return status;
+}
+
+futcache_status_t futcache_pack_observe_with_radius(
     futcache_pack_t *cache,
     const double *point,
-    bool *out_was_novel)
+    double radius,
+    bool *out_was_novel,
+    double *out_distance,
+    size_t *out_index)
 {
-    if (cache == NULL || point == NULL) {
+    if (cache == NULL || point == NULL || !isfinite(radius) || radius < 0.0) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
     if (!point_in_domain(cache, point)) {
@@ -825,16 +949,16 @@ futcache_status_t futcache_pack_observe(
     pthread_rwlock_t *lock = (pthread_rwlock_t *)&cache->lock;
     pthread_rwlock_wrlock(lock);
 
-    bool novel = true;
-    if (cache->count > 0) {
-        double d = INFINITY;
-        futcache_status_t st = backend_nearest(cache, point, &d);
-        if (st != FUTCACHE_OK) {
-            pthread_rwlock_unlock(lock);
-            return st;
-        }
-        novel = (d > cache->epsilon);
+    bool found = false;
+    double matched_distance = INFINITY;
+    size_t matched_index = SIZE_MAX;
+    futcache_status_t lookup_status = backend_covering(
+        cache, point, &found, &matched_distance, &matched_index);
+    if (lookup_status != FUTCACHE_OK) {
+        pthread_rwlock_unlock(lock);
+        return lookup_status;
     }
+    bool novel = !found;
 
     if (novel) {
         size_t representative_bytes = sizeof(pack_representative_t) +
@@ -850,17 +974,20 @@ futcache_status_t futcache_pack_observe(
                 disable_backend_locked(cache);
             }
             if (tracked_allocation_fits(cache, representative_bytes)) {
-                st = append_representative_locked(cache, point);
+                st = append_representative_locked(cache, point, radius);
             } else {
-                st = evict_oldest_and_replace_locked(cache, point);
+                st = evict_oldest_and_replace_locked(cache, point, radius);
             }
         } else {
-            st = append_representative_locked(cache, point);
+            st = append_representative_locked(cache, point, radius);
         }
         if (st != FUTCACHE_OK) {
             pthread_rwlock_unlock(lock);
             return st;
         }
+        matched_distance = 0.0;
+        matched_index = cache->count - 1U;
+        if (radius != cache->epsilon) cache->variable_radii = true;
     }
 
     cache->observations = increment_saturating(cache->observations);
@@ -869,8 +996,20 @@ futcache_status_t futcache_pack_observe(
     cache->generation = increment_saturating(cache->generation);
 
     if (out_was_novel != NULL) *out_was_novel = novel;
+    if (out_distance != NULL) *out_distance = matched_distance;
+    if (out_index != NULL) *out_index = matched_index;
     pthread_rwlock_unlock(lock);
     return FUTCACHE_OK;
+}
+
+futcache_status_t futcache_pack_observe(
+    futcache_pack_t *cache,
+    const double *point,
+    bool *out_was_novel)
+{
+    if (cache == NULL) return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    return futcache_pack_observe_with_radius(
+        cache, point, cache->epsilon, out_was_novel, NULL, NULL);
 }
 
 futcache_status_t futcache_pack_get_stats(
@@ -941,6 +1080,39 @@ futcache_status_t futcache_pack_copy_representatives(
     return FUTCACHE_OK;
 }
 
+futcache_status_t futcache_pack_copy_radii(
+    const futcache_pack_t *cache,
+    double *out_radii,
+    size_t *inout_count)
+{
+    if (cache == NULL || inout_count == NULL) {
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+
+    pthread_rwlock_t *lock = (pthread_rwlock_t *)&cache->lock;
+    pthread_rwlock_rdlock(lock);
+    if (out_radii == NULL) {
+        *inout_count = cache->count;
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_OK;
+    }
+    if (*inout_count < cache->count) {
+        *inout_count = cache->count;
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    const pack_representative_t *representative = cache->representatives;
+    size_t index = 0U;
+    while (representative != NULL) {
+        out_radii[index++] = representative->radius;
+        representative = representative->next;
+    }
+    *inout_count = cache->count;
+    pthread_rwlock_unlock(lock);
+    return FUTCACHE_OK;
+}
+
 futcache_status_t futcache_pack_nearest(
     const futcache_pack_t *cache,
     const double *point,
@@ -957,6 +1129,16 @@ futcache_status_t futcache_pack_nearest(
 
     pthread_rwlock_t *lock = (pthread_rwlock_t *)&cache->lock;
     pthread_rwlock_rdlock(lock);
+
+    if (cache->backend_active &&
+        cache->backend == &futcache_pack_vptree_backend) {
+        futcache_status_t status =
+            futcache_pack_vptree_nearest_index_internal(
+            cache->backend_state, point, cache->dimension, out_distance,
+            out_index, cache->backend_context);
+        pthread_rwlock_unlock(lock);
+        return status;
+    }
 
     double min_d = INFINITY;
     size_t min_i = SIZE_MAX;
@@ -995,6 +1177,7 @@ futcache_status_t futcache_pack_clear(futcache_pack_t *cache)
     }
     free_all_representatives(cache);
     cache->peak_count = 0U;
+    cache->variable_radii = false;
     cache->observations = 0U;
     cache->novel_observations = 0U;
     cache->evictions = 0U;
@@ -1041,17 +1224,16 @@ futcache_status_t futcache_pack_validate(const futcache_pack_t *cache)
         return FUTCACHE_ERROR_CORRUPT_DATA;
     }
 
-    /* Pairwise epsilon-separation. O(n^2) — diagnostic only. */
+    /* Insertion-order variable-radius separation. O(n^2), diagnostic only. */
     futcache_distance_fn distance = cache->distance;
     void *context = cache->distance_context;
     size_t dim = cache->dimension;
-    double eps = cache->epsilon;
 
     const pack_representative_t *left = cache->representatives;
     size_t actual_count = 0U;
     while (left != NULL) {
-        if (left->dimension != dim || !point_in_domain(cache,
-                                                       left->coordinates)) {
+        if (!isfinite(left->radius) || left->radius < 0.0 ||
+            !point_in_domain(cache, left->coordinates)) {
             pthread_rwlock_unlock(lock);
             return FUTCACHE_ERROR_CORRUPT_DATA;
         }
@@ -1059,7 +1241,7 @@ futcache_status_t futcache_pack_validate(const futcache_pack_t *cache)
         while (right != NULL) {
             double d = distance(left->coordinates, right->coordinates,
                                 dim, context);
-            if (!(d > eps)) {  /* reject d <= eps, including NaN */
+            if (!(d > left->radius)) {
                 pthread_rwlock_unlock(lock);
                 return FUTCACHE_ERROR_CORRUPT_DATA;
             }
@@ -1121,7 +1303,8 @@ futcache_status_t futcache_pack_serialize(
         cache->memory_limit_bytes > (size_t)UINT64_MAX ||
         atomic_load_explicit(&cache->peak_memory_bytes,
                              memory_order_relaxed) > (size_t)UINT64_MAX ||
-        !pack_snapshot_size(cache->dimension, cache->count, &required)) {
+        !pack_snapshot_size(cache->dimension, cache->count, true,
+                            &required)) {
         pthread_rwlock_unlock(lock);
         return FUTCACHE_ERROR_OUT_OF_RANGE;
     }
@@ -1145,7 +1328,8 @@ futcache_status_t futcache_pack_serialize(
                       (uint16_t)FUTCACHE_PACK_SERIAL_VERSION);
     pack_write_u16_le(bytes + 10U,
                       (uint16_t)FUTCACHE_PACK_SERIAL_HEADER_SIZE);
-    pack_write_u32_le(bytes + 12U, UINT32_C(0));
+    pack_write_u32_le(bytes + 12U,
+                      (uint32_t)FUTCACHE_PACK_SERIAL_FLAG_RADII);
     pack_write_double_le(bytes + 16U, cache->epsilon);
     pack_write_u64_le(bytes + 24U, (uint64_t)cache->dimension);
     pack_write_u64_le(bytes + 32U, cache->observations);
@@ -1173,6 +1357,8 @@ futcache_status_t futcache_pack_serialize(
     }
     representative = cache->representatives;
     while (representative != NULL) {
+        pack_write_double_le(bytes + offset, representative->radius);
+        offset += sizeof(double);
         for (size_t coordinate = 0U; coordinate < cache->dimension;
              ++coordinate) {
             pack_write_double_le(bytes + offset,
@@ -1215,7 +1401,10 @@ futcache_status_t futcache_pack_deserialize(
     uint64_t novel_observations;
     uint64_t generation;
     uint64_t evictions;
+    uint16_t version;
+    uint32_t flags;
     uint32_t backend_id;
+    bool has_radii;
     size_t dimension;
     size_t count;
     size_t expected_size;
@@ -1233,11 +1422,19 @@ futcache_status_t futcache_pack_deserialize(
     }
     if (memcmp(bytes, futcache_pack_serial_magic,
                sizeof(futcache_pack_serial_magic)) != 0 ||
-        pack_read_u16_le(bytes + 8U) !=
-            (uint16_t)FUTCACHE_PACK_SERIAL_VERSION ||
         pack_read_u16_le(bytes + 10U) !=
-            (uint16_t)FUTCACHE_PACK_SERIAL_HEADER_SIZE ||
-        pack_read_u32_le(bytes + 12U) != UINT32_C(0)) {
+            (uint16_t)FUTCACHE_PACK_SERIAL_HEADER_SIZE) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+    version = pack_read_u16_le(bytes + 8U);
+    flags = pack_read_u32_le(bytes + 12U);
+    if ((version == (uint16_t)FUTCACHE_PACK_SERIAL_VERSION_LEGACY &&
+         flags == UINT32_C(0))) {
+        has_radii = false;
+    } else if (version == (uint16_t)FUTCACHE_PACK_SERIAL_VERSION &&
+               flags == (uint32_t)FUTCACHE_PACK_SERIAL_FLAG_RADII) {
+        has_radii = true;
+    } else {
         return FUTCACHE_ERROR_CORRUPT_DATA;
     }
 
@@ -1256,7 +1453,7 @@ futcache_status_t futcache_pack_deserialize(
     }
     dimension = (size_t)serialized_dimension;
     count = (size_t)serialized_count;
-    if (!pack_snapshot_size(dimension, count, &expected_size) ||
+    if (!pack_snapshot_size(dimension, count, has_radii, &expected_size) ||
         data_size != expected_size) {
         return FUTCACHE_ERROR_CORRUPT_DATA;
     }
@@ -1345,16 +1542,23 @@ futcache_status_t futcache_pack_deserialize(
     for (size_t representative_index = 0U;
          representative_index < count; ++representative_index) {
         bool was_novel = false;
+        double radius = config.epsilon;
+        if (has_radii) {
+            radius = pack_read_double_le(bytes + offset);
+            offset += sizeof(double);
+        }
         for (size_t coordinate = 0U; coordinate < dimension; ++coordinate) {
             point[coordinate] = pack_read_double_le(bytes + offset);
             offset += sizeof(double);
         }
-        if (!point_in_domain(cache, point)) {
+        if (!isfinite(radius) || radius < 0.0 ||
+            !point_in_domain(cache, point)) {
             normalized.deallocate(normalized.context, point);
             futcache_pack_destroy(cache);
             return FUTCACHE_ERROR_CORRUPT_DATA;
         }
-        status = futcache_pack_observe(cache, point, &was_novel);
+        status = futcache_pack_observe_with_radius(
+            cache, point, radius, &was_novel, NULL, NULL);
         if (status != FUTCACHE_OK || !was_novel) {
             normalized.deallocate(normalized.context, point);
             futcache_pack_destroy(cache);

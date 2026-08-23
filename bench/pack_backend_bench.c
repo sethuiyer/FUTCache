@@ -161,6 +161,8 @@ static futcache_pack_t *make_cache(size_t dim, futcache_distance_fn distance,
 
     futcache_pack_t *cache = NULL;
     futcache_status_t st = futcache_pack_create(&config, &cache);
+    free(lo);
+    free(hi);
     if (st != FUTCACHE_OK) {
         fprintf(stderr, "create failed: %s\n", futcache_status_string(st));
         exit(1);
@@ -191,13 +193,13 @@ int main(void)
                            : dataset == 2 ? "manifold l2"
                                           : "manifold cosine";
         if (dataset == 0) {
-            printf("\ndataset: %s (worst-case uniform)  [us/op]\n", name);
+            printf("\ndataset: %s (worst-case uniform)  [ns/op]\n", name);
         } else {
-            printf("\ndataset: %s (low intrinsic dim)  [us/op]\n", name);
+            printf("\ndataset: %s (low intrinsic dim)  [ns/op]\n", name);
         }
-        printf("%-6s %-7s %-12s %-12s %-7s %-12s %-12s %-7s\n",
+        printf("%-6s %-7s %-12s %-12s %-7s %-12s %-12s %-7s %-9s %-9s\n",
                "dim", "reps", "linear obs", "vptree obs", "speedup",
-               "linear qry", "vptree qry", "speedup");
+               "linear qry", "vptree qry", "speedup", "lin MiB", "vp MiB");
         const size_t *count_set =
             dim == 384U ? counts_384 : counts;
         size_t count_n = dim == 384U
@@ -223,6 +225,10 @@ int main(void)
             double t_vp_obs = run_observe(vp, points, n, dim);
             double t_lin_qry = run_query(lin, queries, n, dim);
             double t_vp_qry = run_query(vp, queries, n, dim);
+            futcache_pack_stats_t lin_stats;
+            futcache_pack_stats_t vp_stats;
+            futcache_pack_get_stats(lin, &lin_stats);
+            futcache_pack_get_stats(vp, &vp_stats);
 
             double ns_lin_obs = t_lin_obs * 1e9 / (double)n;
             double ns_vp_obs = t_vp_obs * 1e9 / (double)n;
@@ -230,9 +236,11 @@ int main(void)
             double ns_vp_qry = t_vp_qry * 1e9 / (double)n;
 
             printf("%-6zu %-7zu %-12.1f %-12.1f %-7.1f %-12.1f %-12.1f "
-                   "%-7.1f\n",
+                   "%-7.1f %-9.2f %-9.2f\n",
                    dim, n, ns_lin_obs, ns_vp_obs, ns_lin_obs / ns_vp_obs,
-                   ns_lin_qry, ns_vp_qry, ns_lin_qry / ns_vp_qry);
+                   ns_lin_qry, ns_vp_qry, ns_lin_qry / ns_vp_qry,
+                   (double)lin_stats.memory_bytes / (1024.0 * 1024.0),
+                   (double)vp_stats.memory_bytes / (1024.0 * 1024.0));
 
             futcache_pack_destroy(lin);
             futcache_pack_destroy(vp);

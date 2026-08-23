@@ -8,6 +8,7 @@
 // call concurrently; observe is atomic. The Python object holds a
 // reference to the C cache and releases it in __del__.
 
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -30,7 +31,7 @@ namespace nb = nanobind;
 namespace {
 
 constexpr int FUTCACHE_PY_VERSION_MAJOR = 1;
-constexpr int FUTCACHE_PY_VERSION_MINOR = 2;
+constexpr int FUTCACHE_PY_VERSION_MINOR = 3;
 constexpr int FUTCACHE_PY_VERSION_PATCH = 0;
 
 futcache_distance_fn resolve_distance(const std::string &name) {
@@ -47,9 +48,13 @@ futcache_distance_fn resolve_distance(const std::string &name) {
     if (name == "cosine" || name == "cos") {
         return futcache_distance_cosine;
     }
+    if (name == "poincare" || name == "poincare_ball" ||
+        name == "hyperbolic") {
+        return futcache_distance_poincare;
+    }
     throw std::invalid_argument(
         "unknown distance '" + name +
-        "', expected one of: linf, l1, l2, cosine");
+        "', expected one of: linf, l1, l2, cosine, poincare");
 }
 
 struct NoveltyResult {
@@ -70,6 +75,8 @@ public:
               size_t max_memory_bytes = 0)
         : dimension_(static_cast<size_t>(dimension)),
           epsilon_(epsilon),
+          poincare_(distance == "poincare" || distance == "poincare_ball" ||
+                    distance == "hyperbolic"),
           payload_mutex_(),
           payloads_() {
         if (dimension <= 0) {
@@ -140,20 +147,32 @@ public:
     NoveltyResult query(nb::ndarray<double, nb::ndim<1>> point) {
         check_point(point);
 
-        futcache_pack_t *c = cache_;
-        double nearest_distance = 0.0;
-        size_t nearest_idx = 0;
-        futcache_status_t st = futcache_pack_nearest(
-            c, point.data(), &nearest_distance, &nearest_idx);
+        bool found = false;
+        double matched_distance = INFINITY;
+        size_t matched_idx = SIZE_MAX;
+        futcache_status_t st = futcache_pack_lookup(
+            cache_, point.data(), &found, &matched_distance, &matched_idx);
         if (st != FUTCACHE_OK) {
             throw std::runtime_error("query failed with status " +
                                      std::to_string(static_cast<int>(st)));
         }
-        bool novel = nearest_distance > epsilon_;
+        if (!found) {
+            /* Keep the historical NoveltyResult contract on misses: report
+             * the nearest-centre distance, even though adaptive decisions are
+             * based on containment in representative-owned balls. */
+            size_t nearest_idx = SIZE_MAX;
+            st = futcache_pack_nearest(
+                cache_, point.data(), &matched_distance, &nearest_idx);
+            if (st != FUTCACHE_OK) {
+                throw std::runtime_error(
+                    "nearest lookup failed with status " +
+                    std::to_string(static_cast<int>(st)));
+            }
+        }
         NoveltyResult r;
-        r.representative_id = novel ? -1 : static_cast<int>(nearest_idx);
-        r.is_novel = novel;
-        r.distance = nearest_distance;
+        r.representative_id = found ? static_cast<int>(matched_idx) : -1;
+        r.is_novel = !found;
+        r.distance = matched_distance;
         r.inserted = false;
         return r;
     }
@@ -164,6 +183,23 @@ public:
      * untouched. Returns a NoveltyResult. */
     NoveltyResult observe(nb::ndarray<double, nb::ndim<1>> point,
                            nb::object payload) {
+        return observe_impl(point, epsilon_, payload);
+    }
+
+    NoveltyResult observe_with_radius(
+        nb::ndarray<double, nb::ndim<1>> point,
+        double radius,
+        nb::object payload) {
+        if (!std::isfinite(radius) || radius < 0.0) {
+            throw std::invalid_argument(
+                "radius must be a finite non-negative double");
+        }
+        return observe_impl(point, radius, payload);
+    }
+
+    NoveltyResult observe_impl(nb::ndarray<double, nb::ndim<1>> point,
+                               double radius,
+                               nb::object payload) {
         check_point(point);
 
         const bool has_payload = !payload.is_none();
@@ -185,8 +221,11 @@ public:
         }
 
         bool novel = false;
-        futcache_status_t st = futcache_pack_observe(
-            cache_, point.data(), &novel);
+        double matched_distance = INFINITY;
+        size_t matched_index = SIZE_MAX;
+        futcache_status_t st = futcache_pack_observe_with_radius(
+            cache_, point.data(), radius, &novel, &matched_distance,
+            &matched_index);
         if (st != FUTCACHE_OK) {
             throw std::runtime_error(
                 "observe failed with status " +
@@ -196,7 +235,7 @@ public:
         NoveltyResult r;
         r.is_novel = novel;
         r.inserted = novel;
-        r.distance = 0.0;
+        r.distance = matched_distance;
 
         if (novel) {
             size_t after_count = 0;
@@ -223,25 +262,17 @@ public:
                 }
                 payloads_.swap(shifted);
             }
-            size_t rep_id = after_count - 1;
+            size_t rep_id = matched_index;
+            if (rep_id != after_count - 1U) {
+                throw std::runtime_error(
+                    "internal: inserted representative id mismatch");
+            }
             r.representative_id = static_cast<int>(rep_id);
             if (has_payload) {
                 payloads_[rep_id] = std::move(payload_value);
             }
         } else {
-            /* Redundant: recover the matched representative and its
-             * distance so callers can do confidence-aware caching. */
-            double nearest_distance = 0.0;
-            size_t nearest_idx = 0;
-            futcache_status_t nst = futcache_pack_nearest(
-                cache_, point.data(), &nearest_distance, &nearest_idx);
-            if (nst != FUTCACHE_OK) {
-                throw std::runtime_error(
-                    "nearest lookup failed with status " +
-                    std::to_string(static_cast<int>(nst)));
-            }
-            r.representative_id = static_cast<int>(nearest_idx);
-            r.distance = nearest_distance;
+            r.representative_id = static_cast<int>(matched_index);
         }
 
         return r;
@@ -356,6 +387,22 @@ public:
         return out;
     }
 
+    std::vector<double> copy_radii() {
+        size_t count = 0U;
+        futcache_status_t status = futcache_pack_copy_radii(
+            cache_, nullptr, &count);
+        if (status != FUTCACHE_OK) {
+            throw std::runtime_error("copy_radii query failed");
+        }
+        std::vector<double> radii(count);
+        size_t written = count;
+        status = futcache_pack_copy_radii(cache_, radii.data(), &written);
+        if (status != FUTCACHE_OK || written != count) {
+            throw std::runtime_error("copy_radii copy failed");
+        }
+        return radii;
+    }
+
     void clear() {
         std::lock_guard<std::mutex> lock(payload_mutex_);
         futcache_status_t st = futcache_pack_clear(cache_);
@@ -378,6 +425,7 @@ private:
                 std::to_string(point.shape(0)));
         }
         const double *data = point.data();
+        double squared_norm = 0.0;
         for (size_t i = 0U; i < dimension_; ++i) {
             if (!std::isfinite(data[i])) {
                 throw std::invalid_argument(
@@ -388,6 +436,11 @@ private:
                 throw std::out_of_range(
                     "point out of domain at index " + std::to_string(i));
             }
+            if (poincare_) squared_norm += data[i] * data[i];
+        }
+        if (poincare_ && !(squared_norm < 1.0)) {
+            throw std::out_of_range(
+                "Poincare points must have Euclidean norm strictly below 1");
         }
     }
 
@@ -404,6 +457,7 @@ private:
 
     size_t dimension_;
     double epsilon_;
+    bool poincare_;
     futcache_pack_t *cache_;
     std::vector<double> domain_lo_;
     std::vector<double> domain_hi_;
@@ -425,9 +479,9 @@ NB_MODULE(futcache_ext, m) {
         .def_rw("representative_id", &NoveltyResult::representative_id,
                 "Matched/new slot index; -1 only for a novel non-mutating query")
         .def_rw("is_novel", &NoveltyResult::is_novel,
-                "True when the point is farther than epsilon from every existing rep")
+                "True when the point lies outside every stored representative ball")
         .def_rw("distance", &NoveltyResult::distance,
-                "Distance to the nearest representative (0.0 for a novel insertion)")
+                "Closest containing distance on a hit; nearest-centre distance on a query miss; 0.0 for insertion")
         .def_rw("inserted", &NoveltyResult::inserted,
                 "True when observe() added a new representative");
 
@@ -445,6 +499,10 @@ NB_MODULE(futcache_ext, m) {
         .def("observe", &PackCache::observe,
              nb::arg("point"),
              nb::arg("payload") = nb::none())
+        .def("observe_with_radius", &PackCache::observe_with_radius,
+             nb::arg("point"),
+             nb::arg("radius"),
+             nb::arg("payload") = nb::none())
         .def("get_payload", &PackCache::get_payload, nb::arg("rep_id"))
         .def("set_payload", &PackCache::set_payload,
              nb::arg("rep_id"),
@@ -458,6 +516,7 @@ NB_MODULE(futcache_ext, m) {
         .def("peak_memory_bytes", &PackCache::peak_memory_bytes)
         .def("memory_limit_bytes", &PackCache::memory_limit_bytes)
         .def("copy_representatives", &PackCache::copy_representatives)
+        .def("copy_radii", &PackCache::copy_radii)
         .def("clear", &PackCache::clear)
         .def_static("version_major", &PackCache::version_major)
         .def_static("version_minor", &PackCache::version_minor)

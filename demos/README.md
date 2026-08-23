@@ -39,8 +39,38 @@ First run downloads the BEIR zip (~3 MB) and the embedding model
 (~120 MB, HuggingFace-cached) and embeds the corpus (≈1 min on GPU).
 Re-runs are instant: `python3 demos/beir_semantic_cache.py --skip-embed`.
 
-Also available: `--dataset nfcorpus|fiqa`, `--eps 0.35` (single ε),
-`--max-queries N`.
+Also available: `--dataset nfcorpus|fiqa|cqadupstack-stats`, `--eps 0.35`
+(single ε), `--max-queries N`.
+
+For the adaptive-radius research comparison, run:
+
+```bash
+python3 demos/adaptive_threshold_benchmark.py \
+  --dataset cqadupstack-stats --skip-embed --trials 24
+```
+
+That harness compares fixed cosine, Isolation-Forest-calibrated cosine, and
+Poincare + Isolation Forest radii. It uses prime-base Halton trials, reports
+each reuse/precision frontier, and keeps human qrels strictly on the scoring
+side of the experiment. Query-local specificity is currently an unsupervised
+neighbourhood proxy; replace it with learned hyperbolic embeddings for the
+full research experiment.
+
+A reference run with Bekko embeddings, seed 17, 24 Halton trials, and a 0.995
+precision target loaded 42,269 documents and 652 judged Stats queries. The
+human qrels exposed two direct repeat groups containing four queries:
+
+| system | reuse | precision | missed re-asks | representatives |
+|---|---:|---:|---:|---:|
+| fixed cosine | 0.0123 | 0.1250 | 2/2 | 644 |
+| isolation cosine | 0.0107 | 0.1429 | 2/2 | 645 |
+| Poincare + isolation | 0.0046 | 0.3333 | 2/2 | 649 |
+
+None met the safety target or strictly dominated the fixed frontier. This is
+the baseline the experiment is meant to expose: local contraction improves
+the selected point's precision, but it cannot manufacture duplicate intent
+that the embedding places far apart. The exact cache engine and calibration
+harness are ready for the learned-hyperbolic-embedding comparison.
 
 ## Reading the output
 
@@ -91,8 +121,9 @@ else:
     answer = cache.get_payload(res.representative_id)        # μs, no LLM
 ```
 
-Choose ε the same way the demo does: take a sample of your real
-traffic, find paraphrase pairs, and set ε just below the first
-cross-intent confusion. FUTCache's one-sided guarantee means a wrong
-ε errs toward extra LLM calls (missed reuse), never toward serving a
-wrong answer as a hit.
+Choose ε the same way the demo does: take a sample of your real traffic, find
+paraphrase pairs, and set ε just below the first cross-intent confusion. The
+VP-tree decision is exact for the supplied embedding and radius; semantic
+precision is determined by the embedding model and calibration. A radius that
+is too small causes missed reuse, while one that is too large can merge
+different intents—hence the measured frontier rather than a guessed cutoff.

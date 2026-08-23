@@ -100,6 +100,16 @@ static bool vp_is_novel_ok(const futcache_pack_t *cache, const double *point,
     return futcache_pack_is_novel(cache, point, out_novel) == FUTCACHE_OK;
 }
 
+static double vp_discrete_distance(const double *left, const double *right,
+                                   size_t dimension, void *context)
+{
+    (void)context;
+    for (size_t index = 0U; index < dimension; ++index) {
+        if (left[index] != right[index]) return 1.0;
+    }
+    return 0.0;
+}
+
 /* ============================================================
  * Fault-injection allocator (mirrors tests/test_futcache.c)
  * ============================================================ */
@@ -874,6 +884,186 @@ static bool test_vptree_large_differential(void)
     return true;
 }
 
+static bool test_vptree_adaptive_radius_differential(void)
+{
+    const size_t dimension = 8U;
+    const size_t observations = 1200U;
+    const size_t queries = 800U;
+    uint64_t random_state = UINT64_C(0x8f31b72ca95d410e);
+    vp_domain_t domain = vp_make_domain(dimension, 0.0, 1.0);
+    TEST_ASSERT(domain.lo != NULL && domain.hi != NULL);
+
+    futcache_pack_config_t linear_config;
+    futcache_pack_config_t tree_config;
+    vp_config_init(&linear_config, dimension, 0.05,
+                   futcache_distance_l2, NULL, false);
+    tree_config = linear_config;
+    tree_config.backend = &futcache_pack_vptree_backend;
+    linear_config.domain_min = domain.lo;
+    linear_config.domain_max = domain.hi;
+    tree_config.domain_min = domain.lo;
+    tree_config.domain_max = domain.hi;
+
+    futcache_pack_t *linear = NULL;
+    futcache_pack_t *tree = NULL;
+    TEST_STATUS(futcache_pack_create(&linear_config, &linear), FUTCACHE_OK);
+    TEST_STATUS(futcache_pack_create(&tree_config, &tree), FUTCACHE_OK);
+    double point[8];
+    for (size_t observation = 0U; observation < observations; ++observation) {
+        vp_fill_uniform(&random_state, point, dimension);
+        double radius = 0.01 + 0.24 * vp_random_unit(&random_state);
+        bool novel_linear = false;
+        bool novel_tree = false;
+        double distance_linear = INFINITY;
+        double distance_tree = INFINITY;
+        size_t index_linear = SIZE_MAX;
+        size_t index_tree = SIZE_MAX;
+        TEST_STATUS(futcache_pack_observe_with_radius(
+            linear, point, radius, &novel_linear, &distance_linear,
+            &index_linear), FUTCACHE_OK);
+        TEST_STATUS(futcache_pack_observe_with_radius(
+            tree, point, radius, &novel_tree, &distance_tree, &index_tree),
+            FUTCACHE_OK);
+        TEST_ASSERT(novel_linear == novel_tree);
+        TEST_ASSERT(index_linear == index_tree);
+        TEST_NEAR(distance_linear, distance_tree, 1e-12);
+    }
+
+    for (size_t query = 0U; query < queries; ++query) {
+        vp_fill_uniform(&random_state, point, dimension);
+        bool found_linear = false;
+        bool found_tree = false;
+        double distance_linear = INFINITY;
+        double distance_tree = INFINITY;
+        size_t index_linear = SIZE_MAX;
+        size_t index_tree = SIZE_MAX;
+        TEST_STATUS(futcache_pack_lookup(
+            linear, point, &found_linear, &distance_linear, &index_linear),
+            FUTCACHE_OK);
+        TEST_STATUS(futcache_pack_lookup(
+            tree, point, &found_tree, &distance_tree, &index_tree),
+            FUTCACHE_OK);
+        TEST_ASSERT(found_linear == found_tree);
+        TEST_ASSERT(index_linear == index_tree);
+        if (found_linear) {
+            TEST_NEAR(distance_linear, distance_tree, 1e-12);
+        } else {
+            TEST_ASSERT(isinf(distance_linear) && isinf(distance_tree));
+        }
+        TEST_STATUS(futcache_pack_nearest(
+            linear, point, &distance_linear, &index_linear), FUTCACHE_OK);
+        TEST_STATUS(futcache_pack_nearest(
+            tree, point, &distance_tree, &index_tree), FUTCACHE_OK);
+        TEST_ASSERT(index_linear == index_tree);
+        TEST_NEAR(distance_linear, distance_tree, 1e-12);
+    }
+    TEST_STATUS(futcache_pack_validate(linear), FUTCACHE_OK);
+    TEST_STATUS(futcache_pack_validate(tree), FUTCACHE_OK);
+    futcache_pack_destroy(tree);
+    futcache_pack_destroy(linear);
+    vp_free_domain(domain);
+    return true;
+}
+
+static bool test_vptree_borrows_high_dimensional_vectors(void)
+{
+    const size_t dimension = 384U;
+    vp_domain_t domain = vp_make_domain(dimension, -1.0, 1.0);
+    TEST_ASSERT(domain.lo != NULL && domain.hi != NULL);
+    double *point = (double *)calloc(dimension, sizeof(double));
+    TEST_ASSERT(point != NULL);
+
+    futcache_pack_config_t linear_config;
+    futcache_pack_config_t tree_config;
+    vp_config_init(&linear_config, dimension, 0.0,
+                   futcache_distance_l2, NULL, false);
+    tree_config = linear_config;
+    tree_config.backend = &futcache_pack_vptree_backend;
+    linear_config.domain_min = domain.lo;
+    linear_config.domain_max = domain.hi;
+    tree_config.domain_min = domain.lo;
+    tree_config.domain_max = domain.hi;
+
+    futcache_pack_t *linear = NULL;
+    futcache_pack_t *tree = NULL;
+    futcache_pack_stats_t linear_empty;
+    futcache_pack_stats_t linear_one;
+    futcache_pack_stats_t tree_empty;
+    futcache_pack_stats_t tree_one;
+    bool novel = false;
+    TEST_STATUS(futcache_pack_create(&linear_config, &linear), FUTCACHE_OK);
+    TEST_STATUS(futcache_pack_create(&tree_config, &tree), FUTCACHE_OK);
+    TEST_STATUS(futcache_pack_get_stats(linear, &linear_empty), FUTCACHE_OK);
+    TEST_STATUS(futcache_pack_get_stats(tree, &tree_empty), FUTCACHE_OK);
+    TEST_STATUS(futcache_pack_observe(linear, point, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    TEST_STATUS(futcache_pack_observe(tree, point, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    TEST_STATUS(futcache_pack_get_stats(linear, &linear_one), FUTCACHE_OK);
+    TEST_STATUS(futcache_pack_get_stats(tree, &tree_one), FUTCACHE_OK);
+
+    size_t representative_bytes = linear_one.memory_bytes -
+                                  linear_empty.memory_bytes;
+    size_t indexed_bytes = tree_one.memory_bytes - tree_empty.memory_bytes;
+    TEST_ASSERT(indexed_bytes >= representative_bytes);
+    /* VP metadata stays small and dimension-independent. A duplicated 384-D
+     * vector would add 3072 bytes here. */
+    TEST_ASSERT(indexed_bytes - representative_bytes <= 256U);
+
+    futcache_pack_destroy(tree);
+    futcache_pack_destroy(linear);
+    free(point);
+    vp_free_domain(domain);
+    return true;
+}
+
+static bool test_vptree_equidistant_metric(void)
+{
+    const size_t count = 2048U;
+    double lo[1] = {0.0};
+    double hi[1] = {(double)count + 1.0};
+    futcache_pack_config_t tree_config;
+    futcache_pack_config_t linear_config;
+    vp_config_init(&tree_config, 1U, 0.0, vp_discrete_distance, NULL, true);
+    linear_config = tree_config;
+    linear_config.backend = NULL;
+    tree_config.domain_min = lo;
+    tree_config.domain_max = hi;
+    linear_config.domain_min = lo;
+    linear_config.domain_max = hi;
+    futcache_pack_t *tree = NULL;
+    futcache_pack_t *linear = NULL;
+    TEST_STATUS(futcache_pack_create(&tree_config, &tree), FUTCACHE_OK);
+    TEST_STATUS(futcache_pack_create(&linear_config, &linear), FUTCACHE_OK);
+    for (size_t index = 0U; index < count; ++index) {
+        double point[1] = {(double)index};
+        bool tree_novel = false;
+        bool linear_novel = false;
+        TEST_STATUS(futcache_pack_observe(tree, point, &tree_novel),
+                    FUTCACHE_OK);
+        TEST_STATUS(futcache_pack_observe(linear, point, &linear_novel),
+                    FUTCACHE_OK);
+        TEST_ASSERT(tree_novel && tree_novel == linear_novel);
+    }
+    for (size_t index = 0U; index <= count; ++index) {
+        double point[1] = {(double)index};
+        double tree_distance = INFINITY;
+        double linear_distance = INFINITY;
+        size_t tree_index = SIZE_MAX;
+        size_t linear_index = SIZE_MAX;
+        TEST_STATUS(futcache_pack_nearest(
+            tree, point, &tree_distance, &tree_index), FUTCACHE_OK);
+        TEST_STATUS(futcache_pack_nearest(
+            linear, point, &linear_distance, &linear_index), FUTCACHE_OK);
+        TEST_NEAR(tree_distance, linear_distance, 0.0);
+        TEST_ASSERT(tree_index == linear_index);
+    }
+    TEST_STATUS(futcache_pack_validate(tree), FUTCACHE_OK);
+    futcache_pack_destroy(linear);
+    futcache_pack_destroy(tree);
+    return true;
+}
+
 int pack_vptree_test_suite(void)
 {
     static const test_case_t tests[] = {
@@ -888,6 +1078,9 @@ int pack_vptree_test_suite(void)
         {"adversarial insertion order", test_vptree_adversarial_order},
         {"empty and single point", test_vptree_empty_and_single},
         {"large differential (5000 reps)", test_vptree_large_differential},
+        {"adaptive-radius differential", test_vptree_adaptive_radius_differential},
+        {"borrowed 384-D vectors", test_vptree_borrows_high_dimensional_vectors},
+        {"balanced equidistant metric", test_vptree_equidistant_metric},
     };
     return run_test_cases("pack_vptree", tests,
                           sizeof(tests) / sizeof(tests[0]));

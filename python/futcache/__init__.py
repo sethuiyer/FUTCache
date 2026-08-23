@@ -12,6 +12,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .adaptive import (
+    AdaptiveRadiusController,
+    AdaptiveRadiusPolicy,
+    CompactIsolationForest,
+    halton_sequence,
+    halton_trials,
+    poincare_distance,
+    poincare_embed,
+)
 from .futcache_ext import (
     NoveltyResult as _NoveltyResultRaw,
     PackCache as _PackCacheRaw,
@@ -24,14 +33,14 @@ class NoveltyResult:
 
     Attributes:
         representative_id: slot index of the matched or new
-            representative. It is -1 only for a novel query/observation
-            (no representative existed yet to match against). On a
+            representative. It is -1 only for a novel non-mutating query.
+            On a
             semantic HIT this is the index to pass to ``get_payload()``.
-        is_novel: True when the point is farther than epsilon from
-            every existing representative.
-        distance: distance to the nearest representative. For a novel
-            ``observe()`` this is 0.0 (the point became its own
-            representative); for a HIT it is ``<= epsilon``.
+        is_novel: True when the point lies outside every existing
+            representative's acceptance radius.
+        distance: distance to the closest containing representative on a
+            HIT, the nearest centre on a non-mutating miss, and 0.0 for a
+            novel ``observe()`` (the point became its own representative).
         inserted: True when ``observe()`` added a new representative.
     """
 
@@ -56,10 +65,13 @@ class PackCache:
     """Voronoi packing novelty cache for arbitrary metric spaces.
 
     This wraps ``futcache_pack`` from the C library. Novelty semantics
-    match the underlying C cache exactly: an observation is novel iff
-    its distance to every existing representative exceeds ``epsilon``.
-    The cache is exact for novelty; representative count is bounded by
-    the packing number ``P(K, epsilon)``.
+    match the underlying C cache exactly. Ordinary ``observe()`` calls use
+    ``epsilon`` for every representative; passing an adaptive ``radius``
+    gives a newly inserted representative its own acceptance ball.
+    The cache is exact for membership in the stored representative balls.
+    Fixed-radius representative count is bounded by ``P(K, epsilon)``;
+    adaptive radii retain a geometric packing bound when they have a positive
+    floor, while ``max_memory_bytes`` is the unconditional physical bound.
 
     Payloads (LLM responses, retrieval results, etc.) are stored in a
     Python dict keyed by representative slot index. The C cache itself
@@ -79,7 +91,8 @@ class PackCache:
     Args:
         dimension: number of coordinates per point.
         epsilon: novelty resolution in the chosen distance units.
-        distance: one of ``"linf"``, ``"l1"``, ``"l2"``, ``"cosine"``.
+        distance: one of ``"linf"``, ``"l1"``, ``"l2"``, ``"cosine"``,
+            ``"poincare"``.
             Default ``"linf"`` is the natural extension of the 1D
             interval-union semantics.
         domain_min, domain_max: per-coordinate bounds. Scalars are
@@ -127,20 +140,31 @@ class PackCache:
         except IndexError as e:
             raise ValueError(str(e)) from None
 
-    def observe(self, point, payload=None) -> NoveltyResult:
+    def observe(self, point, payload=None, *, radius=None) -> NoveltyResult:
         """Atomic query + update.
 
         If ``point`` is novel, it is added as a new representative and
         ``payload`` (when provided) is attached to that representative.
         If ``point`` is redundant, the state is unchanged and the
         existing payload for the matched representative is left as-is.
+
+        ``radius=None`` uses the cache's fixed ``epsilon``. A finite
+        non-negative radius enables adaptive resolution for a newly inserted
+        representative; existing representatives always retain their own
+        radii.
         """
         arr = _as_ndarray(point, self._dimension)
         if payload is not None and not isinstance(payload, (bytes, bytearray)):
             raise TypeError("payload must be bytes, bytearray, or None")
         raw_payload = bytes(payload) if payload is not None else None
         try:
-            return _wrap(self._impl.observe(arr, raw_payload))
+            if radius is None:
+                raw = self._impl.observe(arr, raw_payload)
+            else:
+                radius = float(radius)
+                raw = self._impl.observe_with_radius(
+                    arr, radius, raw_payload)
+            return _wrap(raw)
         except IndexError as e:
             raise ValueError(str(e)) from None
 
@@ -208,6 +232,11 @@ class PackCache:
             return np.zeros((0, self._dimension), dtype=np.float64)
         return np.asarray(rows, dtype=np.float64)
 
+    def copy_radii(self):
+        """Return representative radii in the same slot order as vectors."""
+        import numpy as np
+        return np.asarray(self._impl.copy_radii(), dtype=np.float64)
+
     def clear(self) -> None:
         """Empty the representative set and drop all payloads."""
         self._impl.clear()
@@ -262,5 +291,16 @@ def _as_ndarray(point, dimension: int):
     return arr
 
 
-__all__ = ["PackCache", "NoveltyResult", "__version__"]
+__all__ = [
+    "AdaptiveRadiusController",
+    "AdaptiveRadiusPolicy",
+    "CompactIsolationForest",
+    "NoveltyResult",
+    "PackCache",
+    "halton_sequence",
+    "halton_trials",
+    "poincare_distance",
+    "poincare_embed",
+    "__version__",
+]
 __version__ = PackCache.version()

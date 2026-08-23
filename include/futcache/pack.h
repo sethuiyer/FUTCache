@@ -18,7 +18,8 @@ extern "C" {
  * Mathematical framing.
  *
  *   Let H be the observation history and rho_H(x) = min_{h in H} d(x, h)
- *   the distance transform. Metric novelty is the event { rho_H(x) > eps }.
+ *   the distance transform. With the compatibility API, metric novelty is
+ *   the event { rho_H(x) > eps }.
  *
  *   In unbounded mode, let R be a maximal eps-separated subset of H. The
  *   Voronoi cells of R tile the domain: every point lies in exactly one cell,
@@ -52,15 +53,29 @@ extern "C" {
  *     This is the regime where the exact representations above become
  *     unwieldy or inapplicable.
  *
+ * Adaptive resolution.
+ *
+ *   futcache_pack_observe_with_radius() gives each new representative r_i
+ *   its own certified acceptance radius epsilon_i. A query is reusable iff
+ *
+ *       x in U(H) = union_i B(r_i, epsilon_i).
+ *
+ *   This is exact variable-ball stabbing, not a nearest-centre heuristic: a
+ *   farther representative with a larger radius can match when the nearest
+ *   representative does not. The ordinary observe() API simply supplies the
+ *   configured epsilon for every representative and therefore retains its
+ *   original fixed-resolution semantics. Variable radii have a geometric
+ *   packing bound P(K, inf_i epsilon_i) only when their positive infimum is
+ *   known; max_memory_bytes remains the strict physical bound regardless.
+ *
  * Storage and lookup.
  *
- *   The current implementation keeps representatives in FIFO order and
- *   performs an O(|R|) linear scan per observe or query. Each representative
- *   is one allocation containing its d-dimensional point and list header;
- *   this lets bounded mode recycle the oldest allocation without a transient
- *   memory spike. For large |R|, the scan can be replaced by the built-in
- *   VP-tree or another nearest-neighbour backend without changing the public
- *   query API.
+ *   The current implementation keeps representatives in FIFO order. Each
+ *   representative is one allocation containing its radius, d-dimensional
+ *   point, and list header; bounded mode can therefore recycle the oldest
+ *   allocation without a transient memory spike. The built-in VP-tree keeps
+ *   only O(|R|) index metadata and borrows those stable cache-owned vectors,
+ *   avoiding a second O(|R|*d) coordinate store.
  */
 
 /*
@@ -72,7 +87,7 @@ typedef double (*futcache_distance_fn)(const double *a, const double *b,
 
 /*
  * Optional nearest-neighbour backend.  The cache remains the owner of the
- * representative coordinates; a backend owns only its index/state.  A
+ * representative coordinates; a backend owns only its index/state. A custom
  * backend must not retain `points` from nearest() or insert().
  * All backend state and scratch memory must be obtained from the allocator
  * supplied to create(); this is required for max_memory_bytes enforcement.
@@ -81,6 +96,9 @@ typedef double (*futcache_distance_fn)(const double *a, const double *b,
  * may return a conservative (over-estimated) distance when approximate: that
  * can cause false novelty, but must never suppress a genuinely novel point.
  * Return FUTCACHE_OK with `*out_distance = INFINITY` when count is zero.
+ * Adaptive radii remain correct with custom backends: the cache falls back to
+ * its exact linear variable-ball scan. The built-in VP-tree has an internal
+ * radius-aware fast path without changing this public backend ABI.
  */
 typedef struct futcache_pack_backend_ops {
     futcache_status_t (*create)(void **out_state, size_t dimension,
@@ -101,7 +119,7 @@ typedef struct futcache_pack_backend_ops {
 typedef struct futcache_pack_config {
     /* Number of coordinates per point. Must be >= 1. */
     size_t dimension;
-    /* Novelty resolution; same units as the distance function. */
+    /* Default acceptance radius; same units as the distance function. */
     double epsilon;
     /* Distance function. NULL selects L_inf (Chebyshev). */
     futcache_distance_fn distance;
@@ -141,8 +159,8 @@ typedef struct futcache_pack_config {
  * prunes with the triangle inequality, so it works in any metric space
  * (L1, L2, L_inf, or a custom metric) and its query cost tracks the
  * intrinsic dimensionality (the doubling constant), not the ambient
- * dimension: on low-intrinsic-dimension data (real embeddings) it is
- * 10-100x faster than the linear scan even at 384 dimensions, while
+ * dimension: on low-intrinsic-dimension data (real embeddings) it can be
+ * an order of magnitude faster than the linear scan at 384 dimensions, while
  * on adversarial uniform data in high dimensions it degrades toward
  * the linear scan (the curse of dimensionality; see the backend bench).
  *
@@ -159,10 +177,12 @@ typedef struct futcache_pack_config {
  * one-sided guarantee when the normalization contract is violated, the
  * backend detects non-unit-norm inputs (at insert and per query) and
  * falls back to an exact linear scan over the engine's cosine distance
- * for those points — a wrong epsilon can never turn a genuinely novel
- * point into a hit.
+ * for those points. Violating the normalization contract therefore disables
+ * pruning rather than changing the engine-distance decision.
  *
- * Memory is allocated through the cache's allocator (counting-
+ * Nodes borrow stable cache-owned representative vectors instead of copying
+ * them, so index memory is O(n) metadata rather than another O(n*d) vector
+ * store. Memory is allocated through the cache's allocator (counting-
  * allocator / fault-injection compatible), and every insert is
  * all-or-nothing: an allocation failure leaves the index exactly as
  * it was before the call.
@@ -211,6 +231,14 @@ FUTCACHE_API double futcache_distance_linf(const double *a, const double *b,
  */
 FUTCACHE_API double futcache_distance_cosine(const double *a, const double *b,
                                               size_t dimension, void *context);
+/*
+ * Poincare-ball distance for points with Euclidean norm strictly below one.
+ * Invalid points return NaN and are rejected by caches using this metric.
+ */
+FUTCACHE_API double futcache_distance_poincare(const double *a,
+                                                const double *b,
+                                                size_t dimension,
+                                                void *context);
 
 /*
  * Creates a thread-safe packing novelty cache. `config` is consumed for
@@ -226,8 +254,9 @@ FUTCACHE_API futcache_status_t futcache_pack_create(
 FUTCACHE_API void futcache_pack_destroy(futcache_pack_t *cache);
 
 /*
- * Reports whether `point` is farther than `epsilon` from every existing
- * representative. Pure query, no state change.
+ * Reports whether `point` lies outside every representative's stored ball.
+ * With ordinary observe() calls, all stored radii equal `epsilon`. Pure
+ * query, no state change.
  */
 FUTCACHE_API futcache_status_t futcache_pack_is_novel(
     const futcache_pack_t *cache,
@@ -237,15 +266,46 @@ FUTCACHE_API futcache_status_t futcache_pack_is_novel(
 
 /*
  * Atomically tests novelty of `point` and, if novel, adds it as a new
- * representative. A point within epsilon of an existing representative is
- * reported as redundant and the state is unchanged. Under a non-zero memory
- * ceiling, adding a novel point may FIFO-evict the oldest representative;
- * `out_was_novel` remains true and stats.evictions advances.
+ * representative using the configured epsilon as its radius. Existing
+ * representatives retain their stored radii, including any inserted through
+ * observe_with_radius(). A point inside an existing ball is redundant and
+ * the state is unchanged. Under a non-zero memory ceiling, adding a novel
+ * point may FIFO-evict the oldest representative; `out_was_novel` remains
+ * true and stats.evictions advances.
  */
 FUTCACHE_API futcache_status_t futcache_pack_observe(
     futcache_pack_t *cache,
     const double *point,
     bool *out_was_novel
+);
+
+/*
+ * Adaptive-radius atomic query + update. Existing representatives are tested
+ * with their own stored radii. If none contains `point`, a representative
+ * with `radius` is inserted. On a hit, distance/index identify the closest
+ * containing representative; on insertion they are 0 and the new slot.
+ * The three output pointers are optional. Radius must be finite and >= 0.
+ */
+FUTCACHE_API futcache_status_t futcache_pack_observe_with_radius(
+    futcache_pack_t *cache,
+    const double *point,
+    double radius,
+    bool *out_was_novel,
+    double *out_distance,
+    size_t *out_index
+);
+
+/*
+ * Finds the closest representative whose stored ball contains `point`.
+ * Exact distance ties choose the lower FIFO slot. On a miss, found=false,
+ * distance=+infinity, and index=SIZE_MAX. This is a pure query.
+ */
+FUTCACHE_API futcache_status_t futcache_pack_lookup(
+    const futcache_pack_t *cache,
+    const double *point,
+    bool *out_found,
+    double *out_distance,
+    size_t *out_index
 );
 
 /* Returns a consistent stats snapshot. */
@@ -271,15 +331,22 @@ FUTCACHE_API futcache_status_t futcache_pack_copy_representatives(
     size_t *inout_count
 );
 
+/* Copies representative acceptance radii in the same FIFO/slot order. */
+FUTCACHE_API futcache_status_t futcache_pack_copy_radii(
+    const futcache_pack_t *cache,
+    double *out_radii,
+    size_t *inout_count
+);
+
 /*
  * Reports the distance to, and slot index of, the nearest representative.
  * On an empty cache, `*out_distance` is +infinity and `*out_index` is
  * SIZE_MAX. The index matches the ordering used by
- * futcache_pack_copy_representatives(). This always scans the representative
- * list (a custom nearest-neighbour backend does not expose identities), so it
- * is O(|R|) and never mutates state. Indices remain stable across appends but
- * may shift after a pressure eviction; callers must not retain them across a
- * mutating call when max_memory_bytes is non-zero.
+ * futcache_pack_copy_representatives(). The built-in VP-tree accelerates this
+ * exact identity lookup; custom backends fall back to the representative
+ * scan. It never mutates state. Indices remain stable
+ * across appends but may shift after a pressure eviction; callers must not
+ * retain them across a mutating call when max_memory_bytes is non-zero.
  */
 FUTCACHE_API futcache_status_t futcache_pack_nearest(
     const futcache_pack_t *cache,
@@ -295,8 +362,9 @@ FUTCACHE_API futcache_status_t futcache_pack_nearest(
 FUTCACHE_API futcache_status_t futcache_pack_clear(futcache_pack_t *cache);
 
 /*
- * Validates the epsilon-separation invariant (every pair of representatives
- * is strictly farther than epsilon apart), the telemetry lifecycle
+ * Validates the insertion-order packing invariant (each later representative
+ * lies strictly outside every earlier representative's stored radius), the
+ * telemetry lifecycle
  * invariants (generation >= observations, novel <= observations, count +
  * evictions == novel before counter saturation, count <= peak), and the hard
  * live/peak memory ceiling. O(n^2) in the representative count.
@@ -307,7 +375,8 @@ FUTCACHE_API futcache_status_t futcache_pack_validate(const futcache_pack_t *cac
  * Serializes an atomic packing-state snapshot into a versioned,
  * endian-independent, CRC32-protected format. Pass buffer=NULL to query the
  * required size. The snapshot contains representatives, bounds, counters,
- * eviction telemetry, the memory ceiling, and the selected built-in metric.
+ * eviction telemetry, the memory ceiling, representative radii, and the
+ * selected built-in metric.
  * Custom distance functions cannot be serialized and return
  * FUTCACHE_ERROR_UNSUPPORTED_PLATFORM.
  *

@@ -9,6 +9,10 @@ novelty. It stores what future novelty queries can observe rather than storing
 the observation history. The packing engine can additionally enforce a hard
 byte ceiling with deterministic oldest-first pressure eviction.
 
+FUTCache gives you the semantic caching machinery, exact search, bounded
+memory, durability, and measurable reuse frontier. Your embedding model
+determines how far semantic reuse can safely go.
+
 For a bounded one-dimensional metric domain `K=[a,b]` and resolution
 `epsilon`, the exact query is
 
@@ -187,6 +191,19 @@ observation within `epsilon` of an existing representative is redundant and
 the state is unchanged. Representative count is bounded by the packing number
 `P(K, epsilon)`.
 
+The compatibility API uses one fixed `epsilon`. Adaptive resolution is also
+native: `futcache_pack_observe_with_radius` assigns each newly admitted
+representative its own radius `epsilon_i`, and lookup tests the exact union
+`U(H) = union_i B(r_i, epsilon_i)`. It does not assume that the nearest centre
+owns the matching ball—a farther centre with a larger certified radius is
+found correctly. `futcache_pack_lookup` returns the closest containing
+representative and its stable FIFO slot.
+
+If adaptive radii have a known positive floor `epsilon_min`, representative
+count is bounded by `P(K, epsilon_min)`. If radii may approach zero, use
+`max_memory_bytes` for the unconditional physical bound; pressure eviction
+remains strict and never allocates through an uncounted VP-tree path.
+
 For deployments with a smaller operational budget, set
 `futcache_pack_config_t.max_memory_bytes`. Every live allocation requested by
 the cache—including VP-tree nodes and rebuild scratch—is charged to this hard
@@ -199,21 +216,90 @@ therefore cause extra misses, but it cannot produce a false hit. Stats expose
 recover the complete representative state, parameters, pressure limit, and
 telemetry. Snapshots are little-endian, versioned, strictly framed, and CRC32
 protected. Built-in VP-tree state is reconstructed from representatives; it
-is not persisted as pointer-rich derived state.
+is not persisted as pointer-rich derived state. Snapshot version 2 persists
+every adaptive radius and remains backward-compatible with fixed-radius
+version 1 snapshots.
 
 This is the cache that addresses the *geometric* novelty question for RAG
 embeddings, sensor fusion, time-series anomaly detection, and intrinsic
-curiosity in reinforcement learning. Three built-in distances are provided:
+curiosity in reinforcement learning. Five built-in distances are provided:
 
-`futcache_distance_linf`, `futcache_distance_l1`, `futcache_distance_l2`.
-A custom metric can be supplied as a function pointer with an opaque
-context.
+`futcache_distance_linf`, `futcache_distance_l1`, `futcache_distance_l2`,
+`futcache_distance_cosine`, and `futcache_distance_poincare`. A custom metric
+can be supplied as a function pointer with an opaque context.
 
 For large representative sets, `futcache_pack_config_t` also accepts an
 optional nearest-neighbour backend. The built-in linear scan remains the
 default. Approximate indexes may conservatively overestimate distance and
 therefore report extra novelty, but must never suppress a genuinely novel
-point.
+point. The exact VP-tree stores only dimension-independent node metadata and
+borrows immutable representative vectors from the cache, avoiding the former
+second `N * dimension * sizeof(double)` coordinate store. Its subtree maximum
+radius bounds prune exact adaptive ball lookup.
+
+The repository Release benchmark at 384 dimensions and 2,000 representatives
+on a low-intrinsic-dimension cosine workload measures the effect directly:
+
+| Backend | observe | query | live memory |
+|---|---:|---:|---:|
+| linear scan | 268.7 us/op | 535.3 us/op | 5.96 MiB |
+| exact VP-tree | 29.5 us/op | 31.0 us/op | 6.19 MiB |
+
+That is 9.1x faster observation and 17.2x faster lookup for about 4% index
+overhead. A second copy of all 384-D vectors alone would cost another 5.86
+MiB in this case. Run `futcache_pack_backend_bench` on the deployment CPU for
+hardware-specific numbers; uniform high-dimensional data still exhibits the
+expected curse-of-dimensionality fallback toward a scan.
+
+### Adaptive resolution: Poincare + isolation + primes
+
+The Python calibration layer implements the research rule
+
+```text
+epsilon(x) = epsilon_0 (1 - ||z(x)||^2)^gamma
+             exp(-lambda * isolation_score(x))
+```
+
+`z(x)` is a point in the open Poincare ball. Radial position makes specialised
+boundary concepts stricter, while a compact Isolation Forest contracts the
+radius in poorly supported regions. A nearest-known-incompatible margin can
+hard-cap the result. Prime-base Halton trials explore `(epsilon_0, gamma,
+lambda)` without materialising a Cartesian grid.
+
+```python
+from futcache import (
+    AdaptiveRadiusController, AdaptiveRadiusPolicy,
+    CompactIsolationForest, PackCache, halton_trials,
+)
+
+# z_calibration and z_stream are learned hyperbolic embeddings (norm < 1).
+forest = CompactIsolationForest(max_samples=256).fit(z_calibration)
+policy = AdaptiveRadiusPolicy(
+    base_radius=0.6, gamma=1.5, isolation_weight=2.0,
+    margin_safety=0.5,
+)
+controller = AdaptiveRadiusController(policy, forest)
+cache = PackCache(384, epsilon=0.0, distance="poincare", backend="vptree",
+                  max_memory_bytes=64 << 20)
+
+for z, response in z_stream:
+    result = cache.observe(z, payload=response,
+                           radius=controller.radius(z))
+
+for trial in halton_trials({
+    "epsilon_0": (0.05, 0.8),
+    "gamma": (0.0, 4.0),
+    "lambda": (0.0, 6.0),
+}, count=64):
+    evaluate_on_calibration_split(trial)
+```
+
+`CompactIsolationForest` retains flat float32/int32 tree arrays and does not
+retain the fitted embedding matrix. `poincare_embed` is available when an
+external specificity signal needs to be mapped onto Euclidean directions; it
+is deliberately not presented as a substitute for learning a hierarchy.
+These geometry and density signals choose radii—the C engine still performs
+the exact decision, persistence, and bounded-memory eviction.
 
 The exact interval-union cache (`<futcache/futcache.h>`) and the packing
 cache (`<futcache/pack.h>`) answer different questions:
@@ -444,22 +530,25 @@ else:
 The wrapper exposes:
 
 - `PackCache(dimension, epsilon, distance, domain_min, domain_max, backend, max_memory_bytes)`
-- `cache.observe(point, payload=None) -> NoveltyResult`
+- `cache.observe(point, payload=None, radius=None) -> NoveltyResult`
 - `cache.query(point) -> NoveltyResult`
 - `cache.get_payload(representative_id) -> bytes | None`
 - `cache.set_payload(representative_id, payload)`
 - `cache.copy_representatives() -> numpy.ndarray` of shape `(N, dimension)`
+- `cache.copy_radii() -> numpy.ndarray` of shape `(N,)`
 - `cache.clear()`
 - `len(cache)`, `cache.peak_count()`, `cache.memory_bytes()`,
   `cache.peak_memory_bytes()`, `cache.memory_limit_bytes()`,
   `cache.evictions()`, `cache.observations()`, `cache.novel_observations()`
-- `PackCache.version() -> "1.2.0"`
+- `PackCache.version() -> "1.3.0"`
 
-Supported distance names: `"linf"` (default), `"l1"`, `"l2"`, `"cosine"`.
+Supported distance names: `"linf"` (default), `"l1"`, `"l2"`, `"cosine"`,
+and `"poincare"`.
 
 On a semantic HIT, `NoveltyResult.representative_id` is the slot index to
 pass to `get_payload()`, and `NoveltyResult.distance` is the distance to the
-nearest representative (a HIT has `distance <= epsilon`). On a novel
+closest containing representative (a HIT is within that slot's stored
+radius). On a novel
 observation `representative_id` names the newly inserted slot and `distance`
 is `0.0`; only a novel non-mutating query returns `-1`. Under pressure, FIFO
 eviction shifts older slot ids down by one and the Python wrapper shifts or

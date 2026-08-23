@@ -7,6 +7,12 @@
 
 #include "futcache/pack.h"
 
+static void pack_test_write_u16_le(uint8_t *destination, uint16_t value)
+{
+    destination[0] = (uint8_t)(value & UINT16_C(0xff));
+    destination[1] = (uint8_t)((value >> 8U) & UINT16_C(0xff));
+}
+
 static void pack_test_write_u32_le(uint8_t *destination, uint32_t value)
 {
     for (size_t i = 0U; i < 4U; ++i) {
@@ -875,8 +881,8 @@ static futcache_status_t mock_backend_nearest(void *opaque_state,
     stats->nearest_calls++;
     /* Only the designated second point is indexed as a hit; all other
      * points exercise the insertion path (including the forced failure). */
-    *out_distance = (state->indexed > 0U && point[0] == 0.9 &&
-                     point[1] == 0.9) ? 0.0 : 1.0 / 0.0;
+    *out_distance = (state->indexed > 0U && point[0] == 0.15 &&
+                     point[1] == 0.15) ? 0.0 : 1.0 / 0.0;
     return FUTCACHE_OK;
 }
 
@@ -917,7 +923,7 @@ static bool test_pluggable_backend_lifecycle_and_atomicity(void)
     }
 
     /* The mock index reports every indexed point as distance zero. */
-    double second[2] = {0.9, 0.9};
+    double second[2] = {0.15, 0.15};
     if (futcache_pack_is_novel(cache, second, &novel) != FUTCACHE_OK ||
         novel || backend_stats.nearest_calls == 0U) {
         futcache_pack_destroy(cache);
@@ -1169,7 +1175,9 @@ static bool test_memory_pressure_vptree_bound(void)
     TEST_STATUS(futcache_pack_create(&cfg, &cache), FUTCACHE_OK);
     for (size_t i = 0U; i < 100U; ++i) {
         double point[2] = {(double)i, (double)(100U - i)};
-        TEST_STATUS(futcache_pack_observe(cache, point, &novel), FUTCACHE_OK);
+        double radius = (i & 1U) != 0U ? 0.1 : 0.2;
+        TEST_STATUS(futcache_pack_observe_with_radius(
+            cache, point, radius, &novel, NULL, NULL), FUTCACHE_OK);
         TEST_ASSERT(novel);
         TEST_STATUS(futcache_pack_get_stats(cache, &stats), FUTCACHE_OK);
         TEST_ASSERT(stats.memory_bytes <= cfg.max_memory_bytes);
@@ -1540,6 +1548,178 @@ static bool test_vptree_snapshot_rebuild(void)
     return true;
 }
 
+static bool test_adaptive_radius_lookup(void)
+{
+    futcache_pack_config_t config;
+    futcache_pack_t *cache = NULL;
+    double lo[1] = {-1.0};
+    double hi[1] = {2.0};
+    double narrow[1] = {0.0};
+    double broad[1] = {0.3};
+    double query[1] = {0.08};
+    bool novel = false;
+    bool found = false;
+    double distance = INFINITY;
+    size_t index = SIZE_MAX;
+
+    futcache_pack_config_init(&config);
+    config.dimension = 1U;
+    config.epsilon = 0.1;
+    config.distance = futcache_distance_l2;
+    config.domain_min = lo;
+    config.domain_max = hi;
+    config.backend = &futcache_pack_vptree_backend;
+    TEST_STATUS(futcache_pack_create(&config, &cache), FUTCACHE_OK);
+
+    TEST_STATUS(futcache_pack_observe_with_radius(
+        cache, narrow, 0.05, &novel, &distance, &index), FUTCACHE_OK);
+    TEST_ASSERT(novel && index == 0U && distance == 0.0);
+    TEST_STATUS(futcache_pack_observe_with_radius(
+        cache, broad, 0.4, &novel, &distance, &index), FUTCACHE_OK);
+    TEST_ASSERT(novel && index == 1U && distance == 0.0);
+
+    /* The nearest centre (slot 0, d=.08) does not contain the query. The
+     * farther centre (slot 1, d=.22) does: nearest-centre thresholding would
+     * get this case wrong. */
+    TEST_STATUS(futcache_pack_lookup(cache, query, &found, &distance, &index),
+                FUTCACHE_OK);
+    TEST_ASSERT(found && index == 1U);
+    TEST_NEAR(distance, 0.22, 1e-12);
+    TEST_STATUS(futcache_pack_observe_with_radius(
+        cache, query, 0.01, &novel, &distance, &index), FUTCACHE_OK);
+    TEST_ASSERT(!novel && index == 1U);
+
+    {
+        double radii[2] = {0.0, 0.0};
+        size_t count = 2U;
+        TEST_STATUS(futcache_pack_copy_radii(cache, radii, &count),
+                    FUTCACHE_OK);
+        TEST_ASSERT(count == 2U);
+        TEST_NEAR(radii[0], 0.05, 0.0);
+        TEST_NEAR(radii[1], 0.4, 0.0);
+    }
+    TEST_STATUS(futcache_pack_validate(cache), FUTCACHE_OK);
+    futcache_pack_destroy(cache);
+    return true;
+}
+
+static bool test_adaptive_snapshot_and_v1_compatibility(void)
+{
+    futcache_pack_config_t config;
+    futcache_pack_t *cache = NULL;
+    futcache_pack_t *restored = NULL;
+    double lo[1] = {-1.0};
+    double hi[1] = {2.0};
+    const double points[2] = {0.0, 0.4};
+    const double radii[2] = {0.05, 0.4};
+    bool novel = false;
+    size_t snapshot_size = 0U;
+
+    futcache_pack_config_init(&config);
+    config.dimension = 1U;
+    config.epsilon = 0.1;
+    config.distance = futcache_distance_l2;
+    config.domain_min = lo;
+    config.domain_max = hi;
+    TEST_STATUS(futcache_pack_create(&config, &cache), FUTCACHE_OK);
+    for (size_t index = 0U; index < 2U; ++index) {
+        TEST_STATUS(futcache_pack_observe_with_radius(
+            cache, points + index, radii[index], &novel, NULL, NULL),
+            FUTCACHE_OK);
+        TEST_ASSERT(novel);
+    }
+    TEST_STATUS(futcache_pack_serialize(cache, NULL, 0U, &snapshot_size),
+                FUTCACHE_OK);
+    uint8_t *snapshot = (uint8_t *)malloc(snapshot_size);
+    TEST_ASSERT(snapshot != NULL);
+    TEST_STATUS(futcache_pack_serialize(cache, snapshot, snapshot_size,
+                                        &snapshot_size), FUTCACHE_OK);
+    TEST_ASSERT(snapshot[8] == UINT8_C(2) && snapshot[9] == UINT8_C(0));
+    TEST_ASSERT(snapshot[12] == UINT8_C(1));
+
+    TEST_STATUS(futcache_pack_deserialize(snapshot, snapshot_size, NULL,
+                                          &restored), FUTCACHE_OK);
+    {
+        double recovered[2] = {0.0, 0.0};
+        size_t count = 2U;
+        TEST_STATUS(futcache_pack_copy_radii(restored, recovered, &count),
+                    FUTCACHE_OK);
+        TEST_ASSERT(count == 2U);
+        TEST_NEAR(recovered[0], radii[0], 0.0);
+        TEST_NEAR(recovered[1], radii[1], 0.0);
+    }
+    futcache_pack_destroy(restored);
+    restored = NULL;
+
+    /* Convert the deterministic v2 body into the historical v1 layout by
+     * dropping each stored radius. The v1 reader assigns epsilon to every
+     * representative. */
+    size_t legacy_size = snapshot_size - 2U * sizeof(double);
+    uint8_t *legacy = (uint8_t *)malloc(legacy_size);
+    TEST_ASSERT(legacy != NULL);
+    memcpy(legacy, snapshot, 104U + 2U * sizeof(double));
+    pack_test_write_u16_le(legacy + 8U, UINT16_C(1));
+    pack_test_write_u32_le(legacy + 12U, UINT32_C(0));
+    size_t source_offset = 104U + 2U * sizeof(double);
+    size_t destination_offset = source_offset;
+    for (size_t index = 0U; index < 2U; ++index) {
+        source_offset += sizeof(double);
+        memcpy(legacy + destination_offset, snapshot + source_offset,
+               sizeof(double));
+        source_offset += sizeof(double);
+        destination_offset += sizeof(double);
+    }
+    pack_test_rewrite_crc(legacy, legacy_size);
+    TEST_STATUS(futcache_pack_deserialize(legacy, legacy_size, NULL,
+                                          &restored), FUTCACHE_OK);
+    {
+        double recovered[2] = {0.0, 0.0};
+        size_t count = 2U;
+        TEST_STATUS(futcache_pack_copy_radii(restored, recovered, &count),
+                    FUTCACHE_OK);
+        TEST_ASSERT(count == 2U);
+        TEST_NEAR(recovered[0], config.epsilon, 0.0);
+        TEST_NEAR(recovered[1], config.epsilon, 0.0);
+    }
+
+    free(legacy);
+    free(snapshot);
+    futcache_pack_destroy(restored);
+    futcache_pack_destroy(cache);
+    return true;
+}
+
+static bool test_poincare_distance_and_domain(void)
+{
+    double origin[2] = {0.0, 0.0};
+    double half[2] = {0.5, 0.0};
+    double boundary[2] = {1.0, 0.0};
+    TEST_NEAR(futcache_distance_poincare(origin, half, 2U, NULL),
+              log(3.0), 1e-12);
+    TEST_ASSERT(isnan(futcache_distance_poincare(
+        origin, boundary, 2U, NULL)));
+
+    futcache_pack_config_t config;
+    futcache_pack_t *cache = NULL;
+    double lo[2] = {-1.0, -1.0};
+    double hi[2] = {1.0, 1.0};
+    bool novel = false;
+    futcache_pack_config_init(&config);
+    config.dimension = 2U;
+    config.epsilon = 0.2;
+    config.distance = futcache_distance_poincare;
+    config.domain_min = lo;
+    config.domain_max = hi;
+    config.backend = &futcache_pack_vptree_backend;
+    TEST_STATUS(futcache_pack_create(&config, &cache), FUTCACHE_OK);
+    TEST_STATUS(futcache_pack_observe(cache, origin, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    TEST_STATUS(futcache_pack_observe(cache, boundary, &novel),
+                FUTCACHE_ERROR_OUT_OF_RANGE);
+    futcache_pack_destroy(cache);
+    return true;
+}
+
 /* ============================================================
  * Test suite registration
  * ============================================================ */
@@ -1573,6 +1753,12 @@ int pack_test_suite(void)
         {"packing snapshot recovery and corruption rejection",
             test_pack_snapshot_recovery_and_corruption},
         {"VP-tree snapshot rebuild", test_vptree_snapshot_rebuild},
+        {"adaptive representative radii and exact lookup",
+            test_adaptive_radius_lookup},
+        {"adaptive snapshot and v1 compatibility",
+            test_adaptive_snapshot_and_v1_compatibility},
+        {"Poincare metric and open-ball domain",
+            test_poincare_distance_and_domain},
     };
     return run_test_cases("pack", tests, sizeof(tests) / sizeof(tests[0]));
 }

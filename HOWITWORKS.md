@@ -35,7 +35,7 @@ The library ships five engines behind five headers:
 There is also a Python binding, `futcache`, that wraps the packing engine and
 adds payload storage for semantic caching.
 
-The library is version 1.2.0. The version is defined in
+The library is version 1.3.0. The version is defined in
 `include/futcache/futcache.h` and mirrored in `CMakeLists.txt` and
 `pyproject.toml`.
 
@@ -387,41 +387,49 @@ embedding spaces, where a closed-form canonical union does not exist.
 
 ### 8.1 Representation
 
-The cache keeps a FIFO-ordered set R of representative points. A point x is redundant if
-its distance to the nearest representative is at most epsilon; otherwise x is
-novel and is added to R. This is a greedy farthest-point-style insertion: a
-new representative is always at distance strictly greater than epsilon from
-every existing representative, so R is epsilon-separated, and its size is
-bounded by the packing number of the domain at scale epsilon.
+The cache keeps a FIFO-ordered set R of representative points and one
+acceptance radius per representative. The compatibility API assigns the
+configured epsilon to every new representative. A point x is redundant if it
+lies inside any representative ball; otherwise x is novel and is added to R.
+With the fixed API this is the original greedy farthest-point insertion: R is
+epsilon-separated and its size is bounded by the packing number at that scale.
 
-The separation invariant follows directly from the insertion rule. A point is added only
-when it is farther than epsilon from every current representative, so the new
-representative is farther than epsilon from all of them, and separation is
-preserved by induction. Without a hard memory ceiling, a point is rejected
-only when it is within epsilon of some representative, so every observed point
-is either a representative or within epsilon of one. That is the coverage side
-of the unbounded packing trade. Pressure eviction deliberately relaxes full-
-history coverage while preserving separation and one-sided cache safety.
+`futcache_pack_observe_with_radius` instead assigns a new representative its
+own epsilon_i. Lookup is exact membership in `union_i B(r_i, epsilon_i)`. It
+cannot be reduced to the nearest centre: the nearest ball may be too small
+while a farther, larger ball contains the query. A positive radius floor gives
+the packing bound `P(K, inf_i epsilon_i)`; if radii approach zero, the hard
+byte ceiling is the unconditional physical bound.
+
+The adaptive invariant is directional: every later centre lies strictly
+outside every earlier centre's stored radius. Fixed epsilon makes that relation
+symmetric. Pressure eviction deliberately forgets old coverage while
+preserving the invariant among survivors.
 
 ### 8.2 One-sided error
 
-Representatives are a subset of the observed history, so the ball union of R
-is a subset of the true union U_e(H). A point inside a representative's ball
-is therefore genuinely within epsilon of an observed point: the cache never
-reports a false hit. The converse does not hold. A point can be within
-epsilon of an observed non-representative point while being farther than
-epsilon from every representative, in which case the cache reports a false
+Under fixed epsilon, representatives are a subset of the observed history, so
+the ball union of R is a subset of the true union U_e(H). A point inside a
+representative's ball is therefore genuinely within epsilon of an observed
+point: the cache never reports a false hit. The converse does not hold. A
+point can be within epsilon of an observed non-representative point while
+being farther than epsilon from every representative, in which case the cache
+reports a false
 novelty. The packing cache is therefore one-sided and conservative: it may
 over-report novelty, and it must not, and does not, suppress a genuinely
 novel point. This is the correct error profile for a cache, because the worst
 case of a false novelty is a redundant recomputation, whereas a false hit
-would return stale data.
+would return stale data. With adaptive radii, the engine is exact for the
+caller-supplied representative balls. Whether those balls express true intent
+equivalence is a calibration and embedding-model question, measured as reuse
+precision rather than assumed by the data structure.
 
 ### 8.3 Distance functions
 
-The config accepts a `futcache_distance_fn`. Four are provided:
+The config accepts a `futcache_distance_fn`. Five are provided:
 `futcache_distance_l1`, `futcache_distance_l2`, `futcache_distance_linf`, and
-`futcache_distance_cosine`. The default is L_inf. The cosine distance is
+`futcache_distance_cosine`, plus `futcache_distance_poincare` for vectors in
+the open unit ball. The default is L_inf. The cosine distance is
 defined for vectors and is the natural choice for normalized embeddings,
 which is how `examples/rag_embedding.c` and the Python binding use the engine.
 Callers are responsible for normalization: the cosine distance assumes unit
@@ -432,22 +440,25 @@ vectors, and the examples normalize before observing.
 The default nearest-neighbor search is a linear scan over R, which is O(|R|)
 per observation. The config accepts an optional `futcache_pack_backend_ops_t`
 that supplies an external nearest-neighbor index. The backend contract is
-one-sided in the same direction: an approximate backend may return a
-distance that is too small, which over-reports novelty, but it must never
-return a distance that is too large for a point that is genuinely novel,
-because that would suppress novelty. The backend does not expose per-index
-identities, which is why `futcache_pack_nearest` (below) always uses the
-linear representative list. Backends must obtain all state and scratch memory
+one-sided in the same direction: an approximate backend may conservatively
+overestimate distance, which over-reports novelty, but it must never
+underestimate distance and suppress a genuinely novel point. Custom backends
+without radius-aware operations fall back to the exact representative scan in
+adaptive mode. Backends must obtain all state and scratch memory
 from the allocator supplied at creation so the hard byte ceiling can include
 the index as well as representative coordinates.
 
 ### 8.5 Nearest-site lookup
 
+`futcache_pack_lookup` reports the closest containing ball and its slot;
 `futcache_pack_nearest` reports the distance to, and slot index of, the
 nearest representative. On an empty cache it reports `+infinity` and
 `SIZE_MAX`. The slot index matches the ordering used by
 `futcache_pack_copy_representatives`. This function is what the Python
-binding uses to populate a hit's `representative_id` and `distance`. Appends
+binding uses to populate a hit's `representative_id` and `distance`. The
+built-in VP-tree accelerates both identities through a private fast path, and
+its nodes borrow cache-owned vectors rather than duplicating all coordinates.
+Appends
 preserve existing indices; FIFO pressure eviction removes index zero and
 shifts surviving indices, so bounded-mode ids are valid only until the next
 mutation.
@@ -464,8 +475,8 @@ rebuilds cannot overshoot it either.
 
 When a novel representative does not fit, the engine recycles the oldest
 representative's fixed-size allocation and moves it to the tail of the FIFO
-list. The incoming point was farther than epsilon from the entire pre-eviction
-set, so the remaining set stays epsilon-separated. Forgetting the old point
+list. The incoming point was outside every ball in the pre-eviction set, so
+the directional packing invariant survives. Forgetting the old point
 can turn a future hit into a miss, but cannot turn a genuinely novel query into
 a hit. If a bounded backend cannot rebuild within the ceiling, it is destroyed
 and queries fall back to the exact allocation-free linear scan.
@@ -473,13 +484,15 @@ and queries fall back to the exact allocation-free linear scan.
 ### 8.7 Crash-recovery snapshots
 
 `futcache_pack_serialize` captures representatives in FIFO/slot order along
-with the metric, domain, epsilon, counters, evictions, memory ceiling, and
-high-water telemetry. `futcache_pack_deserialize` validates strict framing and
+with the metric, domain, default epsilon, per-representative radii, counters,
+evictions, memory ceiling, and high-water telemetry.
+`futcache_pack_deserialize` validates strict framing and
 CRC32, restores the representative set, and reconstructs the built-in VP-tree
 when applicable. Custom distance callbacks are deliberately unsupported
 because their function pointer and opaque context are not portable recovery
 state; custom indexes restore as a linear scan because an index is derived
-from the representatives.
+from the representatives. The version-2 reader also accepts fixed-radius
+version-1 snapshots and assigns their epsilon to every restored representative.
 
 The byte format is specified in `docs/pack-serialization.md`. For machine-crash
 durability, write a complete snapshot to a same-directory temporary file,
@@ -491,9 +504,8 @@ flush it, and atomically rename it over the prior checkpoint.
 observations`, `novel_observations <= observations`, `representative_count +
 evictions == novel_observations` before saturation, and
 `representative_count <= peak_count`), verifies live and peak bytes against
-the hard ceiling, and checks that every pair of representatives is strictly
-farther than epsilon apart. The separation check is O(|R|^2), which is why it
-is a diagnostic rather than a per-operation check.
+the hard ceiling, and checks the insertion-order radius invariant. The check is
+O(|R|^2), which is why it is a diagnostic rather than a per-operation check.
 
 ---
 
@@ -802,20 +814,23 @@ keyed by representative slot index.
 
 The main class is `PackCache(dimension, epsilon, distance, domain_min,
 domain_max, backend, max_memory_bytes)`, where `distance` is one of `"linf"`
-(default), `"l1"`, `"l2"`, or `"cosine"`, and the domain bounds are scalars
-broadcast to every dimension. A zero memory limit is unlimited; a positive
+(default), `"l1"`, `"l2"`, `"cosine"`, or `"poincare"`, and the domain bounds
+are scalars broadcast to every dimension. Poincare points must lie strictly
+inside the Euclidean unit ball. A zero memory limit is unlimited; a positive
 limit enables native FIFO pressure eviction and drops the corresponding
 Python payload. Points are `numpy.float64` one-dimensional arrays.
 
-`observe(point, payload=None)` and `query(point)` return a `NoveltyResult`
-with four fields:
+`observe(point, payload=None, *, radius=None)` and `query(point)` return a
+`NoveltyResult` with four fields. `radius=None` uses the configured epsilon;
+an explicit radius is stored on a newly inserted representative:
 
 - `representative_id` — the slot index of the matched or newly inserted
   representative; a novel non-mutating `query` returns `-1`.
-- `is_novel` — whether the point is farther than epsilon from every existing
-  representative.
-- `distance` — distance to the nearest representative; `0.0` for a novel
-  observation and at most epsilon for a hit.
+- `is_novel` — whether the point lies outside every existing
+  representative's stored acceptance radius.
+- `distance` — distance to the closest containing representative on a hit,
+  the nearest-centre distance on a non-mutating miss, and `0.0` for a novel
+  observation.
 - `inserted` — true when `observe` added a new representative.
 
 The canonical pattern, demonstrated by
@@ -825,19 +840,29 @@ if not novel, `get_payload` the cached result. The slot index from a hit is
 exactly the key to `get_payload`.
 
 The class also exposes `copy_representatives()` (an `(N, dimension)` array),
-`clear()`, `len()`, `peak_count()`, `memory_bytes()`,
+`copy_radii()` (an `(N,)` array in the same slot order), `clear()`, `len()`,
+`peak_count()`, `memory_bytes()`,
 `peak_memory_bytes()`, `memory_limit_bytes()`, `evictions()`,
 `observations()`, `novel_observations()`, and a class method
-`PackCache.version()` returning `"1.2.0"`.
+`PackCache.version()` returning `"1.3.0"`.
+
+`futcache.adaptive` supplies the optional calibration layer:
+`AdaptiveRadiusPolicy`, `AdaptiveRadiusController`, a compact flat-array
+`CompactIsolationForest`, Poincare embedding/distance helpers, and prime-base
+Halton parameter trials. The engine remains responsible for exact lookup in
+the resulting variable-radius ball union; these utilities choose the radii.
 
 ---
 
 ## 16. Testing and verification
 
-The test suite is the primary specification of behavior. It runs as a single
-executable with one line per test, 69 tests across six suites at the time of
-writing: 18 for the interval engine, 18 for packing, 8 for the VP-tree
-backend, 7 for the tower, 5 for the box cache, and 13 for the CRDT.
+The C test suite is the primary specification of engine behavior. It runs as
+a single executable with one line per test, 75 tests across six suites at the
+time of writing: 18 for the interval engine, 21 for packing, 11 for the
+VP-tree backend, 7 for the tower, 5 for the box cache, and 13 for the CRDT.
+Five additional Python tests cover adaptive lookup, Poincare validation, the
+radius policy and safety margin, compact Isolation Forest memory/scoring, and
+prime-base Halton calibration.
 
 The verification strategy, recorded in `docs/verification.md`, is:
 
@@ -884,10 +909,11 @@ distribution.
 - **Exact multi-dimensional L_inf novelty, dimensions 1–8** — the box
   engine (`box.h`) is the intended tool, but see the one-sided caveat in
   section 9.2. Until the code or the docs are fixed, treat it as conservative.
-- **Arbitrary-dimension embeddings, approximate novelty, payload caching** —
-  use the packing engine (`pack.h`) with the cosine or L2 distance. This is
-  the semantic-cache workhorse and the engine behind the Python binding. It
-  supports both crash-recovery snapshots and an optional hard byte ceiling.
+- **Arbitrary-dimension embeddings, payload caching, adaptive resolution** —
+  use the packing engine (`pack.h`) with cosine, L2, or Poincare distance.
+  Lookup is exact for the stored balls; semantic equivalence depends on the
+  embedding and radius policy. This is the engine behind the Python binding,
+  with crash-recovery snapshots and an optional hard byte ceiling.
 - **One-dimensional coarse prefilter, prefix counts, discovery order** — use
   the tower (`tower.h`).
 - **Multiple replicas that must converge without coordination** — use the
@@ -918,8 +944,10 @@ The engines differ in per-operation cost.
 
 - Interval: O(log n) per observe and query (AVL), O(n) copy and validate,
   O(1) coverage. This is the fastest exact engine.
-- Pack: O(|R|) per observe and query with the linear scan; a backend index
-  can lower this. Copy is O(|R| * dimension); validate is O(|R|^2).
+- Pack: O(|R|) per observe and query with the linear scan; the exact VP-tree
+  can prune metric subtrees. Its nodes borrow the representative vectors, so
+  the index adds O(|R|) metadata rather than another O(|R| * dimension)
+  coordinate copy. Export is O(|R| * dimension); validate is O(|R|^2).
 - Box: O(box_count * dimension) per observe and query (a scan over stored
   boxes); memory is O(box_count * dimension).
 - Tower: O(levels) per observe and query; prefix count and select are
@@ -955,6 +983,10 @@ per workload, so the trade is visible rather than asserted.
   recovered portably and is intentionally rejected by the serializer.
 - The Python binding exposes only the packing engine; the interval, box,
   tower, and CRDT engines are C-only.
+- The included `poincare_embed` helper maps an externally supplied
+  specificity score to radius in the ball; it does not learn a hierarchy.
+  The research demo's local-density specificity is an unsupervised proxy, so
+  a learned hyperbolic encoder remains the important next experiment.
 - LeakSanitizer cannot run in the authoring environment (a ptrace limitation
   of the managed container); leak-freedom is instead established with
   counting allocators. Valgrind is not installed.
@@ -977,6 +1009,8 @@ per workload, so the trade is visible rather than asserted.
   identically.
 - **Representative** — a point the packing cache retained as a proxy for the
   observations near it.
+- **Acceptance radius** — the representative-owned radius that determines
+  membership in that representative's cache ball.
 - **One-sided** — an error profile that may over-report novelty but never
   under-reports it.
 - **Packing number** — the maximum number of pairwise epsilon-separated
