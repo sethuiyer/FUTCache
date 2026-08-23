@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
   FUTCache
-  VERSION 1.0.0
+  VERSION 1.1.0
   DESCRIPTION "Future-equivalence novelty caches"
   LANGUAGES C
 )
@@ -55,6 +55,8 @@ endfunction()
 add_library(futcache ${FUTCACHE_LIBRARY_TYPE}
   src/futcache.c
   src/tower.c
+  src/pack.c
+  src/box.c
 )
 add_library(FUTCache::futcache ALIAS futcache)
 
@@ -97,6 +99,8 @@ if(BUILD_TESTING)
     tests/test_main.c
     tests/test_futcache.c
     tests/test_tower.c
+    tests/test_pack.c
+    tests/test_box.c
   )
   target_link_libraries(futcache_tests PRIVATE FUTCache::futcache)
   target_compile_features(futcache_tests PRIVATE c_std_11)
@@ -112,6 +116,10 @@ if(FUTCACHE_BUILD_EXAMPLES)
   add_executable(futcache_scaling_example examples/reciprocal_scaling.c)
   target_link_libraries(futcache_scaling_example PRIVATE FUTCache::futcache)
   futcache_enable_warnings(futcache_scaling_example)
+
+  add_executable(futcache_rag_embedding_example examples/rag_embedding.c)
+  target_link_libraries(futcache_rag_embedding_example PRIVATE FUTCache::futcache m)
+  futcache_enable_warnings(futcache_rag_embedding_example)
 endif()
 
 if(FUTCACHE_BUILD_BENCHMARKS)
@@ -124,6 +132,16 @@ if(FUTCACHE_BUILD_BENCHMARKS)
   target_link_libraries(futcache_cache_comparison PRIVATE FUTCache::futcache m)
   target_compile_features(futcache_cache_comparison PRIVATE c_std_11)
   futcache_enable_warnings(futcache_cache_comparison)
+
+  add_executable(futcache_nd_dedup bench/nd_dedup.c)
+  target_link_libraries(futcache_nd_dedup PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_nd_dedup PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_nd_dedup)
+
+  add_executable(futcache_bekko_semantic_cache bench/bekko_semantic_cache.c)
+  target_link_libraries(futcache_bekko_semantic_cache PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_bekko_semantic_cache PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_bekko_semantic_cache)
 endif()
 
 install(TARGETS futcache

@@ -28,10 +28,11 @@ operations; destruction requires external quiescence.
 
 | Configuration | Result | Warnings/findings |
 |---|---|---|
-| GCC Debug, static, strongest project warnings, `-Werror` | 25 tests pass | none |
-| GCC Release, shared, strongest project warnings, `-Werror` | 25 tests pass | none |
-| GCC ASan + UBSan, Debug | 25 tests pass | none; leak detector disabled as noted below |
-| GCC TSan, Debug, non-PIE plus ASLR-disabled environment workaround | 25 tests pass | no races or lock findings |
+| GCC Debug, static, strongest project warnings, `-Werror` | 40 tests pass | none |
+| GCC Release, shared, strongest project warnings, `-Werror` | 40 tests pass | none |
+| GCC ASan + UBSan, Debug | 40 tests pass | none; leak detector disabled as noted below |
+| GCC TSan, Debug, non-PIE plus ASLR-disabled environment workaround | 40 tests pass | no races or lock findings |
+| Release examples and benchmarks, `-Werror` | build and run | RAG, n-d packing, LRU comparison clean |
 | GCC `-fanalyzer` | library builds | no analyzer findings |
 | Installed shared package + external `find_package` consumer | builds and runs | none |
 | Clang | not run | compiler is not installed on this host |
@@ -68,6 +69,15 @@ This is a verification limitation, not an observed leak.
   novelty implication, adjacent projection, and composed projection match
   independent arrays and arithmetic. A focused two-level test checks the exact
   discovery-word identity `q_(1,0)(D_1(L)) = D_0(L)` element by element.
+- The packing cache has eleven tests covering configurable metrics, Voronoi
+  representative separation, query purity, allocator failure, concurrency,
+  and the pluggable nearest-neighbour backend lifecycle. Approximate backend
+  semantics are explicitly one-sided: over-estimation may report extra
+  novelty, but must not suppress a genuinely novel point.
+- The exact `L_inf` box cache has four tests covering bounded 2D/3D unions,
+  clipping, domain errors, query purity, clear semantics, and allocation
+  failure atomicity. Its append-only overlapping boxes are exact but not a
+  canonical minimal cell decomposition.
 - Concurrent observations, queries, serialization/restoration, tower reads,
   and tower writes remain valid under TSan.
 
@@ -113,6 +123,9 @@ No unresolved P0 or P1 defect was found.
   10,000 reverse-order duplicates under a global logarithmic height ceiling.
 - Tower differential stream: 4,000 observations across six levels, with every
   prefix, select, discovery, and projection result checked.
+- n-d packing benchmark: 5,000-point streams in dimensions 2, 4, 8, and 16,
+  across `L_inf`, `L1`, and `L2`, plus a 384-dimensional cosine embedding
+  demonstration over 256 clustered queries.
 
 Distributions include uniform dyadic values, duplicates, sorted/reverse-sorted
 exact states, redundant clusters, bridge merges, reciprocal traversal, domain
