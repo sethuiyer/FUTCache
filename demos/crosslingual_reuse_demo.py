@@ -93,6 +93,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--epsilon", type=float, default=0.0)
     ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--model", default=MODEL_NAME)
     args = ap.parse_args()
 
     n_en = sum(1 for _, l, _ in build_queries() if l == "en")
@@ -100,12 +101,12 @@ def main() -> None:
     print("=" * 72)
     print("FUTCache cross-lingual reuse test (real multilingual embeddings)")
     print("=" * 72)
-    print(f"  model: {MODEL_NAME} (384-d, L2-normalised)")
+    print(f"  model: {args.model} (384-d, L2-normalised)")
     print(f"  questions: {n_en + n_other} = {n_en} English + {n_other} "
           f"in other languages  (unique intents = {len(Q)})")
     print(f"  languages: {', '.join(LANGS)}")
     print("  loading model ...")
-    model = SentenceTransformer(MODEL_NAME)
+    model = SentenceTransformer(args.model)
     rows = build_queries()
 
     def show(r):
