@@ -151,3 +151,32 @@ python demos/answer_cache_demo.py --n 10000 --days-volume 100000
 Sample (10,000 queries, ε=0.2): ~82.8% cache-hit, cold `450 ms` vs hit
 `3.9 µs`, `$84.00 → $14.43` (**82.8% lower LLM spend**), ~5.8× faster
 wall-clock, and ~`$257k/yr` saved at 100k queries/day.
+
+## Paraphrase reuse (real-text semantic-reuse test)
+
+`demos/paraphrase_reuse_demo.py` is the honest, human-judgeable version: a
+**45-sentence support corpus** and **10 questions, each with alternate ways
+to ask the same thing**, embedded with a real model
+(`hotchpotch/bekko-embedding-v1-a8m`, 384-d). It measures the two numbers
+that matter and their trade-off as you push `epsilon`:
+
+- **reuse_rate** — P(reuse) = hits / queries
+- **reuse_precision** — P(reuse is the SAME intent | cache says HIT)
+
+It finds the exact frontier between "merging paraphrases" and "merging
+different intents": at ε = 0.45–0.50 you get ~37–40% reuse at **100%
+precision** (every reuse is a true paraphrase, zero cross-intent errors);
+push ε higher and precision collapses (ε=0.70 → 77% reuse but only 52%
+precision, 11 cross-intent merges).
+
+```bash
+pip install sentence-transformers numpy
+python demos/paraphrase_reuse_demo.py --sweep      # the ε frontier
+python demos/paraphrase_reuse_demo.py --epsilon 0.45
+```
+
+The 45-sentence corpus de-duplicates only ~1.1× (they are distinct facts,
+not paraphrases), which is the honest expectation. The result is exactly the
+README's "cacheability" caveat made concrete: a real model has a real but
+*narrow* margin between paraphrase and cross-intent distance, so the safe
+operating point is the ε with 100% precision, not the ε with the most reuse.
