@@ -535,18 +535,28 @@ else:
 
 The wrapper exposes:
 
-- `PackCache(dimension, epsilon, distance, domain_min, domain_max, backend, max_memory_bytes)`
+- `PackCache(dimension, epsilon, distance, domain_min, domain_max, backend, max_memory_bytes, max_entries, ttl)`
 - `cache.observe(point, payload=None, radius=None) -> NoveltyResult`
+- `cache.get_or_compute(point, compute, radius=None) -> (bytes, NoveltyResult)`
 - `cache.query(point) -> NoveltyResult`
 - `cache.get_payload(representative_id) -> bytes | None`
 - `cache.set_payload(representative_id, payload)`
 - `cache.copy_representatives() -> numpy.ndarray` of shape `(N, dimension)`
 - `cache.copy_radii() -> numpy.ndarray` of shape `(N,)`
 - `cache.clear()`
-- `len(cache)`, `cache.peak_count()`, `cache.memory_bytes()`,
+- `len(cache)`, `cache.payload_count()`, `cache.purge()`,
+  `cache.peak_count()`, `cache.memory_bytes()`,
   `cache.peak_memory_bytes()`, `cache.memory_limit_bytes()`,
   `cache.evictions()`, `cache.observations()`, `cache.novel_observations()`
-- `PackCache.version() -> "1.3.0"`
+- `PackCache.version() -> "1.4.0"`
+
+`max_entries` (LRU payload capacity; `0` = unlimited) and `ttl` (payload
+expiry in seconds; `0.0` = never expiry) turn `PackCache` into a drop-in
+semantic **answer cache**. `get_or_compute` serves the cached payload on a
+semantic hit and calls `compute(point)` only when the query is novel or the
+payload was evicted/expired — the primitive that lets you skip an LLM,
+retrieval, or other expensive call on a semantically-redundant query.
+Payload timestamps shift correctly with the C FIFO pressure eviction.
 
 Supported distance names: `"linf"` (default), `"l1"`, `"l2"`, `"cosine"`,
 and `"poincare"`.

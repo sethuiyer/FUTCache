@@ -10,6 +10,7 @@ classes so callers do not need to know the split.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .adaptive import (
@@ -117,9 +118,16 @@ class PackCache:
                  domain_min=None,
                  domain_max=None,
                  backend: str = "linear",
-                 max_memory_bytes: int = 0) -> None:
+                 max_memory_bytes: int = 0,
+                 max_entries: int = 0,
+                 ttl: float = 0.0) -> None:
         if not isinstance(max_memory_bytes, int) or max_memory_bytes < 0:
             raise ValueError("max_memory_bytes must be a non-negative integer")
+        if not isinstance(max_entries, int) or max_entries < 0:
+            raise ValueError("max_entries must be a non-negative integer")
+        ttl = 0.0 if ttl is None else float(ttl)
+        if not math.isfinite(ttl) or ttl < 0.0:
+            raise ValueError("ttl must be a finite non-negative number of seconds")
         lo, hi = _broadcast_domain(dimension, domain_min, domain_max)
         self._dimension = dimension
         self._impl = _PackCacheRaw(
@@ -130,6 +138,8 @@ class PackCache:
             domain_max=hi,
             backend=backend,
             max_memory_bytes=max_memory_bytes,
+            max_entries=max_entries,
+            ttl=ttl,
         )
 
     def query(self, point) -> NoveltyResult:
@@ -167,6 +177,45 @@ class PackCache:
             return _wrap(raw)
         except IndexError as e:
             raise ValueError(str(e)) from None
+
+    def get_or_compute(self, point, compute, *, radius=None):
+        """Drop-in semantic answer cache.
+
+        Returns ``(answer, res)`` where ``answer`` is a non-None payload
+        (bytes). If the query is novel, or its cached payload was evicted
+        (LRU) or expired (TTL), ``compute(point)`` is called and its result
+        stored for that representative; otherwise the cached payload is
+        returned without calling ``compute``. This is the primitive that
+        lets you skip an LLM/expensive call on a semantically-redundant
+        query.
+
+        ``compute`` must return ``bytes``, ``bytearray``, or ``str`` (str is
+        UTF-8 encoded). ``res`` is a ``NoveltyResult``; note that a cache
+        *miss through expiry* still reports ``is_novel=False`` because the
+        geometry is redundant even though the answer is recomputed.
+        """
+        res = self.observe(point, payload=None, radius=radius)
+        slot = res.representative_id
+        if slot < 0:
+            raise RuntimeError("observe returned no representative slot")
+        answer = self.get_payload(slot)
+        if answer is None:
+            value = compute(point)
+            if value is None:
+                raise ValueError("compute() returned None")
+            if isinstance(value, str):
+                value = value.encode()
+            answer = bytes(value)
+            self.set_payload(slot, answer)
+        return answer, res
+
+    def payload_count(self) -> int:
+        """Number of payloads currently stored (excluding evicted/expired)."""
+        return self._impl.payload_count()
+
+    def purge(self) -> int:
+        """Drop all expired payloads; returns the number removed."""
+        return self._impl.purge()
 
     def get_payload(self, representative_id: int):
         """Return the stored payload for ``representative_id``, or None."""

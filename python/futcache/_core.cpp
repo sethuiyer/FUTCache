@@ -8,6 +8,7 @@
 // call concurrently; observe is atomic. The Python object holds a
 // reference to the C cache and releases it in __del__.
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -31,7 +32,7 @@ namespace nb = nanobind;
 namespace {
 
 constexpr int FUTCACHE_PY_VERSION_MAJOR = 1;
-constexpr int FUTCACHE_PY_VERSION_MINOR = 3;
+constexpr int FUTCACHE_PY_VERSION_MINOR = 4;
 constexpr int FUTCACHE_PY_VERSION_PATCH = 0;
 
 futcache_distance_fn resolve_distance(const std::string &name) {
@@ -72,18 +73,27 @@ public:
               nb::object domain_min,
               nb::object domain_max,
               std::string backend = "linear",
-              size_t max_memory_bytes = 0)
+              size_t max_memory_bytes = 0,
+              size_t max_entries = 0,
+              double ttl_seconds = 0.0)
         : dimension_(static_cast<size_t>(dimension)),
           epsilon_(epsilon),
           poincare_(distance == "poincare" || distance == "poincare_ball" ||
                     distance == "hyperbolic"),
           payload_mutex_(),
-          payloads_() {
+          payloads_(),
+          access_time_(),
+          insert_time_(),
+          max_entries_(max_entries),
+          ttl_seconds_(ttl_seconds) {
         if (dimension <= 0) {
             throw std::invalid_argument("dimension must be >= 1");
         }
         if (!std::isfinite(epsilon) || epsilon < 0.0) {
             throw std::invalid_argument("epsilon must be a finite non-negative double");
+        }
+        if (!std::isfinite(ttl_seconds) || ttl_seconds < 0.0) {
+            throw std::invalid_argument("ttl must be a finite non-negative seconds");
         }
 
         std::vector<double> lo(dimension, -1.0);
@@ -252,15 +262,7 @@ public:
                     "internal: unexpected representative count after novel observe");
             }
             if (evicted) {
-                std::unordered_map<size_t, std::string> shifted;
-                shifted.reserve(payloads_.size());
-                for (auto &entry : payloads_) {
-                    if (entry.first > 0 && entry.first < before_count) {
-                        shifted.emplace(entry.first - 1U,
-                                        std::move(entry.second));
-                    }
-                }
-                payloads_.swap(shifted);
+                shift_payloads_locked(before_count);
             }
             size_t rep_id = matched_index;
             if (rep_id != after_count - 1U) {
@@ -270,9 +272,15 @@ public:
             r.representative_id = static_cast<int>(rep_id);
             if (has_payload) {
                 payloads_[rep_id] = std::move(payload_value);
+                touch_locked(rep_id);
+                evict_lru_locked();
             }
         } else {
             r.representative_id = static_cast<int>(matched_index);
+            /* A geometric hit counts as an access: refresh LRU recency. */
+            if (payloads_.find(matched_index) != payloads_.end()) {
+                access_time_[matched_index] = now_secs();
+            }
         }
 
         return r;
@@ -287,6 +295,14 @@ public:
         if (it == payloads_.end()) {
             return nb::none();
         }
+        if (payload_expired_locked(static_cast<size_t>(rep_id))) {
+            /* Lazy expiry: drop the stale entry, treat as a miss. */
+            access_time_.erase(static_cast<size_t>(rep_id));
+            insert_time_.erase(static_cast<size_t>(rep_id));
+            payloads_.erase(it);
+            return nb::none();
+        }
+        access_time_[static_cast<size_t>(rep_id)] = now_secs();
         return nb::bytes(it->second.data(), it->second.size());
     }
 
@@ -296,13 +312,18 @@ public:
         }
         if (payload.is_none()) {
             std::lock_guard<std::mutex> lock(payload_mutex_);
-            payloads_.erase(static_cast<size_t>(rep_id));
+            size_t slot = static_cast<size_t>(rep_id);
+            payloads_.erase(slot);
+            access_time_.erase(slot);
+            insert_time_.erase(slot);
             return;
         }
         nb::bytes b = nb::cast<nb::bytes>(payload);
         std::lock_guard<std::mutex> lock(payload_mutex_);
-        payloads_[static_cast<size_t>(rep_id)] =
-            std::string(b.c_str(), b.size());
+        size_t slot = static_cast<size_t>(rep_id);
+        payloads_[slot] = std::string(b.c_str(), b.size());
+        touch_locked(slot);
+        evict_lru_locked();
     }
 
     size_t __len__() const {
@@ -410,7 +431,22 @@ public:
             throw std::runtime_error("clear failed");
         }
         payloads_.clear();
+        access_time_.clear();
+        insert_time_.clear();
     }
+
+    size_t payload_count() {
+        std::lock_guard<std::mutex> lock(payload_mutex_);
+        return payloads_.size();
+    }
+
+    size_t purge() {
+        std::lock_guard<std::mutex> lock(payload_mutex_);
+        return purge_expired_locked();
+    }
+
+    double ttl_seconds() const { return ttl_seconds_; }
+    size_t max_entries() const { return max_entries_; }
 
     static int version_major() { return FUTCACHE_PY_VERSION_MAJOR; }
     static int version_minor() { return FUTCACHE_PY_VERSION_MINOR; }
@@ -465,9 +501,90 @@ private:
     /* Payloads are owned by Python (the C cache holds only novelty
      * state). Mutex guards the dict because observe() can be called
      * from multiple Python threads even though the C observe() itself
-     * is serialised. */
+     * is serialised. Access/insert times feed the optional LRU + TTL
+     * eviction policies. */
     std::mutex payload_mutex_;
     std::unordered_map<size_t, std::string> payloads_;
+    std::unordered_map<size_t, double> access_time_;
+    std::unordered_map<size_t, double> insert_time_;
+    size_t max_entries_;   /* 0 = unlimited payload entries            */
+    double ttl_seconds_;   /* 0.0 = no expiry                          */
+
+    static double now_secs() {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    bool payload_expired_locked(size_t slot) const {
+        if (ttl_seconds_ <= 0.0) return false;
+        auto it = insert_time_.find(slot);
+        if (it == insert_time_.end()) return true; /* stale: no known birth */
+        return now_secs() - it->second > ttl_seconds_;
+    }
+
+    /* Shift every payload/id/timestamp map down by one slot (drop slot 0)
+     * exactly as the C FIFO pressure eviction renumbers representatives. */
+    void shift_payloads_locked(size_t before_count) {
+        std::unordered_map<size_t, std::string> new_p;
+        std::unordered_map<size_t, double> new_a;
+        std::unordered_map<size_t, double> new_i;
+        new_p.reserve(payloads_.size());
+        for (auto &e : payloads_) {
+            if (e.first > 0 && e.first < before_count)
+                new_p.emplace(e.first - 1U, std::move(e.second));
+        }
+        for (auto &e : access_time_) {
+            if (e.first > 0 && e.first < before_count)
+                new_a.emplace(e.first - 1U, e.second);
+        }
+        for (auto &e : insert_time_) {
+            if (e.first > 0 && e.first < before_count)
+                new_i.emplace(e.first - 1U, e.second);
+        }
+        payloads_.swap(new_p);
+        access_time_.swap(new_a);
+        insert_time_.swap(new_i);
+    }
+
+    /* Enforce the LRU payload cap (0 = unlimited). Calls the size check
+     * after any growth; no-op otherwise. */
+    void evict_lru_locked() {
+        if (max_entries_ == 0 || payloads_.size() <= max_entries_) return;
+        while (payloads_.size() > max_entries_) {
+            size_t victim = SIZE_MAX;
+            double least = INFINITY;
+            for (auto &kv : payloads_) {
+                auto it = access_time_.find(kv.first);
+                double t = it != access_time_.end() ? it->second : 0.0;
+                if (t < least) { least = t; victim = kv.first; }
+            }
+            if (victim == SIZE_MAX) return;
+            payloads_.erase(victim);
+            access_time_.erase(victim);
+            insert_time_.erase(victim);
+        }
+    }
+
+    size_t purge_expired_locked() {
+        if (ttl_seconds_ <= 0.0) return 0;
+        size_t removed = 0;
+        for (auto it = payloads_.begin(); it != payloads_.end(); ) {
+            if (payload_expired_locked(it->first)) {
+                access_time_.erase(it->first);
+                insert_time_.erase(it->first);
+                it = payloads_.erase(it);
+                ++removed;
+            } else {
+                ++it;
+            }
+        }
+        return removed;
+    }
+
+    void touch_locked(size_t slot) {
+        access_time_[slot] = now_secs();
+        insert_time_[slot] = now_secs();
+    }
 };
 
 }  // namespace
@@ -487,14 +604,16 @@ NB_MODULE(futcache_ext, m) {
 
     nb::class_<PackCache>(m, "PackCache")
         .def(nb::init<int, double, std::string, nb::object, nb::object,
-                      std::string, size_t>(),
+                      std::string, size_t, size_t, double>(),
              nb::arg("dimension"),
              nb::arg("epsilon"),
              nb::arg("distance") = std::string("linf"),
              nb::arg("domain_min") = nb::none(),
              nb::arg("domain_max") = nb::none(),
              nb::arg("backend") = std::string("linear"),
-             nb::arg("max_memory_bytes") = 0U)
+             nb::arg("max_memory_bytes") = 0U,
+             nb::arg("max_entries") = 0U,
+             nb::arg("ttl") = 0.0)
         .def("query", &PackCache::query, nb::arg("point"))
         .def("observe", &PackCache::observe,
              nb::arg("point"),
@@ -507,6 +626,10 @@ NB_MODULE(futcache_ext, m) {
         .def("set_payload", &PackCache::set_payload,
              nb::arg("rep_id"),
              nb::arg("payload"))
+        .def("payload_count", &PackCache::payload_count)
+        .def("purge", &PackCache::purge)
+        .def("ttl_seconds", &PackCache::ttl_seconds)
+        .def("max_entries", &PackCache::max_entries)
         .def("__len__", &PackCache::__len__)
         .def("peak_count", &PackCache::peak_count)
         .def("memory_bytes", &PackCache::memory_bytes)

@@ -12,7 +12,21 @@ v1.3.0 were development milestones that were never tagged.
 
 ### Added
 
-- Nothing yet.
+- **Payload TTL + LRU answer-cache layer** (`PackCache`, v1.4.0):
+  - `PackCache(..., max_entries=N, ttl=seconds)` adds an LRU payload-cap and
+    a time-to-live expiry on the Python payload store. Expired payloads are
+    lazily dropped (and cleared by `purge()`); the LRU cap evicts the
+    least-recently-used payload when `max_entries` is exceeded.
+  - `get_or_compute(point, compute)` is the drop-in answer-cache primitive:
+    it serves the cached payload on a semantic hit, or calls `compute(point)`
+    and stores the result when the query is novel or the payload was
+    evicted/expired. This is what lets a deployment skip an LLM/expensive
+    call on a semantically-redundant query.
+  - New accessors `payload_count()` and `purge()` for cache-health metrics.
+  - Payload timestamps shift with the C FIFO pressure eviction, so LRU/TTL
+    stay correct under `max_memory_bytes`.
+  - Tests in `tests/test_answer_cache.py` (TTL expiry, lazy purge, LRU
+    capacity + recency, `get_or_compute` compute-once/recompute-after-expiry).
 
 ## [1.3.0] - 2026-08-24
 
