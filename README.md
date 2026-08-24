@@ -39,6 +39,39 @@ their telemetry differs.
 This is not an LRU key/value cache. It is an exact online novelty oracle:
 specify fidelity (`epsilon`), and the geometry determines memory use.
 
+## What FUTCache is
+
+A **metric-novelty oracle**. For any metric space you can represent as
+vectors (`double[d]`) with a genuine distance function, it answers exactly one
+question:
+
+> has the system seen anything within `epsilon` of this point?
+
+- **Narrow in computation.** Novelty only. It does not store arbitrary keys,
+  retrieve top-k matches, or cache objects by an exact ID. For those, use a
+  key/value cache (Redis, Memcached, LRU) — FUTCache is the wrong tool.
+- **Broad in domains.** Any space with a metric: string / edit distances (via
+  a vector encoding), sets / Jaccard (via an encoding), sensor and
+  time-series data, embeddings, hierarchical or hyperbolic data — whatever
+  you can represent as vectors and supply a distance for.
+- **The constraint.** The metric must be a genuine metric (symmetry +
+  triangle inequality) for the VP-tree's exact pruning and the `P(K, ε)`
+  packing bound to hold. Two cases to know:
+  - *Cosine* (`1 − dot`) is not a metric; the engine detects it and indexes
+    with a chordal (`L2` on the unit sphere) metric, which is exact for
+    normalized inputs, and falls back to an exact linear scan for
+    non-normalized ones.
+  - *Any other non-metric* similarity or custom distance makes the VP-tree
+    prune unsound, so use the **linear backend** (always correct, `O(n)`).
+    The engine doesn't auto-detect arbitrary non-metrics — that's the
+    caller's call.
+- **The production takeaway.** For "has the system seen anything within `ε`
+  of this point?" in a genuine metric space, FUTCache bundles four properties
+  most alternatives lack: a **hard memory ceiling**, **crash-safe
+  persistence**, a **provable one-sided guarantee** (never wrongly suppresses
+  novelty), and **exact, differentially-verified** novelty — all behind a
+  metric-agnostic API.
+
 ## Theoretical foundations
 
 FUTCache is a finite, computable realization of the **Novelty Geometry**
