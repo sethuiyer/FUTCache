@@ -87,5 +87,5 @@ jobs:
       - name: Install package and test deps
         run: pip install . pytest
 
-      - name: Adaptive calibration + answer-cache tests
-        run: pytest tests/test_adaptive.py tests/test_answer_cache.py -v
+      - name: Adaptive + answer-cache + epsilon-tree tests
+        run: pytest tests/test_adaptive.py tests/test_answer_cache.py tests/test_epsilon_tree.py -v

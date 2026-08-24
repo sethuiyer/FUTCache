@@ -22,6 +22,7 @@ from .adaptive import (
     poincare_distance,
     poincare_embed,
 )
+from .epsilon_tree import EpsilonTree
 from .futcache_ext import (
     NoveltyResult as _NoveltyResultRaw,
     PackCache as _PackCacheRaw,
@@ -344,6 +345,7 @@ __all__ = [
     "AdaptiveRadiusController",
     "AdaptiveRadiusPolicy",
     "CompactIsolationForest",
+    "EpsilonTree",
     "NoveltyResult",
     "PackCache",
     "halton_sequence",

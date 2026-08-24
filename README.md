@@ -543,6 +543,9 @@ The wrapper exposes:
 - `cache.set_payload(representative_id, payload)`
 - `cache.copy_representatives() -> numpy.ndarray` of shape `(N, dimension)`
 - `cache.copy_radii() -> numpy.ndarray` of shape `(N,)`
+- `EpsilonTree` — density-aware adaptive `epsilon` via a knee-method region
+  tree (`.fit(ref_points)`, `.epsilon(query)`), for use with
+  `observe_with_radius`
 - `cache.clear()`
 - `len(cache)`, `cache.payload_count()`, `cache.purge()`,
   `cache.peak_count()`, `cache.memory_bytes()`,

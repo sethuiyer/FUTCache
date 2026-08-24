@@ -203,3 +203,34 @@ python demos/crosslingual_reuse_demo.py --sweep
 Contrast with `paraphrase_reuse_demo.py` (English-only): there you get ~40%
 reuse at 100% precision; across languages you trade precision for breadth.
 Pick epsilon by the precision target, not by maximum reuse.
+
+## Adaptive epsilon via the knee method (`EpsilonTree`)
+
+`demos/epsilon_tree_demo.py` replaces the single global `epsilon` with an
+`EpsilonTree`: it splits the calibration embedding space into regions and
+sets each region's epsilon to the **knee** of its local k-NN distance curve
+(the DBSCAN-style threshold), then hands `observe_with_radius` that
+region-specific radius.
+
+```python
+from futcache import EpsilonTree, PackCache
+tree = EpsilonTree(k=3, min_leaf=6, max_depth=4, distance="cosine").fit(corpus)
+eps = tree.epsilon(query)
+cache = PackCache(384, 0.0, distance="cosine")   # adaptive radii
+res = cache.observe(query, radius=eps)
+```
+
+Two honest lessons it teaches on real embeddings:
+
+1. **Units matter.** The tree's distance metric MUST match the cache's
+   (cosine here). Calibrating with Euclidean distances and feeding the result
+   as a cosine radius silently merges everything (this was caught by testing
+   on real data).
+2. **The knee is an auto-initializer, not a final answer.** It finds a
+   sensible ε (~0.34, matching real paraphrase distances) but does NOT beat a
+   precision-tuned fixed ε on this data — and per-region refinement is noisy
+   on tiny (3–4 point) leaves. Refine with the precision/ε frontier.
+
+```bash
+python demos/epsilon_tree_demo.py
+```

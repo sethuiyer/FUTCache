@@ -28,6 +28,22 @@ v1.3.0 were development milestones that were never tagged.
   - Tests in `tests/test_answer_cache.py` (TTL expiry, lazy purge, LRU
     capacity + recency, `get_or_compute` compute-once/recompute-after-expiry).
 
+- **Density-aware adaptive epsilon via a knee-method region tree**
+  (`EpsilonTree`): replaces the single global `epsilon` with one that varies
+  by region. A binary space-partition tree is built over a calibration set,
+  and each leaf's `epsilon` is set to the **knee** of its local
+  k-th-nearest-neighbour distance curve (the DBSCAN-style threshold). A query
+  traverses to its leaf and the radius is passed to `observe_with_radius`.
+  Supports `l2`/`l1`/`linf`/`cosine` distances (the metric must match the
+  cache). Tests in `tests/test_epsilon_tree.py`; interactive demo in
+  `demos/epsilon_tree_demo.py`.
+  - Honest result on real data: the knee gives a sensible auto-ε (~0.34,
+    matching real paraphrase distances) but does NOT beat a precision-tuned
+    fixed ε — use it as an auto-initializer, then refine with the
+    precision/ε frontier. Per-region refinement needs larger clusters for a
+    stable knee. (Also surfaced a units bug: the tree must use the same
+    distance as the cache, not Euclidean when the cache uses cosine.)
+
 ## [1.3.0] - 2026-08-24
 
 First tagged release.
