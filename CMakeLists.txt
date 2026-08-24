@@ -267,6 +267,7 @@ install(FILES
   docs/serialization.md
   docs/pack-serialization.md
   docs/verification.md
+  docs/cookbook.md
   docs/nitrosat_optimization.md
   DESTINATION ${CMAKE_INSTALL_DOCDIR}
 )

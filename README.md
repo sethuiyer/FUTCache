@@ -641,6 +641,11 @@ The interval and packing formats are documented in
 The adversarial build, sanitizer, differential, concurrency, and scaling results
 are recorded in [docs/verification.md](docs/verification.md).
 
+For the three workloads where a novelty oracle is the right abstraction — RAG
+de-duplication, streaming anomaly detection, and RL intrinsic curiosity — see
+the [cookbook](docs/cookbook.md) for tested integration patterns (plus the
+traps to avoid) for every engine.
+
 ## Phase 2: distributed semantic cache
 
 The v1.x design covers the single-node cache. Phase 2 formalises a
