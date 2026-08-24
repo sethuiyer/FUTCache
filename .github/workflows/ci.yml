@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Release / Debug / sanitizer / shared matrix. LeakSanitizer runs on
+  # GitHub-hosted runners (ptrace is permitted), so ASan+UBSan includes
+  # detect_leaks=1; TSan also runs here, closing the local-host gap.
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Release (-Werror)
+            build_type: Release
+          - name: Debug (-Werror)
+            build_type: Debug
+          - name: ASan + UBSan + LSan
+            build_type: Debug
+            cmake_extra: -DFUTCACHE_ENABLE_SANITIZERS=ON
+            test_env: ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+          - name: TSan
+            build_type: Debug
+            cmake_extra: -DFUTCACHE_ENABLE_TSAN=ON
+            test_env: TSAN_OPTIONS=halt_on_error=1
+          - name: Shared Release (-Werror)
+            build_type: Release
+            cmake_extra: -DFUTCACHE_BUILD_SHARED=ON
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install numpy (nitrosat offline-optimizer tests)
+        run: sudo apt-get update && sudo apt-get install -y python3-numpy
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DFUTCACHE_WARNINGS_AS_ERRORS=ON
+          -DFUTCACHE_BUILD_BENCHMARKS=ON
+          -DFUTCACHE_BUILD_NITROSAT=ON
+          ${{ matrix.cmake_extra }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        env:
+          TEST_ENV: ${{ matrix.test_env }}
+        run: $TEST_ENV ctest --test-dir build --output-on-failure
+
+  # Python bindings: build the v1.3.0 wheel and run the adaptive tests.
+  python:
+    name: Python bindings (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package and test deps
+        run: pip install . pytest
+
+      - name: Adaptive calibration tests
+        run: pytest tests/test_adaptive.py -v
