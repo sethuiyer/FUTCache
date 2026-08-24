@@ -215,6 +215,77 @@ futcache_box_destroy(box);
   `max_memory_bytes` shifts slot ids — do not retain a slot id across a
   mutating call when the ceiling is non-zero.
 
+### 1d. Worked example: candidate / résumé de-duplication
+
+A concrete end-to-end pattern for a hiring funnel: OCR a résumé, encode each
+feature, admit only genuinely-novel candidates, and hand the reviewer the
+right subset. Each feature maps to the engine that actually answers *its*
+question, with the honest guarantee stated up front.
+
+**Pipeline**
+
+1. **OCR + parsing** — text + numeric metrics + counts from the document.
+2. **Feature encoding** — text → embedding; numbers → floats; counts → ints.
+3. **Novelty admission** — observe each feature in the matching engine.
+4. **Query & analytics** — nearest-representative lookup, bucket coverage.
+5. **Human-in-the-loop** — review what is genuinely outside coverage, or one
+   representative per dense cluster.
+
+**Feature → engine → what it actually answers**
+
+| Résumé feature | Engine | Answers | Honest guarantee |
+|---|---|---|---|
+| Full-profile embedding, `d=384`, unit norm | `PackCache` (cosine, vptree) | "Have I seen a profile within `ε` of this?" | **One-sided, not exact**: never suppresses novelty, but may report *extra* novelty at packing boundaries |
+| Skill vectors (one per skill, or a composite) | `PackCache` + `observe_with_radius` | "Is this composite skill vector outside every stored adaptive ball?" | Radius policy is yours to define |
+| CGPA / contest rating / JEE rank | C `futcache` **interval-union** cache | "Have I seen a value within `ε` of this?" | **Exact** canonical union (1-D only) |
+| Publication count / stars / followers | C `futcache_tower` | "Which buckets are covered? how much of the range is populated?" | **Coverage**, not a frequency histogram |
+
+```python
+import numpy as np
+from futcache import PackCache
+
+def embed(text):                       # your model; returns unit-norm vector
+    v = model.encode(text)
+    return v / np.linalg.norm(v)
+
+profiles = PackCache(384, epsilon=0.15, distance="cosine",
+                     domain_min=-1.0, domain_max=1.0, backend="vptree",
+                     max_memory_bytes=128 << 20)
+
+for resume in ingest_resumes():
+    profile = embed(resume.body_text)
+    res = profiles.observe(profile, payload=resume.id.encode())
+    if res.is_novel:
+        flag_for_review(resume.id, "novel")
+    else:
+        # within epsilon of an existing profile: that profile's slot
+        note_similar(resume.id, res.representative_id)   # id shifts on eviction
+```
+
+**Corrected claims (read this before you quote the numbers)**
+
+- **Exact only in 1-D (and the box cache).** A high-dimensional packing cache is
+  representative-*approximate*: a point on the Voronoi boundary between two
+  representatives can be flagged novel even though it is within `ε` of a point
+  that was *not* retained as a representative. It never produces a false hit,
+  but it can over-report novelty. Say "one-sided," not "exact."
+- **`query`/`lookup` is not similarity search.** It returns the nearest
+  representative *whose ball contains the point*. `nearest` returns the nearest
+  representative distance. Use a real vector index for ranked retrieval.
+- **The tower is coverage, not cluster size.** It reports which cells are
+  occupied and how much of the range is covered; it does **not** count how
+  many candidates fall in each bucket.
+- **Adaptive radius direction.** The shipped `AdaptiveRadiusPolicy` *contracts*
+  the radius for rare / poorly-supported regions
+  (`exp(-lambda * isolation_score)`), the opposite of "widen for rare." You can
+  implement rare→wide yourself by supplying your own radius to
+  `observe_with_radius`.
+- **Representative ids are unstable.** When `max_memory_bytes` is set, FIFO
+  eviction shifts slot ids. Store the embedding (or re-lookup), not the id.
+- **Latency.** VP-tree `query` is tens of microseconds into the low thousands
+  of representatives at moderate dimension and grows with count; it is not a
+  flat "< 50 µs" for all sizes.
+
 ---
 
 ## Part 2 — Anomaly detection
