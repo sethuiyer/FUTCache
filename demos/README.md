@@ -180,3 +180,26 @@ not paraphrases), which is the honest expectation. The result is exactly the
 README's "cacheability" caveat made concrete: a real model has a real but
 *narrow* margin between paraphrase and cross-intent distance, so the safe
 operating point is the ε with 100% precision, not the ε with the most reuse.
+
+## Cross-lingual reuse (45 questions, 13 unique, rest other languages)
+
+`demos/crosslingual_reuse_demo.py` is the multilingual version: 13 unique
+questions (English) + 32 re-asks of the same questions in Spanish, French,
+German, Japanese, Chinese, Hindi, and Portuguese, embedded with the same real
+model. It measures reuse_rate / reuse_precision across the epsilon frontier.
+
+The honest finding vs the monolingual case: **cross-lingual reuse works but
+never hits 100% precision** — the model's margin between "same question in
+another language" and "a genuinely different question" is tighter and
+overlapping. The sweet spot is ~0.45–0.50 (≈55–64% reuse at ≈79–80%
+precision; e.g. a French "facture" for *invoice* lands closer to a
+nearby-intent rep than to its own English version at some epsilons). Push to
+0.72 and precision collapses to 25% with 29 cross-intent merges.
+
+```bash
+python demos/crosslingual_reuse_demo.py --sweep
+```
+
+Contrast with `paraphrase_reuse_demo.py` (English-only): there you get ~40%
+reuse at 100% precision; across languages you trade precision for breadth.
+Pick epsilon by the precision target, not by maximum reuse.
