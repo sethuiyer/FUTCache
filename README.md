@@ -558,6 +558,10 @@ payload was evicted/expired — the primitive that lets you skip an LLM,
 retrieval, or other expensive call on a semantically-redundant query.
 Payload timestamps shift correctly with the C FIFO pressure eviction.
 
+See [`demos/answer_cache_demo.py`](demos/answer_cache_demo.py) for a runnable
+ROI + latency one-pager (measured cold-vs-hit latency, cost ledger, and
+net spend reduction over a synthetic customer-support workload).
+
 Supported distance names: `"linf"` (default), `"l1"`, `"l2"`, `"cosine"`,
 and `"poincare"`.
 

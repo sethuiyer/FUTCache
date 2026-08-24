@@ -127,3 +127,27 @@ VP-tree decision is exact for the supplied embedding and radius; semantic
 precision is determined by the embedding model and calibration. A radius that
 is too small causes missed reuse, while one that is too large can merge
 different intents—hence the measured frontier rather than a guessed cutoff.
+
+## ROI + latency demo (answer cache)
+
+`demos/answer_cache_demo.py` is the quick financial one-pager. It runs a
+synthetic customer-support/search workload through `PackCache.get_or_compute`
+and prints the business numbers with **measured** latencies (not asserted):
+
+- real cold LLM call vs cache-hit latency (µs → ~100,000× speedup)
+- cost ledger: input+output tokens at a stated price, cost without vs with
+  `PackCache`, net reduction %
+- simulated wall-clock (naive vs cached) and compute calls avoided
+- optional annualized savings at a stated daily volume
+
+The hit rate is **produced by the geometry** (clustered intents + novel tail),
+not hard-coded, so it degrades honestly if you reduce `epsilon` or raise the
+novel fraction:
+
+```bash
+python demos/answer_cache_demo.py --n 10000 --days-volume 100000
+```
+
+Sample (10,000 queries, ε=0.2): ~82.8% cache-hit, cold `450 ms` vs hit
+`3.9 µs`, `$84.00 → $14.43` (**82.8% lower LLM spend**), ~5.8× faster
+wall-clock, and ~`$257k/yr` saved at 100k queries/day.
