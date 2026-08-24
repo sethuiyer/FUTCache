@@ -296,7 +296,7 @@ static bool test_vptree_metric_differential(void)
     static const futcache_distance_fn distances[] = {
         futcache_distance_l1, futcache_distance_l2, futcache_distance_linf};
     const double eps_grid[] = {0.01, 0.05, 0.1, 0.2, 0.5};
-    vp_domain_t domain;
+    vp_domain_t domain = {NULL, NULL};
 
     for (size_t di = 0U; di < sizeof(dims) / sizeof(dims[0]); ++di) {
         size_t dim = dims[di];
@@ -314,6 +314,7 @@ static bool test_vptree_metric_differential(void)
             }
 
             futcache_pack_config_t config_l, config_v;
+            vp_free_domain(domain);
             domain = vp_make_domain(dim, 0.0, 1.0);
             TEST_ASSERT(domain.lo != NULL && domain.hi != NULL);
             vp_config_init(&config_l, dim, 0.05, distance, NULL, false);

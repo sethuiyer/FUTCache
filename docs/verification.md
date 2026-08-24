@@ -233,3 +233,61 @@ no Clang/AFL coverage-guided fuzz run and no usable LeakSanitizer/Valgrind run o
 this host. Custom allocator accounting covers the library's material ownership
 failure paths, but those external tools should still be added to CI on a host
 that supports them.
+
+## K. v1.3.0 re-verification addendum
+
+Re-verified 2026-08-23 (same host, GCC 13.3.0) after the adaptive-calibration
+commit (pack engine, VP-tree, Python bindings). All findings below are either
+improvements or confirmations; no library defect was found.
+
+- **LeakSanitizer now runs on this host.** The earlier "LSan cannot run in this
+  managed container" note is outdated: `ASAN_OPTIONS=detect_leaks=1` completes.
+  The first LSan pass exposed a **test-harness leak**: 28 allocations (16,608
+  bytes) in `test_vptree_metric_differential` (`tests/test_pack_vptree.c`), whose
+  15-iteration loop re-assigned `domain` without freeing the previous one.
+  Fixed by freeing before re-assignment (3-line change). With
+  `detect_leaks=1:halt_on_error=1` the full suite now exits 0 with zero leaks
+  across all suites, so the previous LSan/Valgrind gap is closed.
+- **New adversarial stress suite** (`tests/test_pack_stress.c`, 4 tests,
+  suite total 75 -> 79):
+  1. adaptive-radius VP-tree vs linear differential across L1/L2/L_inf/cosine/
+     poincare at dims 1/3/16/64 with zero, near-zero, huge, and random radii,
+     checking every observe decision, final reps/radii (bit-exact), lookup
+     found/distance/index, and nearest distance/index, plus an independent
+     linear-scan oracle. Non-cosine metrics compare bit-exactly; cosine
+     distances use the backend's documented 1e-6 transform tolerance and any
+     decision disagreement must sit inside that band of the union boundary.
+  2. byte-ceiling eviction with variable radii: per-cache telemetry identity
+     (count + evictions == novel), live/peak memory ceiling, validate(), and
+     every query vs that cache's own surviving-rep oracle, for both backends.
+     The vptree cache may retain fewer reps (and evict more often) at the same
+     ceiling because index metadata shares the budget — expected, not a bug.
+  3. adaptive serialize roundtrip with ceiling + evictions + VP-tree: restored
+     cache is byte-identical in reps/radii, telemetry-identical, and agrees on
+     a continuation stream; corrupted snapshots are still rejected.
+  4. concurrent writers/readers on a variable-radius VP-tree cache: 4 writers
+     (observe_with_radius) + 2 readers (lookup/nearest/serialize with the
+     documented size-query retry on BUFFER_TOO_SMALL); validate() and
+     telemetry identities hold after joining. Stable across repeated runs in
+     Release and ASan.
+- **TSan** still cannot run on this host (shadow-mapping abort before `main`;
+  unchanged). The TSan binary builds; concurrency is otherwise exercised by
+  the new concurrent stress test under ASan and by the existing deterministic
+  stress tests in Debug/Release.
+- **GCC `-fanalyzer`** re-run over all six translation units (gnu11, matching
+  the CMake flags): no findings. The earlier box.c "error" was an artifact of
+  compiling with strict `-std=c11` (pthread_rwlock_t is hidden without
+  `_DEFAULT_SOURCE`); the real build uses gnu11.
+- Build matrix re-confirmed: Release `-Werror`, Debug `-Werror`, ASan+UBSan,
+  shared-library Release `-Werror` (new), Python wheel v1.3.0 in a clean venv,
+  installed-package consumer, all five examples, and the nitrosat offline
+  optimizer test — all green. The Release backend benchmark reproduces the
+  documented 384-d manifold-cosine numbers (8.9x observe / 17.5x query at
+  2,000 representatives, 6.19 MiB live).
+- Python: 5 adaptive unit tests pass; an additional binding smoke test covers
+  all backends x metrics differential agreement, cosine normalization,
+  adaptive-radius payload/slot identity, calibrated ceiling eviction with
+  payload shifting, Poincare rejection, clear/telemetry, and version 1.3.0.
+
+Verdict remains **RELEASE READY**; the only remaining environmental gap is
+Clang/AFL coverage-guided fuzzing.

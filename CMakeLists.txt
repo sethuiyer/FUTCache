@@ -105,6 +105,7 @@ if(BUILD_TESTING)
     tests/test_tower.c
     tests/test_pack.c
     tests/test_pack_vptree.c
+    tests/test_pack_stress.c
     tests/test_box.c
     tests/test_crdt.c
   )

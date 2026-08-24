@@ -55,6 +55,7 @@ int futcache_test_suite(void);
 int tower_test_suite(void);
 int pack_test_suite(void);
 int pack_vptree_test_suite(void);
+int pack_stress_test_suite(void);
 int box_test_suite(void);
 int crdt_test_suite(void);
 
