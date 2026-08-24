@@ -234,3 +234,29 @@ Two honest lessons it teaches on real embeddings:
 ```bash
 python demos/epsilon_tree_demo.py
 ```
+
+## Hyperbolic "zoom lens" — does it fix intent bleeding? (empirical)
+
+`demos/hyperbolic_zoom_demo.py` tests the claim that mapping a cluster into
+the Poincare ball (via an exponential map around its medoid) widens the
+cross-intent margin and stops intent bleeding. Uses the real bekko
+embeddings, the library's `distance="poincare"`, and measures the margin
+(min-cross-intent − max-within-intent) plus reuse/precision for flat cosine
+vs hyperbolic zoom.
+
+Result (honest, on real data): **the hyperbolic zoom does NOT beat flat
+cosine.** Both have a *negative* global margin (no single ε cleanly separates
+intents), and hyperbolic made it *worse* (−0.76 vs −0.19). At the 100%-precision
+operating point both give ~37–40% reuse (flat ε=0.45: 40%/100%;
+hyperbolic ε_H=2.0: 37%/100%), and both collapse when you push ε.
+
+Why the theory doesn't transfer: (a) cancel vs refund are *siblings*, not
+parent-child — hyperbolic space only gives exponential separation to genuine
+tree/hierarchy structure; (b) a per-point coordinate change (even a nonlinear
+zoom) that's an approximately monotone reweighting of distance can't create
+separation that isn't already in the embedding; (c) you'd need a *trained*
+hyperbolic embedding, not a map of a flat one.
+
+```bash
+python demos/hyperbolic_zoom_demo.py
+```
