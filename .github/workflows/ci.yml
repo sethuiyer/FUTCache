@@ -22,19 +22,32 @@ jobs:
         include:
           - name: Release (-Werror)
             build_type: Release
+            asan_options: ""
+            ubsan_options: ""
+            tsan_options: ""
           - name: Debug (-Werror)
             build_type: Debug
+            asan_options: ""
+            ubsan_options: ""
+            tsan_options: ""
           - name: ASan + UBSan + LSan
             build_type: Debug
             cmake_extra: -DFUTCACHE_ENABLE_SANITIZERS=ON
-            test_env: ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+            asan_options: detect_leaks=1:halt_on_error=1
+            ubsan_options: halt_on_error=1:print_stacktrace=1
+            tsan_options: ""
           - name: TSan
             build_type: Debug
             cmake_extra: -DFUTCACHE_ENABLE_TSAN=ON
-            test_env: TSAN_OPTIONS=halt_on_error=1
+            asan_options: ""
+            ubsan_options: ""
+            tsan_options: halt_on_error=1
           - name: Shared Release (-Werror)
             build_type: Release
             cmake_extra: -DFUTCACHE_BUILD_SHARED=ON
+            asan_options: ""
+            ubsan_options: ""
+            tsan_options: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -55,8 +68,10 @@ jobs:
 
       - name: Test
         env:
-          TEST_ENV: ${{ matrix.test_env }}
-        run: $TEST_ENV ctest --test-dir build --output-on-failure
+          ASAN_OPTIONS: ${{ matrix.asan_options }}
+          UBSAN_OPTIONS: ${{ matrix.ubsan_options }}
+          TSAN_OPTIONS: ${{ matrix.tsan_options }}
+        run: ctest --test-dir build --output-on-failure
 
   # Python bindings: build the v1.3.0 wheel and run the adaptive tests.
   python:
