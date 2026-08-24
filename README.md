@@ -669,6 +669,12 @@ de-duplication, streaming anomaly detection, and RL intrinsic curiosity — see
 the [cookbook](docs/cookbook.md) for tested integration patterns (plus the
 traps to avoid) for every engine.
 
+To choose an engine and tune `epsilon` from **measured** results (not
+assertions), see the [playbook](docs/playbook.md): it ranks the engines by
+exactness, walks the reuse-rate/precision frontier, and records what actually
+happened for monolingual, cross-lingual, knee-method-adaptive, and hyperbolic
+approaches.
+
 ## Phase 2: distributed semantic cache
 
 The v1.x design covers the single-node cache. Phase 2 formalises a
