@@ -54,6 +54,34 @@ trades recall for mergeability across nodes.
 
 ---
 
+## Use-case map
+
+Not every "cache" idea maps onto FUTCache. The table below marks each common
+idea with the honest caveat and points to the recipe that implements it.
+
+| Idea | Engine | Recipe | Watch out for |
+|---|------|--------|---------------|
+| RAG query de-dup (skip re-generation) | `pack` + cosine | §1a | No TTL/LRU payload eviction; `ε` is global |
+| Semantic answer cache | `PackCache` (+ your payload store) | §1a | Serves the *nearest* rep's payload, not the best answer; insertion-order dependent |
+| Multilingual FAQ de-dup | `pack` + cosine | §1a | Compression ratio is empirical (negative margin ⇒ order-dependent), not guaranteed |
+| RAG retrieval reuse | `pack` + cosine | §1a | The cache finds novelty, it does not retrieve; keep your own passage cache |
+| Sensor-fusion novelty filter | `pack` or `interval` | §2a | Pick `ε` to match your "new region" scale |
+| Time-series anomaly detection | `interval` (1-D) / `pack` (multi-D) | §2a, §2b | Drift vs novelty; `O(log n)` novelty only |
+| Coverage / "seen this domain?" monitoring | `interval` | §2b | `fully_covered` only meaningful on a bounded domain |
+| RL intrinsic-curiosity reward | `pack` or `interval` | §3a, §3b | Novelty ≠ progress; cap memory, anneal `ε` |
+| Distributed novelty across agents | `crdt` | §3c | Lower recall (fixed anchor set), safe to gossip |
+| Offline embedding de-dup / compression | `pack` + NitroSAT | [README offline opt.](README.md#offline-representative-optimization) | "Coverage" is empirical/verified, not a certificate |
+| Embedding-quality diagnostics | any engine + `cacheability.py` | [README cacheability](README.md#cacheability-futcache-as-a-measuring-instrument) | Margin / `D_cache` say whether the model is cacheable at all |
+
+Two ideas from common lists do **not** belong here:
+
+- **"Embed-aware API rate limiting"** — rate limiting needs per-client
+  counters and similarity thresholds, not a novelty oracle. It answers *"is
+  this a new region?"*, not *"how similar are these two requests?"*.
+- **"Opaque-ID key/value cache"** — the keys have no distance. Use LRU.
+
+---
+
 ## Part 1 — RAG query de-duplication
 
 The goal: skip re-answering a query that is semantically near one you already
