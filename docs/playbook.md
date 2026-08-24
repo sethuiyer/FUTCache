@@ -167,6 +167,7 @@ ordering that isn't already in the flat embedding; a real gain needs a
 | Invariants + latency | `build-test-release/futcache_hiring_demo` (ctest `hiring_ingestion_demo`) |
 | Corpus-dedup cost | `build-test-release/futcache_corpus_dedup` |
 | Security-novelty (SOC log) | `build-test-release/futcache_soc_demo` (ctest `soc_novelty_demo`) |
+| Real-data IDS validation | `python demos/kdd_novelty_check.py` (downloads KDD Cup '99) |
 
 The first five need `pip install sentence-transformers numpy` (they pull the
 model); the last two are C (`FUTCACHE_BUILD_BENCHMARKS` / examples).
