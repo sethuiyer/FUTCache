@@ -214,8 +214,11 @@ static void section_latency(void)
     double eps = 0.02;
 
     /* clustered: points on a 4-dim subspace of R^64 -> low intrinsic dim.
-     * All coords stay inside [0,1] so observations are in-domain. */
-    size_t nc = 20000;
+     * All coords stay inside [0,1] so observations are in-domain.
+     * Sizes are kept small enough that the exact-packing sweep completes
+     * quickly under ASan/UBSan in CI (the demo is a benchmark, not a
+     * correctness test -- the invariants are asserted separately). */
+    size_t nc = 5000;
     double *clustered = (double *)malloc((nc + m) * dim * sizeof(double));
     for (size_t i = 0; i < nc + m; ++i) {
         for (size_t d = 0; d < dim; ++d) clustered[i * dim + d] = 0.5;
@@ -224,14 +227,14 @@ static void section_latency(void)
     }
 
     /* uniform: all coords independent -> high intrinsic dim */
-    size_t nu = 5000;
+    size_t nu = 2000;
     double *uniform = (double *)malloc((nu + m) * dim * sizeof(double));
     for (size_t i = 0; i < nu + m; ++i)
         for (size_t d = 0; d < dim; ++d) uniform[i * dim + d] = rng_unit();
 
     NOTE("clustered (low intrinsic dim):");
     {
-        size_t cluster_ns[] = {1000, 5000, 20000};
+        size_t cluster_ns[] = {500, 2000, 5000};
         for (size_t k = 0; k < 3; ++k) {
             size_t n = cluster_ns[k];
             measure_nearest(futcache_distance_l2, &futcache_pack_vptree_backend,
@@ -242,7 +245,7 @@ static void section_latency(void)
     }
     NOTE("uniform (high intrinsic dim):");
     {
-        size_t uniform_ns[] = {1000, 5000};
+        size_t uniform_ns[] = {500, 2000};
         for (size_t k = 0; k < 2; ++k) {
             size_t n = uniform_ns[k];
             measure_nearest(futcache_distance_l2, &futcache_pack_vptree_backend,
