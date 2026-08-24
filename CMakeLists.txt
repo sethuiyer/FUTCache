@@ -150,6 +150,19 @@ if(FUTCACHE_BUILD_EXAMPLES)
     add_test(NAME hiring_ingestion_demo COMMAND futcache_hiring_demo)
     set_tests_properties(hiring_ingestion_demo PROPERTIES TIMEOUT 120)
   endif()
+
+  # SOC / security-novelty demo: streams a log (recurring normal traffic +
+  # one injected anomaly) through a custom Hamming behavior-novelty gate. It
+  # asserts the anomaly is flagged NOVEL (one-sided guarantee) and exits
+  # non-zero if it is ever suppressed, so ctest enforces the safety property.
+  add_executable(futcache_soc_demo examples/soc_novelty_demo.c)
+  target_link_libraries(futcache_soc_demo PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_soc_demo PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_soc_demo)
+  if(BUILD_TESTING)
+    add_test(NAME soc_novelty_demo COMMAND futcache_soc_demo)
+    set_tests_properties(soc_novelty_demo PROPERTIES TIMEOUT 60)
+  endif()
 endif()
 
 if(FUTCACHE_BUILD_BENCHMARKS)
