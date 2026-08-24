@@ -4,6 +4,13 @@ Practical integration patterns for the three workloads where a
 **novelty oracle** is the right abstraction: RAG de-duplication, streaming
 anomaly detection, and RL intrinsic-curiosity reward.
 
+The novelty oracle itself is a finite realization of the **Novelty Geometry**
+framework — the ordered-discovery construction in
+[novelty-geometry](https://github.com/sethuiyer/novelty-geometry) (see the
+README's [Theoretical foundations](../README.md#theoretical-foundations)).
+This cookbook maps *real problems* onto that primitive; the framework explains
+*why* the primitive is the right one and where its finite-`ε` limits live.
+
 FUTCache answers exactly one question:
 
 > Is this point **more than `epsilon` away from every point I have seen**?

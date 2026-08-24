@@ -8,6 +8,15 @@ The goal is to answer two questions a practitioner actually has:
 1. Which FUTCache engine should I use?
 2. What epsilon (radius) do I set?
 
+FUTCache is a finite realization of the **Novelty Geometry** framework (see
+the README's [Theoretical foundations](../README.md#theoretical-foundations) —
+[novelty-geometry](https://github.com/sethuiyer/novelty-geometry)). The
+limitations in this playbook are the *finite, single-fidelity* and
+*non-canonical* aspects that framework itself flags as open (canonicity across
+towers, realizability over run classes), not arbitrary engine shortcomings.
+The numbers are honest; the framing below is the finite-`ε` slice of a studied
+construction.
+
 ---
 
 ## 1. Pick the engine

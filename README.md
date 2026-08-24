@@ -39,6 +39,40 @@ their telemetry differs.
 This is not an LRU key/value cache. It is an exact online novelty oracle:
 specify fidelity (`epsilon`), and the geometry determines memory use.
 
+## Theoretical foundations
+
+FUTCache is a finite, computable realization of the **Novelty Geometry**
+framework — the study of how an infinite traversal generates, retains, and
+completes *ordered novelty* across increasing resolution. The central object
+is the ordered discovery profile: the sequence of partition cells first
+encountered at each refinement level, in first-discovery order, whose
+completion lives in an inverse limit (and, after hyperbolic realization, on a
+Gromov boundary). The framework is in
+[novelty-geometry](https://github.com/sethuiyer/novelty-geometry) — the
+README, glossary, and the boundary-object semantics note are its entry
+points. (This repo keeps a local mirror of it under
+`references/novelty-geometry`.)
+
+| Framework concept | FUTCache engine |
+|---|---|
+| Sufficient memory / future-equivalence quotient | interval-union `U(H)` — the minimal state that determines future novelty exactly |
+| Ordered novelty word `D_j(L)` (first-discovery order) | tower per-level occupancy + first-discovery log |
+| Partition tower + bonding map `q_{j+1,j}` | tower coarse/fine refinement compatibility |
+| ε-separated set / packing number `P(K, ε)` | packing cache's representative set and bound |
+| Fenwick prefix-sum index | tower spatial rank/select |
+| Inverse limit / discovery topology / boundary | the ideal completion a one-`ε` tower approximates finitely |
+
+FUTCache is the *finite, single-fidelity* slice of that framework: it fixes one
+resolution (`epsilon`) rather than refining a tower, and it stores the
+sufficient novelty state with a hard memory ceiling and crash-safe
+persistence. The limits we measure empirically — the one-sided packing
+approximation (never wrongly suppresses novelty, but can over-report at
+packing boundaries), the negative cacheability margin on some corpora, and the
+cross-lingual precision ceiling — are precisely the *finite* and
+*non-canonical* aspects the framework itself flags as open in its note
+(canonicity across towers, realizability over run classes), not accidental
+deficiencies of the engine.
+
 ## What is implemented
 
 - Exact interval-union FUTCache over any finite `double` domain.
