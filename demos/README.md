@@ -273,13 +273,18 @@ the LLM), with TTL and an LRU cap available.
 python demos/semantic_assistant_integration.py --epsilon 0.45 --ttl 3600
 ```
 
-Real run (120 queries, 10 intents x 3 phrasings, repeated):
-- 84.2% cache hits (101) vs 15.8% cold LLM calls (19)
-- costs $0.29 (naive) -> $0.05 (with cache), 84.2% lower
-- reuse correctness 120/120 = 100% at epsilon=0.45
-- cold 214 ms per LLM call vs ~5 ms (the embed; the cache lookup itself is
-  microseconds) -- the LLM is what's skipped
+Real run (120 queries, 10 intents x 3 phrasings, repeated, epsilon=0.45):
+- **confusion matrix**: TN=10, TP=101, **FP=0** (no wrong-intent serve),
+  FN=9 (missed reuse -> wasted LLM)
+- reuse 84.2%, **precision 100%**, recall 91.8%, F1 0.957
+- cost $0.29 -> $0.05 (84.2% lower)
+- the epsilon frontier shows the honest trade-off: raise eps and
+  **false positives (wrong-intent serves) climb** -- eps=0.55 -> FP=4,
+  eps=0.65 -> FP=21, eps=0.72 -> FP=26 (precision drops to 77%), while
+  recall only improves slightly. Pick eps by your tolerance for serving a
+  wrong answer (FP) vs wasting an LLM call (FN).
 
 The point: this is the *integration* shape you'd ship -- embed once, call the
 LLM only on a genuinely novel/rephrased question, serve the rest from cache,
-and get an honest hit-rate / precision / cost number.
+and report an honest confusion matrix (TP/FP/TN/FN) plus cost, so you see
+both the savings and where epsilon hurts.

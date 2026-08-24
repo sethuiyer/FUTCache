@@ -135,6 +135,54 @@ class SupportAssistant:
         return answer.decode(), (not res.is_novel), res
 
 
+def decode_intent(answer):
+    return answer.split(">")[0].replace("<intent:", "")
+
+
+def evaluate(assistant, stream):
+    """Run the stream and return a confusion matrix at the query level.
+
+    Ground truth: a query is NOVEL if its intent has not been seen yet in the
+    stream (must call the LLM), REDUNDANT if it's a repeat/rephrase (should
+    reuse). The cache decides HIT (served) or MISS (LLM called).
+
+      TP = HIT and served the correct intent   (correct reuse)
+      FP = HIT but served the WRONG intent     (cross-intent merge)
+      FN = MISS but the intent was seen        (missed reuse -> wasted LLM)
+      TN = MISS and genuinely novel            (correct new-intent LLM call)
+    """
+    seen = set()
+    tp = fp = fn = tn = 0
+    for intent, question in stream:
+        first = intent not in seen
+        seen.add(intent)
+        answer, was_cached, _ = assistant.ask(question, intent)
+        served = decode_intent(answer)
+        if was_cached and served == intent:
+            tp += 1
+        elif was_cached:
+            fp += 1
+        elif first:
+            tn += 1
+        else:
+            fn += 1
+    return {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
+def summarize(c):
+    total = c["tp"] + c["fp"] + c["fn"] + c["tn"]
+    reuse = c["tp"] + c["fp"]
+    precision = c["tp"] / reuse if reuse else 0.0
+    recall = c["tp"] / (c["tp"] + c["fn"]) if (c["tp"] + c["fn"]) else 0.0
+    f1 = (2 * precision * recall / (precision + recall)
+          if (precision + recall) else 0.0)
+    return {
+        "total": total, "tp": c["tp"], "fp": c["fp"], "fn": c["fn"],
+        "tn": c["tn"], "reuse_rate": reuse / total if total else 0.0,
+        "precision": precision, "recall": recall, "f1": f1,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--epsilon", type=float, default=0.45)
@@ -167,54 +215,51 @@ def main() -> None:
     order = rng.permutation(len(phrasings))
     stream = [phrasings[i] for i in order]
     stream = stream * args.repeats
-
-    hits = misses = correct = served = 0
-    cold_s = 0.0
-    cached_s = 0.0
-    wrong = []
-    for intent, question in stream:
-        t0 = time.perf_counter()
-        answer, was_cached, res = assistant.ask(question, intent)
-        dt = time.perf_counter() - t0
-        if was_cached:
-            hits += 1
-            cached_s += dt
-        else:
-            misses += 1
-            cold_s += dt
-        # attribute the served answer to an intent (embedded in the answer)
-        served_intent = answer.split(">")[0].replace("<intent:", "")
-        if served_intent == intent:
-            correct += 1
-        else:
-            wrong.append((intent, served_intent))
-        served += 1
-
     n = len(stream)
-    naive_cost = n * cost_per_call
-    cached_cost = misses * cost_per_call
-    saved = naive_cost - cached_cost
-    precision = correct / served
 
-    print("\n[ Integration results ]")
-    print(f"  queries: {n:,}   cold LLM calls: {misses:,} ({misses/n:.1%})"
-          f"   cache hits: {hits:,} ({hits/n:.1%})")
-    print(f"  avg latency: cold={cold_s/max(misses,1)*1e3:.1f} ms  "
-          f"cached={cached_s/max(hits,1)*1e6:.1f} us")
-    print(f"  reuse correctness: {correct}/{served} = {precision:.1%}")
+    # ---- single epsilon: full confusion matrix
+    def build(eps):
+        return SupportAssistant(model, eps=eps, ttl=args.ttl,
+                                max_entries=args.max_entries)
+
+    # measure latency/cost at the requested epsilon
+    ass = build(args.epsilon)
+    c = evaluate(ass, stream)
+    s = summarize(c)
+    naive_cost = n * cost_per_call
+    cached_cost = (c["tn"] + c["fn"]) * cost_per_call
+    saved = naive_cost - cached_cost
+
+    print("\n[ Confusion matrix @ epsilon=%.2f ]" % args.epsilon)
+    print(f"  TN (correct novel, LLM called) = {c['tn']}")
+    print(f"  TP (correct reuse, served)     = {c['tp']}")
+    print(f"  FN (missed reuse, wasted LLM)  = {c['fn']}")
+    print(f"  FP (WRONG intent served)       = {c['fp']}   <-- false positives")
+    print(f"\n  reuse_rate  = {s['reuse_rate']:.1%}")
+    print(f"  precision   = {s['precision']:.1%}   (TP/(TP+FP))")
+    print(f"  recall      = {s['recall']:.1%}   (TP/(TP+FN))")
+    print(f"  F1          = {s['f1']:.3f}")
     print(f"  cost: naive=${naive_cost:.2f}  with cache=${cached_cost:.2f}  "
           f"saved=${saved:.2f} ({saved/naive_cost:.1%})")
-    if wrong:
-        print(f"  cross-intent serves: {[(a, b) for a, b in wrong[:4]]}")
+
+    # ---- epsilon frontier (shows how false positives rise)
+    print("\n[ epsilon frontier: FP rises as epsilon grows ]")
+    print("  eps   | reuse | precision | recall | F1    | FP | FN | TN")
+    print("  ------|-------|-----------|--------|-------|----|----|----")
+    for eps in (0.35, 0.45, 0.55, 0.65, 0.72):
+        s2 = summarize(evaluate(build(eps), stream))
+        print(f"  {eps:.2f} | {s2['reuse_rate']:5.1%} | "
+              f"{s2['precision']:8.1%} | {s2['recall']:6.1%} | "
+              f"{s2['f1']:.3f} | {s2['fp']:2d} | {s2['fn']:2d} | {s2['tn']:2d}")
+
     print("\n[ Example transcript ]")
     for intent, question in stream[:6]:
-        answer, was_cached, _ = assistant.ask(question, intent)
+        answer, was_cached, _ = ass.ask(question, intent)
         tag = "CACHE" if was_cached else "LLM  "
         print(f"  [{tag}] {question[:52]:54s} -> {answer.split('> ')[-1][:46]}")
-    print("  (epsilon too large would merge intents and serve the wrong answer;")
-    print("   reuse correctness is the honest precision measure.)")
-    print("  (cached latency includes the per-query embedding, which is unavoidable;")
-    print("   the cache lookup itself is microseconds -- the LLM call is what is skipped.)")
+    print("\n  FP = a cache hit that served the WRONG intent's answer (epsilon too")
+    print("      large merged two intents); FN = a rephrase that missed the cache")
+    print("      and wasted an LLM call (epsilon too small). Both are real costs.")
 
 
 if __name__ == "__main__":
