@@ -85,9 +85,30 @@ def main():
     print("  false-positive on KDD Cup '99 (eps=3). The R2L/U2R classes")
     print("  (warezclient 67%, ipsweep 73%) are the honest weak spot -- they")
     print("  overlap the benign feature region. The gate never suppresses a novel")
-    print("  point (one-sided), so this is a LOWER bound on detection; it is a")
-    print("  real triage/novelty filter, and the feature representation (not the")
-    print("  novelty primitive) is what limits it.")
+    print("  point (one-sided), so this is a LOWER bound on detection.\n")
+
+    # ---- CRITICAL: compare against trivial baselines (does FUTCache add
+    # anything specific, or is the dataset just easy?) ----
+    from sklearn.metrics import roc_auc_score
+    reps = c.copy_representatives()
+    def score_nn(pts, rp): return np.linalg.norm(pts[:, None, :] - rp[None, :, :], axis=2).min(axis=1)
+    s3,   s3b   = score_nn(Xs[attack_idx], reps),        score_nn(Xs[heldout_norm], reps)
+    s1,   s1b   = score_nn(Xs[attack_idx], Xs[base]),    score_nn(Xs[heldout_norm], Xs[base])
+    cen = Xs[base].mean(axis=0)
+    sc_, sc_b   = np.linalg.norm(Xs[attack_idx] - cen, axis=1), np.linalg.norm(Xs[heldout_norm] - cen, axis=1)
+    y = np.concatenate([np.ones(len(attack_idx)), np.zeros(len(heldout_norm))])
+    print("  [ does FUTCache beat a trivial baseline? AUC, higher = better ]")
+    print(f"    FUTCache novelty (eps=3, {len(reps)} reps): AUC = "
+          f"{roc_auc_score(y, np.concatenate([s3, s3b])):.4f}")
+    print(f"    1-NN to benign                         : AUC = "
+          f"{roc_auc_score(y, np.concatenate([s1, s1b])):.4f}")
+    print(f"    nearest-centroid (benign mean)         : AUC = "
+          f"{roc_auc_score(y, np.concatenate([sc_, sc_b])):.4f}")
+    print("  INTERPRETATION: if FUTCache's AUC ~= nearest-centroid / 1-NN, the")
+    print("  separation is a property of the DATASET (easy classes), not of")
+    print("  FUTCache specifically. Its real value is operational (bounded-memory")
+    print("  online streaming, one-sided never-miss-novelty, durable), which an")
+    print("  offline benchmark with a static centroid cannot exercise.")
 
 
 if __name__ == "__main__":

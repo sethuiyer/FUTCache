@@ -142,14 +142,16 @@ deficiencies of the engine.
   clusters+tail, tight clusters, and uniform), plus a note that a uniform
   long tail in high dimension does not collapse. Run
   `futcache_corpus_dedup` (optionally on your own `N*dim` float64 corpus).
-- A real-data validation of the **security-novelty / SOC** use case on
+- A **security-novelty / SOC** example on
   [KDD Cup '99](https://scikit-learn.org/stable/modules/generated/sklearn.datasets.fetch_kddcup99.html)
   (`demos/kdd_novelty_check.py`): train the one-sided novelty gate on benign
-  traffic only, then check whether it flags real attack classes as novel.
-  At the sweet-spot epsilon it flags **~99% of attack connections as NOVEL at
-  ~2.5% benign false-positive**, collapsing the benign baseline 25×. The R2L/
-  U2R classes are the honest weak spot (they overlap benign features). This is
-  a measured result on real IDS data, not a synthetic demo.
+  traffic only and query whether it flags real attack classes as novel. Note
+  the honest limit: on KDD99 the gate's accuracy (AUC ~0.99) is *identical to
+  a trivial nearest-centroid / 1-NN baseline* (AUC ~0.99), because several
+  attack classes are trivially separable — so KDD99 shows the gate *works*
+  (as a novelty primitive) but does **not** show it detects better than a
+  simple baseline. FUTCache's edge here is operational (bounded-memory online
+  streaming, one-sided never-miss-novelty, durable), not detection accuracy.
 
 The learned recurrent/KV state and application-specific sliding-window TTL
 forms discussed in `how.md` require a model- or key-domain-specific observable
