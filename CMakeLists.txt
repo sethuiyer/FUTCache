@@ -137,6 +137,19 @@ if(FUTCACHE_BUILD_EXAMPLES)
   target_link_libraries(futcache_box_example PRIVATE FUTCache::futcache m)
   target_compile_features(futcache_box_example PRIVATE c_std_11)
   futcache_enable_warnings(futcache_box_example)
+
+  # Deterministic empirical benchmark: checks the metric-caching invariants
+  # (medoid collapse, outlier admission, separation, interval holes/ceilings,
+  # CRDT convergence) and reports the VP-tree latency behaviour vs intrinsic
+  # dimension. Exits non-zero if a hard invariant fails, so ctest enforces it.
+  add_executable(futcache_hiring_demo examples/hiring_ingestion_demo.c)
+  target_link_libraries(futcache_hiring_demo PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_hiring_demo PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_hiring_demo)
+  if(BUILD_TESTING)
+    add_test(NAME hiring_ingestion_demo COMMAND futcache_hiring_demo)
+    set_tests_properties(hiring_ingestion_demo PROPERTIES TIMEOUT 120)
+  endif()
 endif()
 
 if(FUTCACHE_BUILD_BENCHMARKS)
