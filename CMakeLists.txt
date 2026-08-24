@@ -177,6 +177,11 @@ if(FUTCACHE_BUILD_BENCHMARKS)
   target_link_libraries(futcache_pack_backend_bench PRIVATE FUTCache::futcache m)
   target_compile_features(futcache_pack_backend_bench PRIVATE c_std_11)
   futcache_enable_warnings(futcache_pack_backend_bench)
+
+  add_executable(futcache_corpus_dedup bench/corpus_dedup_cost.c)
+  target_link_libraries(futcache_corpus_dedup PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_corpus_dedup PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_corpus_dedup)
 endif()
 
 if(FUTCACHE_BUILD_NITROSAT)

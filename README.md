@@ -69,6 +69,12 @@ specify fidelity (`epsilon`), and the geometry determines memory use.
 - A `bench/cache_comparison.c` benchmark pitting FUTCache against LRU and an
   exact-set cache on five workloads, with memory, decision-error, and
   throughput reporting.
+- A `bench/corpus_dedup_cost.c` cost benchmark showing the honest
+  distribution-dependent de-duplication economics: the reduction ratio and
+  downstream embedding/index cost saved across three data shapes (balanced
+  clusters+tail, tight clusters, and uniform), plus a note that a uniform
+  long tail in high dimension does not collapse. Run
+  `futcache_corpus_dedup` (optionally on your own `N*dim` float64 corpus).
 
 The learned recurrent/KV state and application-specific sliding-window TTL
 forms discussed in `how.md` require a model- or key-domain-specific observable
