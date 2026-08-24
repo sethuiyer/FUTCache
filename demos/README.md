@@ -265,7 +265,7 @@ python demos/hyperbolic_zoom_demo.py
 
 `demos/semantic_assistant_integration.py` wires `PackCache.get_or_compute`
 into an app-shaped flow: a support assistant answers user questions via a
-(mock) LLM over a 29-sentence knowledge base, with the semantic cache in
+(mock) LLM over a 45-sentence knowledge base, with the semantic cache in
 front of it. A repeat or rephrased question is served from cache (skipping
 the LLM), with TTL and an LRU cap available.
 

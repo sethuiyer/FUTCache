@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 
 import numpy as np
+from _shared import QUESTIONS_MONO as QUESTIONS
 from sentence_transformers import SentenceTransformer
 
 import futcache
@@ -32,38 +33,6 @@ from futcache import PackCache, poincare_distance
 
 MODEL = "hotchpotch/bekko-embedding-v1-a8m"
 
-QUESTIONS = {
-    "password_reset": [
-        "How do I reset my password?", "What is the procedure to change my password?",
-        "I forgot my password, how can I get a new one?"],
-    "sign_out": [
-        "How do I log out of my account?", "What is the way to sign out?",
-        "How can I end my current session?"],
-    "cancel_subscription": [
-        "How do I cancel my subscription?", "What is the process to cancel my plan?",
-        "I want to stop my subscription, how?"],
-    "refund": [
-        "How do I get a refund?", "What is the refund process?",
-        "Can I get my money back, and how?"],
-    "api_key": [
-        "Where do I find my API key?", "How do I generate an API key?",
-        "How do I get my API credentials?"],
-    "change_email": [
-        "How do I change my email address?", "What is the way to update my email?",
-        "How can I modify the email on my account?"],
-    "invoice": [
-        "Where can I download my invoice?", "How do I get a copy of my bill?",
-        "How do I access my billing statement?"],
-    "mobile_app": [
-        "Is there a mobile app?", "Do you have an iOS or Android app?",
-        "Can I use this from my phone?"],
-    "pricing": [
-        "How much does it cost?", "What are the pricing tiers?",
-        "What is the monthly price?"],
-    "two_factor": [
-        "How do I enable 2FA?", "How do I start using two-factor authentication?",
-        "How do I set up multifactor authentication?"],
-}
 
 
 def embed(texts, model):

@@ -24,6 +24,7 @@ import argparse
 import time
 
 import numpy as np
+from _shared import CORPUS, QUESTIONS_MONO as QUESTIONS
 from sentence_transformers import SentenceTransformer
 
 from futcache import PackCache
@@ -35,71 +36,8 @@ AVG_IN = 200
 AVG_OUT = 120
 LLM_LATENCY_S = 0.20
 
-CORPUS = [
-    "You can reset your password from the account settings page.",
-    "Password resets require a confirmation link sent to your email.",
-    "Choose a password with at least eight characters and a number.",
-    "A password reset link expires after sixty minutes.",
-    "To sign out, open the user menu and select logout.",
-    "Logging out clears your local session on the device.",
-    "Subscriptions are managed in the billing section.",
-    "You can cancel a subscription at the end of the billing cycle.",
-    "Cancelling stops renewals but keeps access until the period ends.",
-    "Refunds are issued within five to ten business days.",
-    "Eligible refunds are processed back to your original payment method.",
-    "API keys are generated under the developer settings tab.",
-    "Keep your API key secret; do not commit it to a repository.",
-    "Change your email address from the profile settings.",
-    "A verification email is sent to the new address.",
-    "Invoices are available for download in the billing history.",
-    "Each invoice includes a line-by-line summary of charges.",
-    "A mobile app is available for iOS and Android.",
-    "The mobile app supports the same features as the web version.",
-    "There is a free tier with a monthly usage limit.",
-    "Paid plans unlock higher usage caps and priority support.",
-    "Two-factor authentication adds a second step at sign in.",
-    "Enable 2FA from the security settings on your account.",
-    "Authenticator apps generate the verification code.",
-    "You can invite teammates from the organization settings.",
-    "Audit logs record changes made to your workspace.",
-    "Data is encrypted at rest and in transit.",
-    "You can export your data in a CSV file.",
-    "The help center has step-by-step guides for common tasks.",
-]
 
 # intent -> (canonical question, list of rephrasings)
-QUESTIONS = {
-    "password_reset": ["How do I reset my password?",
-                       "What is the procedure to change my password?",
-                       "I forgot my password, how can I get a new one?"],
-    "sign_out": ["How do I log out of my account?",
-                 "What is the way to sign out?",
-                 "How can I end my session?"],
-    "cancel_subscription": ["How do I cancel my subscription?",
-                            "What is the process to cancel my plan?",
-                            "I want to stop my subscription, how?"],
-    "refund": ["How do I get a refund?",
-               "What is the refund process?",
-               "Can I get my money back, and how?"],
-    "api_key": ["Where do I find my API key?",
-                "How do I generate an API key?",
-                "How do I get my API credentials?"],
-    "change_email": ["How do I change my email address?",
-                     "What is the way to update my email?",
-                     "How can I modify the email on my account?"],
-    "invoice": ["Where can I download my invoice?",
-                "How do I get a copy of my bill?",
-                "How do I access my billing statement?"],
-    "mobile_app": ["Is there a mobile app?",
-                   "Do you have an iOS or Android app?",
-                   "Can I use this from my phone?"],
-    "pricing": ["How much does it cost?",
-                "What are the pricing tiers?",
-                "What is the monthly price?"],
-    "two_factor": ["How do I enable 2FA?",
-                   "How do I start two-factor authentication?",
-                   "How do I set up multifactor authentication?"],
-}
 
 
 class SupportAssistant:

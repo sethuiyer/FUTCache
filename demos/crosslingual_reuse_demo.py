@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 
 import numpy as np
+from _shared import QUESTIONS_MULTI as Q
 from sentence_transformers import SentenceTransformer
 
 from futcache import PackCache
@@ -30,79 +31,6 @@ MODEL_NAME = "hotchpotch/bekko-embedding-v1-a8m"
 
 # intent -> list of (language, text). 13 unique intents; 32 non-English
 # phrasings spread across them, for 13 + 32 = 45 questions.
-Q = {
-    "reset_password": [
-        ("en", "How do I reset my password?"),
-        ("es", "¿Cómo restablezco mi contraseña?"),
-        ("fr", "Comment réinitialiser mon mot de passe ?"),
-        ("ja", "パスワードをリセットするにはどうすればよいですか？"),
-    ],
-    "cancel_subscription": [
-        ("en", "How do I cancel my subscription?"),
-        ("de", "Wie kündige ich mein Abo?"),
-        ("zh", "我如何取消我的订阅？"),
-    ],
-    "refund": [
-        ("en", "How do I get a refund?"),
-        ("es", "¿Cómo puedo solicitar un reembolso?"),
-        ("pt", "Como faço para obter um reembolso?"),
-        ("de", "Wie bekomme ich eine Rückerstattung?"),
-    ],
-    "contact_support": [
-        ("en", "How do I contact support?"),
-        ("fr", "Comment contacter le support ?"),
-        ("ja", "サポートに連絡するにはどうすればよいですか？"),
-        ("zh", "我如何联系客服？"),
-    ],
-    "two_factor": [
-        ("en", "How do I enable two-factor authentication?"),
-        ("es", "¿Cómo activo la autenticación de dos factores?"),
-        ("hi", "मैं टू-फैक्टर प्रमाणीकरण कैसे सक्षम करूँ?"),
-        ("ja", "二段階認証を有効にするには？"),
-    ],
-    "export_data": [
-        ("en", "How do I export my data?"),
-        ("ja", "データをエクスポートするにはどうすればよいですか？"),
-        ("zh", "我如何导出我的数据？"),
-        ("fr", "Comment exporter mes données ?"),
-    ],
-    "pay_bill": [
-        ("en", "How do I pay my bill?"),
-        ("de", "Wie bezahle ich meine Rechnung?"),
-        ("es", "¿Cómo pago mi factura?"),
-        ("fr", "Comment régler ma facture ?"),
-    ],
-    "upgrade_plan": [
-        ("en", "How do I upgrade my plan?"),
-        ("de", "Wie kann ich meinen Tarif upgraden?"),
-        ("hi", "मैं अपना प्लान कैसे अपग्रेड करूँ?"),
-    ],
-    "invoice": [
-        ("en", "Where can I find my invoice?"),
-        ("es", "¿Dónde encuentro mi factura?"),
-        ("fr", "Où trouver ma facture ?"),
-    ],
-    "delete_account": [
-        ("en", "How do I delete my account?"),
-        ("zh", "我如何删除我的账户？"),
-        ("ja", "アカウントを削除するにはどうすればよいですか？"),
-    ],
-    "change_email": [
-        ("en", "How do I change my email address?"),
-        ("fr", "Comment changer mon adresse e-mail ?"),
-        ("de", "Wie ändere ich meine E-Mail-Adresse?"),
-    ],
-    "invite_teammate": [
-        ("en", "How do I invite a teammate?"),
-        ("pt", "Como faço para convidar um colega?"),
-        ("es", "¿Cómo invito a un compañero?"),
-    ],
-    "billing_address": [
-        ("en", "How do I change my billing address?"),
-        ("hi", "मैं अपना बिलिंग पता कैसे बदलूँ?"),
-        ("pt", "Como altero meu endereço de cobrança?"),
-    ],
-}
 
 LANGS = ["en", "es", "fr", "de", "ja", "zh", "hi", "pt"]
 

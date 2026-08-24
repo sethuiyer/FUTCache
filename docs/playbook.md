@@ -188,3 +188,57 @@ model); the last two are C (`FUTCACHE_BUILD_BENCHMARKS` / examples).
   (the geometry is redundant even though the answer is recomputed).
 - **The ratio is a lower bound**, not a promise: the packing cache is
   one-sided, so `%saved` understates the truly-redundant content.
+
+## 7. Operating it (beyond picking ε)
+
+Once you've picked the engine and ε, the return on the cache comes from how
+you run it. This is the layer the geometry doesn't cover.
+
+### 7a. Set the eviction/expiry policy
+
+- `max_memory_bytes` — hard ceiling on *native* cache memory (representatives
+  + index + bounds). With a nonzero value, FIFO pressure eviction recycles the
+  oldest representative under the ceiling. This bounds the geometric state.
+- `max_entries` (Python, v1.4.0) — **LRU** cap on the *payload* store. The
+  geometry may need many representatives, but the cached *answers* you
+  actually keep are usually far fewer. Cap this to bound answer-store memory.
+- `ttl` (Python) — payload expiry in seconds. The right value is roughly your
+  content's staleness window: too short → you recompute answers that are still
+  valid (more LLM cost); too long → you serve answers that went stale.
+
+These are independent knobs: `max_memory_bytes` bounds the novelty state,
+`max_entries`+`ttl` bound the answers you keep.
+
+### 7b. Watch the live metrics, not the geometry
+
+The three numbers that tell you whether the cache is earning its keep:
+
+- **hit rate** (`payload_count` / `len`, or the fraction of `observe` that
+  were redundant) — rising means the cache is catching repeats.
+- **reuse precision** (P(correct intent | hit)) — the playbook's §3 frontier.
+  If it drops, ε is too large; raise the alarm before it serves wrong answers.
+- **compute calls avoided** (`novel_observations` vs `observations`) — the
+  direct cost saving, in LLM calls.
+
+Log these as a rolling window, not a lifetime total.
+
+### 7c. Re-calibrate ε when the data drifts
+
+Embeddings aren't static. When the model version, the corpus, or the query
+mix changes, the frontier moves. Re-run the sweep (`demos/paraphrase_reuse_demo.py
+--sweep`, `demos/crosslingual_reuse_demo.py --sweep`) and re-pick the highest
+ε at 100% precision. A cache calibrated on stale data silently degrades —
+either by serving wrong answers (ε too high) or wasting LLM calls (ε too low).
+
+### 7d. A sane operating default
+
+```
+PackCache(dim, epsilon, distance="cosine",
+          backend="vptree",            # once you have many representatives
+          max_memory_bytes=64<<20,     # bound the geometry
+          max_entries=10_000,          # bound the answers kept
+          ttl=3600)                    # answers are good for an hour
+```
+Then measure hit-rate / precision in production, and let those two numbers
+drive any ε or capacity change. If precision dips below ~100%, tighten ε
+before touching memory.
