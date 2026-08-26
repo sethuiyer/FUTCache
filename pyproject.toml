@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "FUTCache contributors" }]
 classifiers = [
     "Programming Language :: C",
-    "Programming Language :: Cython",
+    "Programming Language :: C++",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -23,7 +23,7 @@ classifiers = [
 dependencies = ["numpy>=2.0"]
 
 [project.urls]
-Homepage = "https://github.com/example/futcache"
+Homepage = "https://github.com/sethuiyer/FUTCache"
 
 [tool.scikit-build]
 cmake.version = ">=3.16"

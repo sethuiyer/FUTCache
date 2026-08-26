@@ -46,7 +46,9 @@ extern "C" {
  * Guarantees.
  *
  *   - One-sidedness: is_novel queries are exact (no false negatives).
- *   - Bounded memory: O(n) for n representatives.
+ *   - Bounded memory: a configured hard byte ceiling is enforced. Exact
+ *     arbitrary-scale queries retain O(h) history for h observations, in
+ *     addition to O(n) representative state.
  *   - Eviction: evict_lowest_persistence() removes the rep with the
  *     smallest persistence, preserving the most novel reps.
  *   - Prime tagging: each rep gets a prime signature based on its

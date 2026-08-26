@@ -101,7 +101,7 @@ static bool test_persist_single_observe(void)
     TEST_STATUS(futcache_persist_is_novel_at(eng, 0.8, 0.1, &novel), FUTCACHE_OK);
     TEST_ASSERT(novel == true);
 
-    TEST_STATUS(futcache_persist_is_novel_at(eng, 0.8, 0.3, &novel), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_is_novel_at(eng, 0.75, 0.25, &novel), FUTCACHE_OK);
     TEST_ASSERT(novel == false);
 
     /* Merge tree: 1 leaf, 0 features */
@@ -151,14 +151,14 @@ static bool test_persist_two_obs(void)
     TEST_ASSERT(n2->left == 0);
     TEST_ASSERT(n2->right == 1);
     TEST_ASSERT(n2->parent == -1);
-    TEST_NEAR(n2->death_scale, 0.6, 1e-12); /* gap = 0.8 - 0.2 */
+    TEST_NEAR(n2->death_scale, 0.3, 1e-12); /* half-gap = (0.8 - 0.2)/2 */
 
-    /* 1 feature: persistence = 0.6 */
+    /* 1 feature: persistence = half the gap = 0.3 */
     futcache_persist_feature_t feats[10];
     size_t dcount = 10;
     TEST_STATUS(futcache_persist_copy_diagram(eng, feats, &dcount), FUTCACHE_OK);
     TEST_ASSERT(dcount == 1);
-    TEST_NEAR(feats[0].persistence, 0.6, 1e-12);
+    TEST_NEAR(feats[0].persistence, 0.3, 1e-12);
     TEST_ASSERT(feats[0].birth_prime == 2); /* p_0 = 2 */
     TEST_ASSERT(feats[0].death_prime == 3); /* p_1 = 3 */
 
@@ -199,12 +199,12 @@ static bool test_persist_three_obs(void)
      *   Node 0: leaf at 0.0
      *   Node 1: leaf at 0.4
      *   Node 2: leaf at 1.0
-     *   Node 3: internal, merges node 0 and node 1, death_scale = 0.4
-     *   Node 4: internal, merges node 3 and node 2, death_scale = 0.6
+     *   Node 3: internal, merges node 0 and node 1, death_scale = 0.2
+     *   Node 4: internal, merges node 3 and node 2, death_scale = 0.3
      *
      * Features:
-     *   Feature 0: persistence = 0.4 (gap between 0.0 and 0.4)
-     *   Feature 1: persistence = 0.6 (gap between 0.4 and 1.0)
+     *   Feature 0: persistence = 0.2 (half-gap between 0.0 and 0.4)
+     *   Feature 1: persistence = 0.3 (half-gap between 0.4 and 1.0)
      */
 
     TEST_ASSERT(futcache_persist_node_count(eng) == 5);
@@ -213,21 +213,21 @@ static bool test_persist_three_obs(void)
     const futcache_persist_node_t *n3 = futcache_persist_get_node(eng, 3);
     TEST_ASSERT(n3 != NULL);
     TEST_ASSERT(n3->is_leaf == false);
-    TEST_NEAR(n3->death_scale, 0.4, 1e-12);
+    TEST_NEAR(n3->death_scale, 0.2, 1e-12);
 
     const futcache_persist_node_t *n4 = futcache_persist_get_node(eng, 4);
     TEST_ASSERT(n4 != NULL);
     TEST_ASSERT(n4->is_leaf == false);
-    TEST_NEAR(n4->death_scale, 0.6, 1e-12);
+    TEST_NEAR(n4->death_scale, 0.3, 1e-12);
     TEST_ASSERT(n4->parent == -1); /* root */
 
-    /* Features: 2 features, persistence 0.4 and 0.6 */
+    /* Features: 2 features, persistence 0.2 and 0.3 */
     futcache_persist_feature_t feats[10];
     size_t dcount = 10;
     TEST_STATUS(futcache_persist_copy_diagram(eng, feats, &dcount), FUTCACHE_OK);
     TEST_ASSERT(dcount == 2);
-    TEST_NEAR(feats[0].persistence, 0.4, 1e-12);
-    TEST_NEAR(feats[1].persistence, 0.6, 1e-12);
+    TEST_NEAR(feats[0].persistence, 0.2, 1e-12);
+    TEST_NEAR(feats[1].persistence, 0.3, 1e-12);
 
     TEST_STATUS(futcache_persist_validate(eng), FUTCACHE_OK);
     futcache_persist_destroy(eng);
@@ -274,7 +274,7 @@ static bool test_persist_differential(void)
             for (size_t oi = 0; oi < n_obs; ++oi) {
                 double d = queries[qi] - obs[oi];
                 if (d < 0) d = -d;
-                if (d <= scales[si] + 1e-12) {
+                if (d <= scales[si]) {
                     expected_novel = false;
                     break;
                 }
@@ -334,7 +334,7 @@ static bool test_persist_features_evict(void)
 
     /* Observe 5 points: 0.0, 0.1, 0.2, 0.3, 0.4
      * Gaps: 0.1, 0.1, 0.1, 0.1 (all equal)
-     * 4 features, each with persistence 0.1 */
+     * 4 features, each with persistence 0.05 */
     double pts[] = {0.0, 0.1, 0.2, 0.3, 0.4};
     for (int i = 0; i < 5; ++i) {
         TEST_STATUS(futcache_persist_observe(eng, pts[i]), FUTCACHE_OK);
@@ -344,7 +344,7 @@ static bool test_persist_features_evict(void)
     TEST_STATUS(futcache_persist_feature_count(eng, 0.0, &count), FUTCACHE_OK);
     TEST_ASSERT(count == 4);
 
-    /* Evict features with persistence < 0.15: all 4 have persistence 0.1,
+    /* Evict features with persistence < 0.15: all 4 have persistence 0.05,
      * so all are evicted. */
     TEST_STATUS(futcache_persist_evict_below(eng, 0.15), FUTCACHE_OK);
     TEST_STATUS(futcache_persist_feature_count(eng, 0.0, &count), FUTCACHE_OK);
@@ -365,7 +365,7 @@ static bool test_persist_features_evict(void)
     return true;
 }
 
-/* --- 9. CRDT merge: idempotent, commutative, associative --- */
+/* --- 9. Signature join: idempotent, commutative, associative --- */
 
 static bool test_crdt_merge(void)
 {
@@ -429,7 +429,7 @@ static bool test_crdt_merge(void)
     return true;
 }
 
-/* --- 10. Selberg zeta function --- */
+/* --- 10. Finite prime-product diagnostic (legacy API name) --- */
 
 static bool test_selberg_zeta(void)
 {
@@ -446,8 +446,8 @@ static bool test_selberg_zeta(void)
     /* Observe points: 0.0, 1.0, 3.0
      * Gaps: 1.0 (between 0 and 1), 2.0 (between 1 and 3)
      * Features:
-     *   Feature 0: birth=0 (obs 0), death=1 (obs 1), persistence=1.0
-     *   Feature 1: birth=1 (obs 1), death=2 (obs 2), persistence=2.0
+     *   Feature 0: birth=0, death=1, persistence=0.5
+     *   Feature 1: birth=1, death=2, persistence=1.0
      *
      * Prime birth indices: birth=0 (not prime), birth=1 (not prime)
      * So Z(s) = 1 (no prime-birth features)
@@ -594,7 +594,7 @@ static bool test_persist_randomized(void)
         for (int i = 0; i < 20; ++i) {
             double d = x - obs[i];
             if (d < 0) d = -d;
-            if (d <= t + 1e-12) {
+            if (d <= t) {
                 expected_novel = false;
                 break;
             }
@@ -684,6 +684,49 @@ static bool test_readme_persist_example(void)
     return true;
 }
 
+static bool test_exact_small_distances_and_invalid_queries(void)
+{
+    futcache_persist_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    futcache_persist_t *eng = NULL;
+    bool novel = false;
+    double intervals[2];
+    size_t count = 1U;
+
+    TEST_STATUS(futcache_persist_create(&cfg, &eng), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_observe(eng, 0.0), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_is_novel_at(eng, 5e-13, 0.0, &novel),
+                FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    TEST_STATUS(futcache_persist_novelty_spectrum(
+                    eng, 5e-13, intervals, &count), FUTCACHE_OK);
+    TEST_ASSERT(count == 1U && intervals[1] == 5e-13);
+    TEST_STATUS(futcache_persist_is_novel_at(eng, NAN, 0.0, &novel),
+                FUTCACHE_ERROR_INVALID_ARGUMENT);
+    count = 1U;
+    TEST_STATUS(futcache_persist_novelty_spectrum(eng, NAN, intervals, &count),
+                FUTCACHE_ERROR_INVALID_ARGUMENT);
+    futcache_persist_destroy(eng);
+    return true;
+}
+
+static bool test_max_features_limit(void)
+{
+    futcache_persist_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.max_features = 1U;
+    futcache_persist_t *eng = NULL;
+    TEST_STATUS(futcache_persist_create(&cfg, &eng), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_observe(eng, 0.0), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_observe(eng, 1.0), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_observe(eng, 2.0),
+                FUTCACHE_ERROR_OUT_OF_RANGE);
+    TEST_ASSERT(futcache_persist_node_count(eng) == 3U);
+    TEST_STATUS(futcache_persist_validate(eng), FUTCACHE_OK);
+    futcache_persist_destroy(eng);
+    return true;
+}
+
 int persist_test_suite(void)
 {
     static const test_case_t tests[] = {
@@ -695,12 +738,14 @@ int persist_test_suite(void)
         {"differential is_novel_at (70 combos)", test_persist_differential},
         {"novelty spectrum", test_persist_spectrum},
         {"feature count and evict_below", test_persist_features_evict},
-        {"CRDT merge (idempotent/commutative)", test_crdt_merge},
-        {"Selberg zeta function", test_selberg_zeta},
+        {"signature join (idempotent/commutative)", test_crdt_merge},
+        {"finite prime-product diagnostic", test_selberg_zeta},
         {"clear and reuse", test_persist_clear_reuse},
         {"randomized differential (100 trials)", test_persist_randomized},
         {"stats with prime cycle count", test_persist_stats},
         {"README persist quick-start numbers", test_readme_persist_example},
+        {"exact small distances and invalid queries", test_exact_small_distances_and_invalid_queries},
+        {"max feature limit", test_max_features_limit},
     };
     return run_test_cases("persist", tests, sizeof(tests) / sizeof(tests[0]));
 }

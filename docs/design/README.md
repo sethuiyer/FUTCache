@@ -6,7 +6,7 @@ novelty engine. Each is independent; each composes with the others.
 
 | # | File | Core idea | Status |
 |---|---|---|---|
-| 01 | [01-persistent-novelty.md](01-persistent-novelty.md) | **Prime-tagged** persistence diagram — novelty as a function of scale, with Selberg trace formula connection to eviction cycles | Design |
+| 01 | [01-persistent-novelty.md](01-persistent-novelty.md) | **Prime-tagged** persistence diagram and an explicitly speculative zeta analogy | Partial implementation / research |
 | 02 | [02-wasserstein-eviction.md](02-wasserstein-eviction.md) | Replace FIFO eviction with **W₁-optimal** (nearest-neighbor-minimum) eviction; quantify the one-sided gap | Design |
 | 03 | [03-submodular-selection.md](03-submodular-selection.md) | Replace order-sensitive ε-separated insertion with **submodular coverage** maximization (1−1/e guarantee) | Design |
 | 04 | [04-learned-metric.md](04-learned-metric.md) | Bridge to **arbitrary similarity** via distance-to-anchors embedding with bounded distortion | Design |

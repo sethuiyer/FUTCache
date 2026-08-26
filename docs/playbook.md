@@ -28,7 +28,7 @@ question**. The one axis that matters is **exactness**; the second is
 | Engine | Exact? | Best for | The catch |
 |---|------|----------|-----------|
 | `futcache` (interval union) | ✅ **Exact, canonical** | 1-D scalars: gaps, coverage, new-ceiling detection | 1-D only |
-| `box` (L_inf) | ✅ **Exact** (full-ball) | exact low-dim `L_inf` coverage, numeric features (2–8 D) | one box per novel point → bloat; `O(box_count)` |
+| `box` (L_inf) | ✅ **Exact** (full-history balls) | exact low-dim `L_inf` coverage, numeric features (2–8 D) | one box per observation → bloat; `O(box_count)` |
 | `pack` (Voronoi / `PackCache`) | ⚠️ **One-sided** | embeddings, ≥2-D, RAG dedup, LLM answer cache, partial-coverage | never wrongly drops novelty, but **over-reports** at packing boundaries |
 | `crdt` | ✅ under δ-net quantization | distributed replicas that converge without a coordinator | lower recall (fixed anchors), `O(|A|)` quantize |
 | `tower` | n/a (occupancy) | coverage/divergence analytics over counts | a *coverage* structure, not a novelty oracle |
@@ -288,13 +288,11 @@ or validate with PCA before observing.
 
 **B4. CRDT merge collision (prime signature spoofing).**
 The 1-D persistent engine tags features with `(p_b mod M, p_d mod M)`. For
-M = 2^61−1, a bad actor with knowledge of the merge tree structure could
-craft observation sequences that produce *the same* prime signature for
-different features, causing the CRDT merge to collapse distinct novelty
-patterns into one. In practice this requires ≥ 10^6 observations (the prime
-gap argument), but in a long-running distributed system it's non-trivial.
-Mitigation: use full (unmodded) prime products for small n, or add a
-secondary hash.
+M = 2^61−1, distinct local features can share a signature either through a
+modular collision or, much earlier, because sorted indices are local ranks
+rather than global identities. The signature join can then collapse
+unrelated features. Mitigation: use stable geometric or observation IDs and
+recompute from raw histories when a true combined diagram is required.
 
 **B5. ε-drift via model version upgrade.**
 A data vendor calibrates ε = 0.45 on embedding model v1. They upgrade to
@@ -307,7 +305,8 @@ but the *vendor* loses revenue. The bad actor here is the vendor who
 Mitigation: re-run the §3 sweep on every model upgrade.
 
 **B6. Submodular selection oracle attack.**
-The `select_max_coverage` API returns the optimal (1−1/e) rep set. A bad
+The `select_max_coverage` API returns a greedy rep set with a `(1−1/e)`
+coverage approximation guarantee. A bad
 actor can call this API with their *query stream* as the points and their
 *own* candidate set as the universe, extracting the coverage structure of
 the buyer's query distribution. They learn which query patterns are
@@ -358,13 +357,12 @@ evicts, and the cycle repeats. The bad actor causes O(n) eviction
 churn with O(n log n) cost per eviction. Mitigation: use VP-tree backend;
 set `max_memory_bytes` well above P(K, ε) × rep_size.
 
-**B12. Selberg zeta manipulation (spectral attack).**
-The `selberg_zeta(s)` function encodes the eviction cycle structure. A
-bad actor who can observe Z(s) at multiple s values can invert it to
-recover the persistence spectrum (the "eigenvalues" of the novelty
-landscape). This reveals the exact clustering structure of the buyer's
-data. Mitigation: expose only Z(s) at a single s, or add noise to the
-zeta values (Laplace mechanism with ε_privacy).
+**B12. Zeta-diagnostic manipulation.**
+The finite diagnostic summarizes prime-birth persistence values. Multiple
+high-precision evaluations can leak more distributional information than a
+single value, but they neither encode eviction cycles nor guarantee exact
+spectrum recovery. Mitigation: restrict access and evaluate privacy noise
+against a stated threat model before deployment.
 
 ---
 
@@ -384,9 +382,9 @@ A content platform has 1M documents and needs to cache 1000
 "representative" summaries. `select_max_coverage(points, n=1M, dim=384,
 epsilon=0.45, k=1000)` returns the 1000 docs that cover the maximum
 fraction of the 1M-doc space within ε. The 1−1/e guarantee means the
-greedy solution covers ≥ 63% of the optimal coverage — no brute-force
-needed. This is 37× cheaper than the optimal (NP-hard) solution for
-k=1000, n=1M.
+greedy solution covers at least `(1−1/e)` of optimal coverage. Computing
+the exact optimum is NP-hard; the greedy routine avoids exhaustive subset
+search.
 
 **G3. W1-optimal eviction for cache stability.**
 A CDN uses `PackCache.evict_w1()` instead of FIFO. When the cache is full,
@@ -458,14 +456,11 @@ narrow spectrum (novel only up to t=0.05), they use ε=0.05 (tight
 matching, high precision). The persistence diagram *is* the adaptive ε
 policy — no separate calibration step needed.
 
-**G11. Selberg zeta as a health metric.**
-The `selberg_zeta(s)` function is a scalar summary of the entire
-persistence diagram. A good actor monitors Z(2.0) over time: if Z(s) is
-stable, the novelty landscape is stable (no drift). If Z(s) is rising,
-new clusters are forming (data distribution shifting). If Z(s) is
-dropping, clusters are merging (ε too large, or the domain is saturating).
-This is a single-number "health check" for the cache, analogous to a
-CPU utilization metric for a server.
+**G11. Finite zeta-inspired product as an experimental health metric.**
+The `selberg_zeta(s)` function is an experimental scalar summary of the
+prime-birth subset of the persistence diagram. It may be tracked alongside
+direct counts and quantiles, but stability or direction of this scalar does
+not by itself prove absence, cause, or direction of distribution drift.
 
 **G12. Bounded-memory guarantee for edge devices.**
 The packing number P(K, ε) gives an *exact upper bound* on the number

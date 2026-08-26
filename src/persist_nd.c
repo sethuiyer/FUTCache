@@ -23,8 +23,12 @@ struct futcache_persist_nd {
     double *domain_min;
     double *domain_max;
 
-    /* Observed points (unsorted). */
-    double *points;           /* [capacity * dimension] */
+    /* Retained representatives. */
+    double *points;           /* [rep_capacity * dimension] */
+
+    /* Complete observation history, required for exact arbitrary-scale
+     * novelty queries. */
+    double *history;          /* [point_capacity * dimension] */
     size_t point_count;
     size_t point_capacity;
 
@@ -46,6 +50,53 @@ struct futcache_persist_nd {
     futcache_allocator_t allocator;
     size_t max_memory_bytes;
 };
+
+static bool checked_mul_size(size_t a, size_t b, size_t *out)
+{
+    if (a != 0U && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool checked_add_size(size_t a, size_t b, size_t *out)
+{
+    if (b > SIZE_MAX - a) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool storage_bytes(const futcache_persist_nd_t *engine,
+                          size_t rep_capacity, size_t point_capacity,
+                          size_t *out)
+{
+    size_t rep_points;
+    size_t history_points;
+    size_t rep_metadata;
+    size_t one_bound;
+    size_t bounds;
+    size_t observation_map;
+    size_t total = sizeof(*engine);
+    if (!checked_mul_size(rep_capacity, engine->dimension, &rep_points) ||
+        !checked_mul_size(rep_points, sizeof(double), &rep_points) ||
+        !checked_mul_size(point_capacity, engine->dimension,
+                          &history_points) ||
+        !checked_mul_size(history_points, sizeof(double), &history_points) ||
+        !checked_mul_size(rep_capacity,
+            2U * sizeof(double) + sizeof(size_t) + sizeof(uint64_t),
+            &rep_metadata) ||
+        !checked_mul_size(engine->dimension, sizeof(double), &one_bound) ||
+        !checked_mul_size(one_bound, 2U, &bounds) ||
+        !checked_mul_size(point_capacity, sizeof(size_t), &observation_map) ||
+        !checked_add_size(total, bounds, &total) ||
+        !checked_add_size(total, rep_points, &total) ||
+        !checked_add_size(total, history_points, &total) ||
+        !checked_add_size(total, rep_metadata, &total) ||
+        !checked_add_size(total, observation_map, &total)) {
+        return false;
+    }
+    *out = total;
+    return true;
+}
 
 /* ============================================================
  * Default allocator
@@ -144,14 +195,14 @@ futcache_status_t futcache_persist_nd_create(
     const futcache_allocator_t *allocator,
     futcache_persist_nd_t **out_engine)
 {
-    if (dimension == 0 || out_engine == NULL || distance == NULL)
+    if (out_engine == NULL) return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    *out_engine = NULL;
+    if (dimension == 0 || distance == NULL)
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     if (!isfinite(epsilon) || epsilon < 0.0)
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     if (domain_min == NULL || domain_max == NULL)
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
-    *out_engine = NULL;
-
     for (size_t i = 0; i < dimension; ++i) {
         if (!isfinite(domain_min[i]) || !isfinite(domain_max[i]) ||
             domain_max[i] <= domain_min[i])
@@ -174,6 +225,13 @@ futcache_status_t futcache_persist_nd_create(
     engine->distance_fn = distance;
     engine->distance_context = distance_context;
     engine->max_memory_bytes = max_memory_bytes;
+
+    size_t base_bytes;
+    if (!storage_bytes(engine, 0U, 0U, &base_bytes) ||
+        (max_memory_bytes != 0U && base_bytes > max_memory_bytes)) {
+        alloc.deallocate(alloc.context, engine);
+        return FUTCACHE_ERROR_OUT_OF_MEMORY;
+    }
 
     /* Copy domain bounds. */
     engine->domain_min = (double *)alloc.allocate(
@@ -198,6 +256,7 @@ void futcache_persist_nd_destroy(futcache_persist_nd_t *engine)
     if (engine == NULL) return;
     futcache_allocator_t *a = &engine->allocator;
     a->deallocate(a->context, engine->points);
+    a->deallocate(a->context, engine->history);
     a->deallocate(a->context, engine->obs_to_rep);
     a->deallocate(a->context, engine->radii);
     a->deallocate(a->context, engine->nearest_dist);
@@ -217,8 +276,8 @@ static bool point_in_domain(
 {
     for (size_t i = 0; i < engine->dimension; ++i) {
         if (!isfinite(x[i]) ||
-            x[i] < engine->domain_min[i] - 1e-12 ||
-            x[i] > engine->domain_max[i] + 1e-12)
+            x[i] < engine->domain_min[i] ||
+            x[i] > engine->domain_max[i])
             return false;
     }
     return true;
@@ -252,7 +311,113 @@ static bool is_within_any_rep(
     if (out_nearest_rep) *out_nearest_rep = best_idx;
     if (out_nearest_dist) *out_nearest_dist = best_dist;
 
-    return best_dist <= radius + 1e-12;
+    return best_dist <= radius;
+}
+
+static futcache_status_t ensure_capacity(futcache_persist_nd_t *engine,
+                                         bool add_representative)
+{
+    size_t rep_capacity = engine->rep_capacity;
+    size_t point_capacity = engine->point_capacity;
+    if (add_representative && engine->rep_count == rep_capacity) {
+        if (rep_capacity > SIZE_MAX / 2U) return FUTCACHE_ERROR_OUT_OF_MEMORY;
+        rep_capacity = rep_capacity == 0U ? 16U : rep_capacity * 2U;
+    }
+    if (engine->point_count == point_capacity) {
+        if (point_capacity > SIZE_MAX / 2U) return FUTCACHE_ERROR_OUT_OF_MEMORY;
+        point_capacity = point_capacity == 0U ? 16U : point_capacity * 2U;
+    }
+
+    size_t prospective;
+    if (!storage_bytes(engine, rep_capacity, point_capacity, &prospective) ||
+        (engine->max_memory_bytes != 0U &&
+         prospective > engine->max_memory_bytes)) {
+        return FUTCACHE_ERROR_OUT_OF_MEMORY;
+    }
+
+    futcache_allocator_t *a = &engine->allocator;
+    double *new_points = NULL;
+    double *new_radii = NULL;
+    double *new_nearest = NULL;
+    size_t *new_birth_index = NULL;
+    uint64_t *new_birth_prime = NULL;
+    double *new_history = NULL;
+    size_t *new_map = NULL;
+
+    if (rep_capacity != engine->rep_capacity) {
+        size_t point_values;
+        if (!checked_mul_size(rep_capacity, engine->dimension, &point_values)) {
+            return FUTCACHE_ERROR_OUT_OF_MEMORY;
+        }
+        new_points = a->allocate(a->context, point_values * sizeof(double));
+        new_radii = a->allocate(a->context, rep_capacity * sizeof(double));
+        new_nearest = a->allocate(a->context, rep_capacity * sizeof(double));
+        new_birth_index = a->allocate(a->context,
+                                      rep_capacity * sizeof(size_t));
+        new_birth_prime = a->allocate(a->context,
+                                      rep_capacity * sizeof(uint64_t));
+        if (new_points == NULL || new_radii == NULL || new_nearest == NULL ||
+            new_birth_index == NULL || new_birth_prime == NULL) goto oom;
+        if (engine->rep_count != 0U) {
+            memcpy(new_points, engine->points,
+                engine->rep_count * engine->dimension * sizeof(double));
+            memcpy(new_radii, engine->radii,
+                engine->rep_count * sizeof(double));
+            memcpy(new_nearest, engine->nearest_dist,
+                engine->rep_count * sizeof(double));
+            memcpy(new_birth_index, engine->birth_index,
+                engine->rep_count * sizeof(size_t));
+            memcpy(new_birth_prime, engine->birth_prime,
+                engine->rep_count * sizeof(uint64_t));
+        }
+    }
+    if (point_capacity != engine->point_capacity) {
+        size_t history_values;
+        if (!checked_mul_size(point_capacity, engine->dimension,
+                              &history_values)) goto oom;
+        new_history = a->allocate(a->context,
+                                  history_values * sizeof(double));
+        new_map = a->allocate(a->context, point_capacity * sizeof(size_t));
+        if (new_history == NULL || new_map == NULL) goto oom;
+        if (engine->point_count != 0U) {
+            memcpy(new_history, engine->history,
+                engine->point_count * engine->dimension * sizeof(double));
+            memcpy(new_map, engine->obs_to_rep,
+                engine->point_count * sizeof(size_t));
+        }
+    }
+
+    if (new_points != NULL) {
+        a->deallocate(a->context, engine->points);
+        a->deallocate(a->context, engine->radii);
+        a->deallocate(a->context, engine->nearest_dist);
+        a->deallocate(a->context, engine->birth_index);
+        a->deallocate(a->context, engine->birth_prime);
+        engine->points = new_points;
+        engine->radii = new_radii;
+        engine->nearest_dist = new_nearest;
+        engine->birth_index = new_birth_index;
+        engine->birth_prime = new_birth_prime;
+        engine->rep_capacity = rep_capacity;
+    }
+    if (new_history != NULL) {
+        a->deallocate(a->context, engine->history);
+        a->deallocate(a->context, engine->obs_to_rep);
+        engine->history = new_history;
+        engine->obs_to_rep = new_map;
+        engine->point_capacity = point_capacity;
+    }
+    return FUTCACHE_OK;
+
+oom:
+    a->deallocate(a->context, new_points);
+    a->deallocate(a->context, new_radii);
+    a->deallocate(a->context, new_nearest);
+    a->deallocate(a->context, new_birth_index);
+    a->deallocate(a->context, new_birth_prime);
+    a->deallocate(a->context, new_history);
+    a->deallocate(a->context, new_map);
+    return FUTCACHE_ERROR_OUT_OF_MEMORY;
 }
 
 futcache_status_t futcache_persist_nd_observe(
@@ -274,72 +439,11 @@ futcache_status_t futcache_persist_nd_observe(
 
     uint64_t obs_index = engine->observations;
 
+    futcache_status_t capacity_status = ensure_capacity(engine, !known);
+    if (capacity_status != FUTCACHE_OK) return capacity_status;
+
     if (!known) {
         /* Novel: add a new representative. */
-
-        /* Grow points array. */
-        if (engine->rep_count >= engine->rep_capacity) {
-            size_t new_cap = engine->rep_capacity == 0 ? 16
-                                                       : engine->rep_capacity * 2;
-            double *new_pts = (double *)engine->allocator.allocate(
-                engine->allocator.context,
-                new_cap * engine->dimension * sizeof(double));
-            if (new_pts == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
-            if (engine->rep_count > 0) {
-                memcpy(new_pts, engine->points,
-                       engine->rep_count * engine->dimension * sizeof(double));
-            }
-            engine->allocator.deallocate(
-                engine->allocator.context, engine->points);
-            engine->points = new_pts;
-            engine->rep_capacity = new_cap;
-
-            /* Grow per-rep arrays. */
-            double *new_radii = (double *)engine->allocator.allocate(
-                engine->allocator.context, new_cap * sizeof(double));
-            double *new_nd = (double *)engine->allocator.allocate(
-                engine->allocator.context, new_cap * sizeof(double));
-            size_t *new_bi = (size_t *)engine->allocator.allocate(
-                engine->allocator.context, new_cap * sizeof(size_t));
-            uint64_t *new_bp = (uint64_t *)engine->allocator.allocate(
-                engine->allocator.context, new_cap * sizeof(uint64_t));
-            if (new_radii == NULL || new_nd == NULL ||
-                new_bi == NULL || new_bp == NULL) {
-                /* Roll back on OOM: free partial allocations. */
-                engine->allocator.deallocate(
-                    engine->allocator.context, new_radii);
-                engine->allocator.deallocate(
-                    engine->allocator.context, new_nd);
-                engine->allocator.deallocate(
-                    engine->allocator.context, new_bi);
-                engine->allocator.deallocate(
-                    engine->allocator.context, new_bp);
-                return FUTCACHE_ERROR_OUT_OF_MEMORY;
-            }
-            size_t old_cap = engine->rep_count;
-            if (old_cap > 0) {
-                memcpy(new_radii, engine->radii,
-                       old_cap * sizeof(double));
-                memcpy(new_nd, engine->nearest_dist,
-                       old_cap * sizeof(double));
-                memcpy(new_bi, engine->birth_index,
-                       old_cap * sizeof(size_t));
-                memcpy(new_bp, engine->birth_prime,
-                       old_cap * sizeof(uint64_t));
-            }
-            engine->allocator.deallocate(
-                engine->allocator.context, engine->radii);
-            engine->allocator.deallocate(
-                engine->allocator.context, engine->nearest_dist);
-            engine->allocator.deallocate(
-                engine->allocator.context, engine->birth_index);
-            engine->allocator.deallocate(
-                engine->allocator.context, engine->birth_prime);
-            engine->radii = (double *)new_radii;
-            engine->nearest_dist = (double *)new_nd;
-            engine->birth_index = new_bi;
-            engine->birth_prime = new_bp;
-        }
 
         /* Store the new rep. */
         size_t rep_idx = engine->rep_count;
@@ -351,46 +455,17 @@ futcache_status_t futcache_persist_nd_observe(
         engine->nearest_dist[rep_idx] = INFINITY;
         engine->rep_count++;
 
-        /* Track observation -> rep mapping. */
-        if (engine->point_count >= engine->point_capacity) {
-            size_t new_cap = engine->point_capacity == 0 ? 16
-                                                         : engine->point_capacity * 2;
-            size_t *new_map = (size_t *)engine->allocator.allocate(
-                engine->allocator.context, new_cap * sizeof(size_t));
-            if (new_map == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
-            if (engine->point_count > 0) {
-                memcpy(new_map, engine->obs_to_rep,
-                       engine->point_count * sizeof(size_t));
-            }
-            engine->allocator.deallocate(
-                engine->allocator.context, engine->obs_to_rep);
-            engine->obs_to_rep = new_map;
-            engine->point_capacity = new_cap;
-        }
-        engine->obs_to_rep[engine->point_count++] = rep_idx;
+        engine->obs_to_rep[engine->point_count] = rep_idx;
 
         /* Recompute all nearest distances. O(n^2 * d). */
         recompute_nearest(engine);
     } else {
-        /* Redundant observation: track the mapping. */
-        if (engine->point_count >= engine->point_capacity) {
-            size_t new_cap = engine->point_capacity == 0 ? 16
-                                                         : engine->point_capacity * 2;
-            size_t *new_map = (size_t *)engine->allocator.allocate(
-                engine->allocator.context, new_cap * sizeof(size_t));
-            if (new_map == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
-            if (engine->point_count > 0) {
-                memcpy(new_map, engine->obs_to_rep,
-                       engine->point_count * sizeof(size_t));
-            }
-            engine->allocator.deallocate(
-                engine->allocator.context, engine->obs_to_rep);
-            engine->obs_to_rep = new_map;
-            engine->point_capacity = new_cap;
-        }
-        engine->obs_to_rep[engine->point_count++] = nearest_rep;
+        engine->obs_to_rep[engine->point_count] = nearest_rep;
     }
 
+    memcpy(engine->history + engine->point_count * engine->dimension, x,
+           engine->dimension * sizeof(double));
+    engine->point_count++;
     engine->observations++;
     return FUTCACHE_OK;
 }
@@ -409,18 +484,20 @@ futcache_status_t futcache_persist_nd_is_novel_at(
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     if (!isfinite(t) || t < 0.0)
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    if (!point_in_domain(engine, x)) return FUTCACHE_ERROR_OUT_OF_RANGE;
 
-    if (engine->rep_count == 0) {
+    if (engine->point_count == 0) {
         *out_is_novel = true;
         return FUTCACHE_OK;
     }
 
-    /* Linear scan: check if x is within distance t of any rep. */
+    /* Linear scan over the complete history: arbitrary-scale queries must not
+     * lose the balls contributed by observations absorbed at base epsilon. */
     size_t dim = engine->dimension;
-    for (size_t i = 0; i < engine->rep_count; ++i) {
+    for (size_t i = 0; i < engine->point_count; ++i) {
         double d = engine->distance_fn(
-            x, engine->points + i * dim, dim, engine->distance_context);
-        if (d <= t + 1e-12) {
+            x, engine->history + i * dim, dim, engine->distance_context);
+        if (d <= t) {
             *out_is_novel = false;
             return FUTCACHE_OK;
         }
@@ -505,7 +582,10 @@ static void shift_reps_down(futcache_persist_nd_t *engine, size_t evicted)
 
     /* Update obs_to_rep mapping. */
     for (size_t i = 0; i < engine->point_count; ++i) {
-        if (engine->obs_to_rep[i] > evicted) {
+        if (engine->obs_to_rep[i] == evicted) {
+            engine->obs_to_rep[i] = SIZE_MAX;
+        } else if (engine->obs_to_rep[i] > evicted &&
+                   engine->obs_to_rep[i] != SIZE_MAX) {
             engine->obs_to_rep[i]--;
         }
     }
@@ -662,11 +742,10 @@ futcache_status_t futcache_persist_nd_get_stats(
         out_stats->prime_birth_count = prime_count;
     }
 
-    out_stats->memory_bytes = sizeof(futcache_persist_nd_t) +
-        engine->rep_count * engine->dimension * sizeof(double) +
-        engine->point_count * sizeof(size_t) +
-        engine->rep_count * (sizeof(double) + sizeof(double) +
-                             sizeof(size_t) + sizeof(uint64_t));
+    if (!storage_bytes(engine, engine->rep_capacity, engine->point_capacity,
+                       &out_stats->memory_bytes)) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
     return FUTCACHE_OK;
 }
 
@@ -689,6 +768,21 @@ futcache_status_t futcache_persist_nd_validate(
     for (size_t i = 0; i < engine->rep_count; ++i) {
         if (!point_in_domain(engine, engine->points + i * engine->dimension))
             return FUTCACHE_ERROR_CORRUPT_DATA;
+    }
+
+    for (size_t i = 0; i < engine->point_count; ++i) {
+        if (!point_in_domain(engine,
+                engine->history + i * engine->dimension)) {
+            return FUTCACHE_ERROR_CORRUPT_DATA;
+        }
+    }
+
+    size_t live_bytes;
+    if (!storage_bytes(engine, engine->rep_capacity, engine->point_capacity,
+                       &live_bytes) ||
+        (engine->max_memory_bytes != 0U &&
+         live_bytes > engine->max_memory_bytes)) {
+        return FUTCACHE_ERROR_CORRUPT_DATA;
     }
 
     /* Nearest distances must be non-negative or INFINITY. */

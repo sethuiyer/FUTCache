@@ -38,6 +38,7 @@ struct futcache_embed {
     futcache_distance_fn distance;   /* metric on original space */
     void *distance_context;
     double covering_radius; /* estimated delta (lower bound) */
+    bool covering_radius_certified;
 
     futcache_allocator_t owner_allocator;
     futcache_allocator_t allocator;
@@ -86,10 +87,31 @@ futcache_status_t futcache_embed_create(
         config->domain_max == NULL) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
+    if (!isfinite(config->covering_radius_upper_bound) ||
+        config->covering_radius_upper_bound < 0.0) {
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+    for (size_t coordinate = 0U; coordinate < config->dimension;
+         ++coordinate) {
+        if (!isfinite(config->domain_min[coordinate]) ||
+            !isfinite(config->domain_max[coordinate]) ||
+            config->domain_max[coordinate] <= config->domain_min[coordinate]) {
+            return FUTCACHE_ERROR_INVALID_ARGUMENT;
+        }
+    }
+    size_t anchor_values;
+    if (config->anchor_count > SIZE_MAX / config->dimension) {
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+    anchor_values = config->anchor_count * config->dimension;
+    for (size_t value = 0U; value < anchor_values; ++value) {
+        if (!isfinite(config->anchors[value])) {
+            return FUTCACHE_ERROR_INVALID_ARGUMENT;
+        }
+    }
     /* Overflow check: anchor_count * dimension must fit in size_t. */
-    if (config->anchor_count >
-        (SIZE_MAX - sizeof(futcache_embed_t)) /
-            (sizeof(double) * config->dimension)) {
+    if (anchor_values >
+        (SIZE_MAX - sizeof(futcache_embed_t)) / sizeof(double)) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
 
@@ -98,8 +120,7 @@ futcache_status_t futcache_embed_create(
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
 
-    size_t anchor_bytes = config->anchor_count * config->dimension *
-                          sizeof(double);
+    size_t anchor_bytes = anchor_values * sizeof(double);
     if (anchor_bytes > SIZE_MAX - sizeof(futcache_embed_t)) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
@@ -114,9 +135,11 @@ futcache_status_t futcache_embed_create(
     embed->anchor_count = config->anchor_count;
     embed->anchors = (double *)(embed + 1);
     memcpy(embed->anchors, config->anchors, anchor_bytes);
-    embed->distance = config->distance;
+    embed->distance = config->distance != NULL
+        ? config->distance : futcache_distance_linf;
     embed->distance_context = config->distance_context;
     embed->covering_radius = 0.0;
+    embed->covering_radius_certified = false;
     embed->owner_allocator = allocator;
     embed->allocator = allocator;
 
@@ -124,7 +147,8 @@ futcache_status_t futcache_embed_create(
      * the CRDT engine: deterministic quasi-random Halton probe points.
      * This gives a lower bound on the true covering radius. */
     {
-        size_t probe_count = config->anchor_count * 10U;
+        size_t probe_count = config->anchor_count > SIZE_MAX / 10U
+            ? SIZE_MAX : config->anchor_count * 10U;
         if (probe_count < 1000U) probe_count = 1000U;
         if (probe_count > 100000U) probe_count = 100000U;
 
@@ -141,6 +165,15 @@ futcache_status_t futcache_embed_create(
         if (st != FUTCACHE_OK) {
             allocator.deallocate(allocator.context, embed);
             return st;
+        }
+        if (isfinite(config->covering_radius_upper_bound) &&
+            config->covering_radius_upper_bound > 0.0) {
+            if (config->covering_radius_upper_bound < embed->covering_radius) {
+                allocator.deallocate(allocator.context, embed);
+                return FUTCACHE_ERROR_INVALID_ARGUMENT;
+            }
+            embed->covering_radius = config->covering_radius_upper_bound;
+            embed->covering_radius_certified = true;
         }
     }
 
@@ -166,11 +199,20 @@ futcache_status_t futcache_embed_point(
     if (embed == NULL || point == NULL || out_embedded == NULL) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
+    for (size_t coordinate = 0U; coordinate < embed->dimension; ++coordinate) {
+        if (!isfinite(point[coordinate])) {
+            return FUTCACHE_ERROR_OUT_OF_RANGE;
+        }
+    }
     for (size_t i = 0; i < embed->anchor_count; ++i) {
         const double *anchor = embed->anchors + i * embed->dimension;
-        out_embedded[i] = embed->distance(point, anchor,
-                                           embed->dimension,
-                                           embed->distance_context);
+        double coordinate = embed->distance(point, anchor,
+                                             embed->dimension,
+                                             embed->distance_context);
+        if (!isfinite(coordinate) || coordinate < 0.0) {
+            return FUTCACHE_ERROR_OUT_OF_RANGE;
+        }
+        out_embedded[i] = coordinate;
     }
     return FUTCACHE_OK;
 }
@@ -207,6 +249,9 @@ futcache_status_t futcache_embed_adjusted_epsilon(
     }
     if (!isfinite(epsilon_original) || epsilon_original < 0.0) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+    if (!embed->covering_radius_certified) {
+        return FUTCACHE_ERROR_OUT_OF_RANGE;
     }
     double delta = embed->covering_radius;
     double adjusted = epsilon_original - 2.0 * delta;
@@ -253,8 +298,11 @@ futcache_status_t futcache_embed_pack_create(
     futcache_embed_t **out_embed,
     futcache_pack_t **out_cache)
 {
-    if (out_embed != NULL) *out_embed = NULL;
-    if (out_cache != NULL) *out_cache = NULL;
+    if (out_embed == NULL || out_cache == NULL) {
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
+    *out_embed = NULL;
+    *out_cache = NULL;
     if (original_dimension == 0U || max_anchors == 0U ||
         domain_min == NULL || domain_max == NULL) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
@@ -265,15 +313,21 @@ futcache_status_t futcache_embed_pack_create(
     if (!isfinite(target_radius) || target_radius <= 0.0) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
+    if (strategy != FUTCACHE_CRDT_ANCHOR_GRID) {
+        /* A sampled Halton radius is a lower bound, so it cannot certify the
+         * distortion adjustment performed by this convenience constructor. */
+        return FUTCACHE_ERROR_INVALID_ARGUMENT;
+    }
 
     /* Step 1: Generate anchors with covering radius <= target_radius. */
     double *anchors = NULL;
     size_t anchor_count = 0;
     double covering_radius = 0.0;
-    size_t alloc_bytes = max_anchors * original_dimension * sizeof(double);
-    if (alloc_bytes > SIZE_MAX) {
+    if (max_anchors > SIZE_MAX / original_dimension ||
+        max_anchors * original_dimension > SIZE_MAX / sizeof(double)) {
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     }
+    size_t alloc_bytes = max_anchors * original_dimension * sizeof(double);
     anchors = (double *)malloc(alloc_bytes);
     if (anchors == NULL) {
         return FUTCACHE_ERROR_OUT_OF_MEMORY;
@@ -303,11 +357,13 @@ futcache_status_t futcache_embed_pack_create(
     econfig.dimension = original_dimension;
     econfig.anchor_count = anchor_count;
     econfig.anchors = anchors;
-    econfig.distance = original_distance;
+    econfig.distance = original_distance != NULL
+        ? original_distance : futcache_distance_linf;
     econfig.distance_context = original_distance_context;
     econfig.domain_min = domain_min;
     econfig.domain_max = domain_max;
-    econfig.allocator = *allocator;
+    econfig.covering_radius_upper_bound = covering_radius;
+    if (allocator != NULL) econfig.allocator = *allocator;
 
     futcache_embed_t *embed = NULL;
     st = futcache_embed_create(&econfig, &embed);
@@ -341,27 +397,34 @@ futcache_status_t futcache_embed_pack_create(
         futcache_embed_destroy(embed);
         return FUTCACHE_ERROR_OUT_OF_MEMORY;
     }
-    /* Compute the max possible distance from any anchor to any point in the
-     * domain. This is an upper bound on each embedded coordinate. */
+    futcache_distance_fn distance = original_distance != NULL
+        ? original_distance : futcache_distance_linf;
+    /* Compute a certified coordinate bound for the built-in norm metrics.
+     * For other metrics DBL_MAX is conservative and avoids rejecting a valid
+     * embedded point on the basis of an unproved corner heuristic. */
     for (size_t i = 0; i < anchor_count; ++i) {
         emb_domain_min[i] = 0.0;
-        /* Max distance from anchor to any domain corner.
-         * For simplicity, use the distance to the farthest corner. */
-        double max_dist = 0.0;
-        /* Check all 2^d corners — but d can be large. Instead, use the
-         * distance to the two extreme corners (min and max) as a bound.
-         * For L_p metrics, the farthest point from a given anchor in a
-         * hyperrectangle is one of the corners. For simplicity we check
-         * the two "opposite" corners. */
         const double *anchor = (const double *)(embed->anchors +
                                                 i * original_dimension);
-        /* Corner 1: all domain_min */
-        double d1 = original_distance(anchor, domain_min, original_dimension,
-                                       original_distance_context);
-        /* Corner 2: all domain_max */
-        double d2 = original_distance(anchor, domain_max, original_dimension,
-                                       original_distance_context);
-        max_dist = d1 > d2 ? d1 : d2;
+        double max_dist = 0.0;
+        if (distance == futcache_distance_l1 ||
+            distance == futcache_distance_l2 ||
+            distance == futcache_distance_linf) {
+            double accumulator = 0.0;
+            for (size_t coordinate = 0U; coordinate < original_dimension;
+                 ++coordinate) {
+                double dlo = fabs(anchor[coordinate] - domain_min[coordinate]);
+                double dhi = fabs(anchor[coordinate] - domain_max[coordinate]);
+                double far = dlo > dhi ? dlo : dhi;
+                if (distance == futcache_distance_l1) accumulator += far;
+                else if (distance == futcache_distance_l2) accumulator += far * far;
+                else if (far > accumulator) accumulator = far;
+            }
+            max_dist = distance == futcache_distance_l2
+                ? sqrt(accumulator) : accumulator;
+        } else {
+            max_dist = DBL_MAX;
+        }
         emb_domain_max[i] = max_dist;
     }
 
@@ -374,7 +437,7 @@ futcache_status_t futcache_embed_pack_create(
     pconfig.domain_min = emb_domain_min;
     pconfig.domain_max = emb_domain_max;
     pconfig.backend = &futcache_pack_vptree_backend;
-    pconfig.allocator = *allocator;
+    if (allocator != NULL) pconfig.allocator = *allocator;
 
     futcache_pack_t *cache = NULL;
     st = futcache_pack_create(&pconfig, &cache);
@@ -388,7 +451,7 @@ futcache_status_t futcache_embed_pack_create(
     free(emb_domain_min);
     free(emb_domain_max);
 
-    if (out_embed != NULL) *out_embed = embed;
-    if (out_cache != NULL) *out_cache = cache;
+    *out_embed = embed;
+    *out_cache = cache;
     return FUTCACHE_OK;
 }

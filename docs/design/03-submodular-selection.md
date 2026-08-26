@@ -42,7 +42,7 @@ This guarantees the set is *eps-separated*, but it has two limitations:
 
 We can do better by formulating representative selection as a
 **maximisation of a monotone submodular function** subject to a
-cardinality constraint, and using a **lazy greedy** algorithm with the
+cardinality constraint, and using a **direct greedy** algorithm with the
 classic `1 − 1/e` approximation guarantee.
 
 ---
@@ -67,13 +67,14 @@ The objective is:
 
     R* = argmax_{S ⊆ X, |S| ≤ k} f(S)
 
-where `k = P(K, eps) = N_eps(K)` is the packing number of the domain `K`
-at scale eps (or the configured budget if smaller).
+where `k` is the configured budget. The minimum budget for full coverage is
+a covering number; it is related to, but not generally equal to, the packing
+number `P(K, eps)`.
 
 ### 2.2. Theorem (Approximation guarantee)
 
 **Theorem 3.1 (1 − 1/e guarantee).** Let `f` be the coverage function
-above. The lazy greedy algorithm that at each step adds the element
+above. The greedy algorithm that at each step adds the element
 with the largest marginal gain `f(S ∪ {x}) − f(S)` produces a set `R`
 with:
 
@@ -141,7 +142,7 @@ is the average ball size.
 
 ### 3.3. Incremental / streaming version
 
-For streaming, a **lazy greedy with a priority queue**:
+The implemented streaming policy is a **direct swap heuristic**:
 
 1. Maintain `R` (current representatives) and `U` (candidates).
 2. On each new observation `x`: if `d(x, R) > eps`, add to `U` and
@@ -149,9 +150,9 @@ For streaming, a **lazy greedy with a priority queue**:
 3. When `|R| > k`: select `r* = argmin_{r in R} marginal_loss(r | R)`
    where `marginal_loss(r | R) = f(R) − f(R \ {r})`, and evict it.
 
-This is the **swap heuristic** for submodular maximisation under a
-cardinality constraint, and it retains the `1 − 1/e` guarantee in the
-streaming setting (Chen, Mirrokni, Nanongkai, Wang 2018).
+This is a practical bounded-memory policy. It is not the batch greedy
+algorithm, and FUTCache does not claim a `1 − 1/e` approximation guarantee
+for this streaming eviction rule.
 
 ---
 
@@ -229,8 +230,8 @@ A new engine `futcache_select` (or an option on `pack`):
 
 2. **Dynamic k.** If `k` changes at runtime (user adjusts budget), the
    greedy solution is no longer optimal for the new `k`. The
-   *streaming swap* heuristic (Section 3.3) handles this with the same
-   `1 − 1/e` guarantee.
+   *streaming swap* heuristic (Section 3.3) can adapt the bounded set, but
+   this implementation does not claim the batch greedy approximation bound.
 
 3. **Weighted observations.** In a semantic cache, some queries are more
    "important" (higher frequency, higher cost). The weighted coverage

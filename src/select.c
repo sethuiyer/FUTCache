@@ -143,7 +143,7 @@ futcache_status_t futcache_select_max_coverage(
     size_t selected_count = 0U;
     size_t current_covered = 0U;
 
-    /* Lazy greedy: at each step, find the candidate with the largest
+    /* Direct greedy: at each step, find the candidate with the largest
      * marginal gain. Tie-break by lexicographic order. */
     for (size_t step = 0; step < k; ++step) {
         double best_gain = -1.0;

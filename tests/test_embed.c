@@ -196,6 +196,7 @@ static bool test_embed_adjusted_epsilon(void)
     cfg.distance = futcache_distance_l1;
     cfg.domain_min = lo;
     cfg.domain_max = hi;
+    cfg.covering_radius_upper_bound = 0.125;
 
     futcache_embed_t *emb = NULL;
     TEST_STATUS(futcache_embed_create(&cfg, &emb), FUTCACHE_OK);
@@ -241,6 +242,7 @@ static bool test_embed_pack_e2e(void)
     cfg.distance = futcache_distance_l2;
     cfg.domain_min = lo;
     cfg.domain_max = hi;
+    cfg.covering_radius_upper_bound = sqrt(2.0) / 4.0;
 
     futcache_embed_t *emb = NULL;
     TEST_STATUS(futcache_embed_create(&cfg, &emb), FUTCACHE_OK);
@@ -383,12 +385,13 @@ static bool test_embed_pack_validate(void)
     cfg.distance = futcache_distance_l1;
     cfg.domain_min = lo;
     cfg.domain_max = hi;
+    cfg.covering_radius_upper_bound = 0.2;
 
     futcache_embed_t *emb = NULL;
     TEST_STATUS(futcache_embed_create(&cfg, &emb), FUTCACHE_OK);
 
     size_t m = futcache_embed_anchor_count(emb);
-    double eps_orig = 0.4;
+    double eps_orig = 0.5;
     double eps_emb;
     TEST_STATUS(futcache_embed_adjusted_epsilon(emb, eps_orig, &eps_emb),
                 FUTCACHE_OK);
@@ -499,6 +502,51 @@ static bool test_embed_high_dimensional(void)
     return true;
 }
 
+static bool test_embed_certification_and_convenience_bounds(void)
+{
+    double anchors[] = {0.0, 1.0};
+    double lo[] = {0.0, 0.0};
+    double hi[] = {1.0, 1.0};
+    futcache_embed_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.dimension = 2U;
+    cfg.anchor_count = 1U;
+    cfg.anchors = anchors;
+    cfg.distance = NULL; /* documented L_inf default */
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+
+    futcache_embed_t *embed = NULL;
+    TEST_STATUS(futcache_embed_create(&cfg, &embed), FUTCACHE_OK);
+    double projected[1];
+    TEST_STATUS(futcache_embed_point(
+        embed, (const double[]){1.0, 0.0}, projected), FUTCACHE_OK);
+    TEST_ASSERT(projected[0] == 1.0);
+    TEST_STATUS(futcache_embed_point(
+        embed, (const double[]){NAN, 0.0}, projected),
+        FUTCACHE_ERROR_OUT_OF_RANGE);
+    double adjusted = 0.0;
+    TEST_STATUS(futcache_embed_adjusted_epsilon(embed, 2.0, &adjusted),
+                FUTCACHE_ERROR_OUT_OF_RANGE);
+    futcache_embed_destroy(embed);
+
+    futcache_pack_t *cache = NULL;
+    TEST_STATUS(futcache_embed_pack_create(
+        2U, 2.0, futcache_distance_l2, NULL, lo, hi, 0.4,
+        FUTCACHE_CRDT_ANCHOR_GRID, 4U, 0U, NULL, &embed, &cache),
+        FUTCACHE_OK);
+    double embedded_point[4];
+    TEST_STATUS(futcache_embed_point(
+        embed, (const double[]){1.0, 0.0}, embedded_point), FUTCACHE_OK);
+    bool novel = false;
+    TEST_STATUS(futcache_pack_observe(cache, embedded_point, &novel),
+                FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    futcache_pack_destroy(cache);
+    futcache_embed_destroy(embed);
+    return true;
+}
+
 int embed_test_suite(void)
 {
     static const test_case_t tests[] = {
@@ -511,6 +559,7 @@ int embed_test_suite(void)
         {"anchor generation integration", test_embed_anchor_generation},
         {"embedded pack validation", test_embed_pack_validate},
         {"high-dimensional 384D embedding", test_embed_high_dimensional},
+        {"certification and convenience bounds", test_embed_certification_and_convenience_bounds},
     };
     return run_test_cases("embed", tests, sizeof(tests) / sizeof(tests[0]));
 }

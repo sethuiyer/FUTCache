@@ -398,7 +398,7 @@ def nth_prime(i: int) -> int:
 
 
 def merge_persistence_diagrams(diagram_a: list, diagram_b: list) -> list:
-    """CRDT merge: union of two persistence diagrams (idempotent, commutative)."""
+    """Deterministic, idempotent join by stored feature signature."""
     return _merge_persistence_diagrams(diagram_a, diagram_b)
 
 
@@ -407,7 +407,7 @@ class PersistentNovelty:
 
     Maintains a merge tree (single-linkage dendrogram) over observed 1-D
     points. Supports scale-resolved novelty queries, prime-tagged
-    persistence diagrams, CRDT merge, and the Selberg zeta function.
+    persistence diagrams, signature joins, and a finite zeta-inspired diagnostic.
 
     Typical use:
 
@@ -417,7 +417,7 @@ class PersistentNovelty:
         eng.is_novel_at(0.55, 0.1)   # False (within 0.1 of 0.5)
         eng.novelty_spectrum(0.6)     # [0.0, 0.1]  (novel up to t=0.1)
         eng.copy_diagram()            # list of feature dicts
-        eng.selberg_zeta(2.0)         # Selberg zeta at s=2
+        eng.selberg_zeta(2.0)         # finite zeta-inspired diagnostic
     """
 
     def __init__(self):
@@ -451,7 +451,9 @@ class PersistentNovelty:
         return [dict(zip(keys, row)) for row in raw]
 
     def merge(self, other: "PersistentNovelty") -> list:
-        """CRDT merge: idempotent, commutative union of two diagrams.
+        """Idempotent, commutative join by stored feature signature.
+
+        This does not recompute persistence over the union of raw histories.
 
         Returns list of dicts with same structure as copy_diagram().
         """
@@ -461,7 +463,7 @@ class PersistentNovelty:
         return [dict(zip(keys, row)) for row in raw]
 
     def selberg_zeta(self, s: float) -> float:
-        """Selberg zeta function over prime-birth features."""
+        """Finite zeta-inspired product over prime-birth features."""
         return self._impl.selberg_zeta(s)
 
     def prime_cycle_count(self, tau: float = 0.0) -> int:
@@ -561,26 +563,30 @@ class AnchorEmbedding:
 
     Projects d-dimensional points into m-dimensional space where m =
     number of anchors. The distortion bound is 2*delta (delta = covering
-    radius of the anchor set). One-sidedness is preserved: if two points
+    radius of the anchor set). With a caller-supplied certified upper bound,
+    one-sidedness is preserved: if two points
     are at distance > epsilon in the original space, their embeddings are
     at distance > epsilon - 2*delta.
 
     Typical use:
 
         emb = AnchorEmbedding(dimension=384, anchors=[...], distance="cosine",
-                              domain_min=[-1]*384, domain_max=[1]*384)
+                              domain_min=[-1]*384, domain_max=[1]*384,
+                              covering_radius_upper_bound=0.1)
         embedded = emb.embed(point)   # m-dimensional vector
         eps_adj = emb.adjusted_epsilon(0.45)  # conservative epsilon
     """
 
     def __init__(self, dimension: int, anchors: list, distance: str = "linf",
-                 domain_min: list = None, domain_max: list = None):
+                 domain_min: list = None, domain_max: list = None,
+                 covering_radius_upper_bound: float = 0.0):
         if domain_min is None:
             domain_min = [-1.0] * dimension
         if domain_max is None:
             domain_max = [1.0] * dimension
         self._impl = _AnchorEmbeddingRaw(
-            dimension, anchors, distance, domain_min, domain_max)
+            dimension, anchors, distance, domain_min, domain_max,
+            covering_radius_upper_bound)
         self._dimension = dimension
 
     def embed(self, point: list) -> list:
@@ -589,7 +595,7 @@ class AnchorEmbedding:
 
     @property
     def covering_radius(self) -> float:
-        """Estimated covering radius delta (distortion = 2*delta)."""
+        """Certified bound when supplied; sampled lower estimate otherwise."""
         return self._impl.covering_radius()
 
     @property
@@ -601,7 +607,7 @@ class AnchorEmbedding:
         return self._dimension
 
     def adjusted_epsilon(self, epsilon: float) -> float:
-        """Conservative epsilon = epsilon - 2*delta (one-sidedness preserved)."""
+        """Conservative epsilon; requires a certified covering-radius bound."""
         return self._impl.adjusted_epsilon(epsilon)
 
     def __repr__(self):

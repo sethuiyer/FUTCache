@@ -682,7 +682,8 @@ public:
                     std::vector<double> anchors,
                     std::string distance,
                     std::vector<double> domain_min,
-                    std::vector<double> domain_max)
+                    std::vector<double> domain_max,
+                    double covering_radius_upper_bound)
         : dimension_(static_cast<size_t>(dimension)),
           distance_name_(distance) {
         if (dimension_ == 0U) {
@@ -719,6 +720,7 @@ public:
         cfg.distance_context = nullptr;
         cfg.domain_min = domain_min.data();
         cfg.domain_max = domain_max.data();
+        cfg.covering_radius_upper_bound = covering_radius_upper_bound;
 
         futcache_status_t st = futcache_embed_create(&cfg, &embed_);
         if (st != FUTCACHE_OK) {
@@ -1228,23 +1230,24 @@ NB_MODULE(futcache_ext, m) {
 
     nb::class_<AnchorEmbedding>(m, "AnchorEmbedding")
         .def(nb::init<int, std::vector<double>, std::string,
-                      std::vector<double>, std::vector<double>>(),
+                      std::vector<double>, std::vector<double>, double>(),
              nb::arg("dimension"),
              nb::arg("anchors"),
              nb::arg("distance") = std::string("linf"),
              nb::arg("domain_min"),
-             nb::arg("domain_max"))
+             nb::arg("domain_max"),
+             nb::arg("covering_radius_upper_bound") = 0.0)
         .def("embed", &AnchorEmbedding::embed, nb::arg("point"),
              "phi(x) = (d(x, a_1), ..., d(x, a_m)) — one coordinate per anchor.")
         .def("covering_radius", &AnchorEmbedding::covering_radius,
-             "Estimated covering radius delta (lower bound). Distortion is 2*delta.")
+             "Certified covering-radius bound when supplied; sampled estimate otherwise.")
         .def("anchor_count", &AnchorEmbedding::anchor_count,
              "Number of anchors (embedded dimension m).")
         .def("dimension", &AnchorEmbedding::dimension,
              "Original-space dimension d.")
         .def("adjusted_epsilon", &AnchorEmbedding::adjusted_epsilon,
              nb::arg("epsilon"),
-             "Conservative embedded epsilon = epsilon - 2*delta (no false positives at original epsilon).");
+             "Conservative embedded epsilon; requires a certified radius upper bound.");
 
     /* --- Submodular representative selection (Design Sketch 03) --- */
 
@@ -1385,7 +1388,7 @@ NB_MODULE(futcache_ext, m) {
              }
              return result;
          }, nb::arg("other"),
-             "CRDT merge: union of features (idempotent, commutative).")
+             "Deterministic feature-signature join (idempotent, commutative).")
         .def("selberg_zeta", &PersistentNovelty::selberg_zeta,
              nb::arg("s"))
         .def("prime_cycle_count", &PersistentNovelty::prime_cycle_count,
@@ -1408,7 +1411,7 @@ NB_MODULE(futcache_ext, m) {
         return (size_t)futcache_persist_nth_prime(i);
     }, nb::arg("i"), "Return the i-th prime (0-indexed). p_0=2, p_1=3, ...");
 
-    /* CRDT merge of two diagrams (free function) */
+    /* Deterministic signature join of two feature arrays (free function). */
     m.def("merge_persistence_diagrams",
           [](const std::vector<futcache_persist_feature_t> &a,
              const std::vector<futcache_persist_feature_t> &b) {
@@ -1426,7 +1429,7 @@ NB_MODULE(futcache_ext, m) {
               return out;
           },
           nb::arg("diagram_a"), nb::arg("diagram_b"),
-          "CRDT merge: union of two persistence diagrams.");
+          "Deterministic join of two persistence feature arrays by signature.");
 
     /* --- d-D persistent novelty (Design Sketch 01, Phase 3) --- */
     nb::class_<PersistentNoveltyND>(m, "PersistentNoveltyND")

@@ -7,6 +7,31 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct nd_allocator_context {
+    size_t remaining;
+    size_t active;
+} nd_allocator_context_t;
+
+static void *nd_allocate(void *opaque, size_t size)
+{
+    nd_allocator_context_t *context = opaque;
+    if (context->remaining == 0U) return NULL;
+    context->remaining--;
+    void *memory = malloc(size);
+    if (memory != NULL) context->active++;
+    return memory;
+}
+
+static void nd_deallocate(void *opaque, void *pointer)
+{
+    nd_allocator_context_t *context = opaque;
+    if (pointer != NULL) {
+        if (context->active == 0U) abort();
+        context->active--;
+        free(pointer);
+    }
+}
+
 /* ============================================================
  * d-D Persistent Packing tests (Design Sketch 01, Phase 3)
  * ============================================================ */
@@ -330,7 +355,7 @@ static bool test_nd_differential(void)
             bool expected_novel = true;
             for (size_t oi = 0; oi < n_obs; ++oi) {
                 double d = test_l2(queries[qi], obs[oi], 3, NULL);
-                if (d <= scales[si] + 1e-12) {
+                if (d <= scales[si]) {
                     expected_novel = false;
                     break;
                 }
@@ -529,7 +554,7 @@ static bool test_nd_randomized(void)
         bool expected_novel = true;
         for (int i = 0; i < 10; ++i) {
             double d = test_l2(q, obs[i], 2, NULL);
-            if (d <= qt + 1e-12) {
+            if (d <= qt) {
                 expected_novel = false;
                 break;
             }
@@ -549,6 +574,82 @@ static bool test_nd_randomized(void)
     return true;
 }
 
+static bool test_nd_full_history_and_exact_boundaries(void)
+{
+    double lo[1] = {-10.0};
+    double hi[1] = {10.0};
+    futcache_persist_nd_t *eng = NULL;
+    bool novel = false;
+    TEST_STATUS(futcache_persist_nd_create(
+        1, 1.0, test_l2, NULL, lo, hi, 0U, NULL, &eng), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_nd_observe(
+        eng, (const double[]){0.0}, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    TEST_STATUS(futcache_persist_nd_observe(
+        eng, (const double[]){0.9}, &novel), FUTCACHE_OK);
+    TEST_ASSERT(!novel);
+    TEST_STATUS(futcache_persist_nd_is_novel_at(
+        eng, (const double[]){1.8}, 1.0, &novel), FUTCACHE_OK);
+    TEST_ASSERT(!novel);
+    futcache_persist_nd_destroy(eng);
+
+    lo[0] = -1.0;
+    hi[0] = 1.0;
+    TEST_STATUS(futcache_persist_nd_create(
+        1, 0.0, test_l2, NULL, lo, hi, 0U, NULL, &eng), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_nd_observe(
+        eng, (const double[]){0.0}, &novel), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_nd_is_novel_at(
+        eng, (const double[]){5e-13}, 0.0, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    TEST_STATUS(futcache_persist_nd_is_novel_at(
+        eng, (const double[]){NAN}, 0.0, &novel),
+        FUTCACHE_ERROR_OUT_OF_RANGE);
+    futcache_persist_nd_destroy(eng);
+    return true;
+}
+
+static bool test_nd_memory_limit_is_enforced(void)
+{
+    double lo[1] = {-1.0};
+    double hi[1] = {1.0};
+    futcache_persist_nd_t *eng = NULL;
+    TEST_STATUS(futcache_persist_nd_create(
+        1, 0.1, test_l2, NULL, lo, hi, 1U, NULL, &eng),
+        FUTCACHE_ERROR_OUT_OF_MEMORY);
+    TEST_ASSERT(eng == NULL);
+    return true;
+}
+
+static bool test_nd_allocation_failure_is_atomic(void)
+{
+    double lo[1] = {-1.0};
+    double hi[1] = {1.0};
+    nd_allocator_context_t context = {32U, 0U};
+    futcache_allocator_t allocator = {nd_allocate, nd_deallocate, &context};
+    futcache_persist_nd_t *eng = NULL;
+    TEST_STATUS(futcache_persist_nd_create(
+        1, 0.1, test_l2, NULL, lo, hi, 0U, &allocator, &eng), FUTCACHE_OK);
+    size_t active_before = context.active;
+    context.remaining = 3U;
+    bool novel = false;
+    TEST_STATUS(futcache_persist_nd_observe(
+        eng, (const double[]){0.0}, &novel), FUTCACHE_ERROR_OUT_OF_MEMORY);
+    TEST_ASSERT(context.active == active_before);
+    futcache_persist_nd_stats_t stats;
+    TEST_STATUS(futcache_persist_nd_get_stats(eng, &stats), FUTCACHE_OK);
+    TEST_ASSERT(stats.observations == 0U && stats.rep_count == 0U);
+    TEST_STATUS(futcache_persist_nd_validate(eng), FUTCACHE_OK);
+
+    context.remaining = 16U;
+    TEST_STATUS(futcache_persist_nd_observe(
+        eng, (const double[]){0.0}, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    futcache_persist_nd_destroy(eng);
+    TEST_ASSERT(context.active == 0U);
+    return true;
+}
+
 int persist_nd_test_suite(void)
 {
     static const test_case_t tests[] = {
@@ -562,6 +663,9 @@ int persist_nd_test_suite(void)
         {"clear and reuse", test_nd_clear},
         {"prime birth tracking", test_nd_prime_births},
         {"randomized differential (50 trials, 2-D L2)", test_nd_randomized},
+        {"full history and exact boundaries", test_nd_full_history_and_exact_boundaries},
+        {"memory limit is enforced", test_nd_memory_limit_is_enforced},
+        {"allocation failure is atomic", test_nd_allocation_failure_is_atomic},
     };
     return run_test_cases("persist_nd", tests,
                           sizeof(tests) / sizeof(tests[0]));

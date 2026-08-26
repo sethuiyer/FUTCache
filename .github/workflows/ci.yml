@@ -73,7 +73,7 @@ jobs:
           TSAN_OPTIONS: ${{ matrix.tsan_options }}
         run: ctest --test-dir build --output-on-failure
 
-  # Python bindings: build the v1.3.0 wheel and run the adaptive tests.
+  # Python bindings: build the current wheel and run the Python tests.
   python:
     name: Python bindings (pytest)
     runs-on: ubuntu-latest

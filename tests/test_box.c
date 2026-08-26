@@ -191,12 +191,14 @@ static bool test_box_validate_telemetry(void)
     TEST_ASSERT(novel);
     TEST_STATUS(futcache_box_observe(cache, second, &novel), FUTCACHE_OK);
     TEST_ASSERT(novel);
-    /* covered lies inside the first box; redundant, no new box. */
+    /* The centre is redundant, but its box is retained because it can extend
+     * the exact full-history union in other configurations. */
     TEST_STATUS(futcache_box_observe(cache, covered, &novel), FUTCACHE_OK);
     TEST_ASSERT(!novel);
     TEST_STATUS(futcache_box_validate(cache), FUTCACHE_OK);
 
     TEST_STATUS(futcache_box_get_stats(cache, &stats), FUTCACHE_OK);
+    TEST_ASSERT(stats.box_count == 3U && stats.novel_observations == 2U);
     uint64_t generation_before = stats.generation;
     TEST_STATUS(futcache_box_clear(cache), FUTCACHE_OK);
     TEST_STATUS(futcache_box_get_stats(cache, &stats), FUTCACHE_OK);
@@ -210,6 +212,34 @@ static bool test_box_validate_telemetry(void)
     return true;
 }
 
+static bool test_box_redundant_centres_extend_union(void)
+{
+    double lower[] = {-10.0};
+    double upper[] = {10.0};
+    futcache_box_config_t config;
+    futcache_box_t *cache = NULL;
+    bool novel = false;
+
+    futcache_box_config_init(&config);
+    config.dimension = 1U;
+    config.epsilon = 1.0;
+    config.domain_min = lower;
+    config.domain_max = upper;
+    TEST_STATUS(futcache_box_create(&config, &cache), FUTCACHE_OK);
+    TEST_STATUS(futcache_box_observe(cache, (const double[]){0.0}, &novel),
+                FUTCACHE_OK);
+    TEST_ASSERT(novel);
+    TEST_STATUS(futcache_box_observe(cache, (const double[]){0.9}, &novel),
+                FUTCACHE_OK);
+    TEST_ASSERT(!novel);
+    TEST_STATUS(futcache_box_is_novel(cache, (const double[]){1.8}, &novel),
+                FUTCACHE_OK);
+    TEST_ASSERT(!novel);
+    TEST_STATUS(futcache_box_validate(cache), FUTCACHE_OK);
+    futcache_box_destroy(cache);
+    return true;
+}
+
 int box_test_suite(void)
 {
     static const test_case_t tests[] = {
@@ -217,7 +247,8 @@ int box_test_suite(void)
         {"exact hand-checked L_inf union", test_box_hand_checked_union},
         {"domain validation and query purity", test_box_domain_and_query_purity},
         {"allocation failure atomicity", test_box_allocation_failure_atomicity},
-        {"telemetry and containment validation", test_box_validate_telemetry}
+        {"telemetry and containment validation", test_box_validate_telemetry},
+        {"redundant centres extend exact union", test_box_redundant_centres_extend_union}
     };
     return run_test_cases("box", tests, sizeof(tests) / sizeof(tests[0]));
 }

@@ -94,7 +94,7 @@ uint64_t futcache_persist_prime_mod(size_t i)
     return p % FUTCACHE_PERSIST_PRIME_MODULUS;
 }
 
-/* Is observation index i a "prime index"?
+/* Is sorted-point index i a "prime index"?
  * Index 0 -> p_0 = 2 (prime), 1 -> p_1 = 3 (prime), etc.
  * Every index maps to a prime, so every index is "prime".
  *
@@ -106,7 +106,7 @@ uint64_t futcache_persist_prime_mod(size_t i)
  * being at the "outermost" level of the dendrogram.
  *
  * For simplicity, we define: a feature is a "prime cycle" if its
- * birth observation index (0-based) is a prime number.
+ * birth sorted-point index (0-based) is a prime number.
  * Index 0 -> not prime (0 is not prime)
  * Index 1 -> not prime (1 is not prime)
  * Index 2 -> prime
@@ -160,6 +160,7 @@ struct futcache_persist {
     size_t sorted_count;
 
     uint64_t observations;
+    size_t max_features;
 
     futcache_allocator_t allocator;
 };
@@ -214,7 +215,7 @@ static int gap_compare(const void *a, const void *b)
  * For the persistence diagram in 1-D:
  *   - Each of the n-1 gaps produces one persistent feature.
  *   - Feature i has birth = 0 (the component appears at t=0) and
- *     death = gap_i (the component dies when the gap closes).
+ *     death = gap_i / 2 (radius-t balls meet halfway across the gap).
  *   - The "birth_obs" is the index of the left point in the gap.
  *   - The "death_obs" is the index of the right point in the gap.
  *
@@ -223,13 +224,13 @@ static int gap_compare(const void *a, const void *b)
  *   - Internal nodes are created in order of increasing gap.
  *   - Each internal node merges the two components adjacent to the gap.
  */
-static void rebuild_merge_tree(futcache_persist_t *engine)
+static futcache_status_t rebuild_merge_tree_inplace(futcache_persist_t *engine)
 {
     size_t n = engine->point_count;
     if (n == 0) {
         engine->node_count = 0;
         engine->feature_count = 0;
-        return;
+        return FUTCACHE_OK;
     }
 
     /* Sort points (for the sorted array and merge tree). */
@@ -237,7 +238,7 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
         size_t new_cap = n < 64 ? 64 : n * 2;
         double *new_sp = (double *)engine->allocator.allocate(
             engine->allocator.context, new_cap * sizeof(double));
-        if (new_sp == NULL) return; /* OOM: keep old state */
+        if (new_sp == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
         if (engine->sorted_count > 0) {
             memcpy(new_sp, engine->sorted_points,
                    engine->sorted_count * sizeof(double));
@@ -279,7 +280,7 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
      * For the persistence diagram, we don't actually need the full
      * merge tree structure — we just need the (birth, death) pairs.
      * In 1-D, the persistence diagram is simply:
-     *   - For each gap i (sorted by width): (0, gap_width_i)
+     *   - For each gap i (sorted by width): (0, gap_width_i / 2)
      *   - The last component (root) has death = INFINITY.
      *
      * But for the merge tree structure (needed for validate and
@@ -293,7 +294,7 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
             futcache_persist_node_t *new_nodes =
                 (futcache_persist_node_t *)engine->allocator.allocate(
                     engine->allocator.context, new_cap * sizeof(futcache_persist_node_t));
-            if (new_nodes == NULL) return;
+            if (new_nodes == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
             engine->allocator.deallocate(engine->allocator.context, engine->nodes);
             engine->nodes = new_nodes;
             engine->node_capacity = new_cap;
@@ -311,7 +312,7 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
         node->is_leaf = true;
         engine->node_count = 1;
         engine->feature_count = 0;
-        return;
+        return FUTCACHE_OK;
     }
 
     /* Need 2n-1 nodes. */
@@ -321,7 +322,7 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
         futcache_persist_node_t *new_nodes =
             (futcache_persist_node_t *)engine->allocator.allocate(
                 engine->allocator.context, new_cap * sizeof(futcache_persist_node_t));
-        if (new_nodes == NULL) return;
+        if (new_nodes == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
         engine->allocator.deallocate(engine->allocator.context, engine->nodes);
         engine->nodes = new_nodes;
         engine->node_capacity = new_cap;
@@ -345,7 +346,7 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
     /* Compute gaps. */
     size_t n_gaps = n - 1;
     gap_entry_t *gaps = (gap_entry_t *)malloc(n_gaps * sizeof(gap_entry_t));
-    if (gaps == NULL) return; /* OOM */
+    if (gaps == NULL) return FUTCACHE_ERROR_OUT_OF_MEMORY;
 
     for (size_t i = 0; i < n_gaps; ++i) {
         gaps[i].gap = engine->sorted_points[i + 1] - engine->sorted_points[i];
@@ -364,10 +365,10 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
      *
      * For each gap (in order of increasing width), we merge the two
      * components on either side of the gap. The new component gets
-     * an internal node with death_scale = gap width.
+     * an internal node with death_scale = half the gap width.
      */
     int32_t *comp = (int32_t *)malloc(n * sizeof(int32_t));
-    if (comp == NULL) { free(gaps); return; }
+    if (comp == NULL) { free(gaps); return FUTCACHE_ERROR_OUT_OF_MEMORY; }
 
     for (size_t i = 0; i < n; ++i) comp[i] = (int32_t)i;
 
@@ -377,7 +378,7 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
     int32_t *comp_right = (int32_t *)malloc((2 * n) * sizeof(int32_t));
     if (comp_left == NULL || comp_right == NULL) {
         free(gaps); free(comp); free(comp_left); free(comp_right);
-        return;
+        return FUTCACHE_ERROR_OUT_OF_MEMORY;
     }
     for (size_t i = 0; i < n; ++i) {
         comp_left[i] = (int32_t)i;
@@ -444,8 +445,8 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
      *
      * For internal node k (node index n + k, where k = 0..n-2):
      *   - birth = 0 (the component exists from t=0)
-     *   - death = the gap width at which this merge happened
-     *   - persistence = death - birth = gap width
+     *   - death = half the gap width at which the radius-t balls meet
+     *   - persistence = death - birth = gap width / 2
      *
      * The gap width for the k-th merge (in sorted order) is
      * gaps[k].gap after sorting.
@@ -467,7 +468,7 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
                     new_cap * sizeof(futcache_persist_feature_t));
             if (new_feats == NULL) {
                 free(gaps); free(comp); free(comp_left); free(comp_right);
-                return;
+                return FUTCACHE_ERROR_OUT_OF_MEMORY;
             }
             engine->allocator.deallocate(engine->allocator.context,
                                          engine->features);
@@ -485,10 +486,10 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
              * right child... no, it's the gap at the merge point.
              *
              * Actually, the death_scale of the internal node is the
-             * gap width at which the merge happened. We stored this
+             * filtration scale at which the merge happened. We stored this
              * during the merge. But we set death_scale = INFINITY for
              * all internal nodes initially. Let me fix this: the
-             * death_scale should be set to the gap width during the
+             * death_scale should be set to half the gap width during the
              * merge. */
 
             /* For now, compute the persistence from the gap array.
@@ -509,9 +510,9 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
             f->birth_value = lc->lo;
             f->death_value = (lc->hi + rc->lo) / 2.0; /* midpoint of gap */
 
-            /* Persistence: the gap width.
-             * The gap between lc->hi and rc->lo. */
-            f->persistence = rc->lo - lc->hi;
+            /* Radius-t balls around adjacent components meet at the gap
+             * midpoint, so the filtration death scale is half the gap. */
+            f->persistence = (rc->lo - lc->hi) / 2.0;
 
             /* Also update the node's death_scale. */
             node->death_scale = f->persistence;
@@ -526,6 +527,46 @@ static void rebuild_merge_tree(futcache_persist_t *engine)
     free(comp);
     free(comp_left);
     free(comp_right);
+    return FUTCACHE_OK;
+}
+
+/* Build all derived state off to the side, then publish it in one commit.
+ * This keeps observe failure-atomic even when a custom allocator fails at any
+ * tree/diagram allocation site. */
+static futcache_status_t rebuild_merge_tree(futcache_persist_t *engine)
+{
+    futcache_persist_t next = *engine;
+    next.nodes = NULL;
+    next.node_count = 0U;
+    next.node_capacity = 0U;
+    next.features = NULL;
+    next.feature_count = 0U;
+    next.feature_capacity = 0U;
+    next.sorted_points = NULL;
+    next.sorted_count = 0U;
+
+    futcache_status_t status = rebuild_merge_tree_inplace(&next);
+    if (status != FUTCACHE_OK) {
+        engine->allocator.deallocate(engine->allocator.context, next.nodes);
+        engine->allocator.deallocate(engine->allocator.context, next.features);
+        engine->allocator.deallocate(engine->allocator.context,
+                                     next.sorted_points);
+        return status;
+    }
+
+    engine->allocator.deallocate(engine->allocator.context, engine->nodes);
+    engine->allocator.deallocate(engine->allocator.context, engine->features);
+    engine->allocator.deallocate(engine->allocator.context,
+                                 engine->sorted_points);
+    engine->nodes = next.nodes;
+    engine->node_count = next.node_count;
+    engine->node_capacity = next.node_capacity;
+    engine->features = next.features;
+    engine->feature_count = next.feature_count;
+    engine->feature_capacity = next.feature_capacity;
+    engine->sorted_points = next.sorted_points;
+    engine->sorted_count = next.sorted_count;
+    return FUTCACHE_OK;
 }
 
 /* ============================================================
@@ -550,6 +591,7 @@ futcache_status_t futcache_persist_create(
 
     memset(engine, 0, sizeof(*engine));
     engine->allocator = allocator;
+    engine->max_features = config->max_features;
 
     *out_engine = engine;
     return FUTCACHE_OK;
@@ -575,6 +617,11 @@ futcache_status_t futcache_persist_observe(futcache_persist_t *engine, double x)
     if (engine == NULL || !isfinite(x))
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
 
+    if (engine->max_features != 0U &&
+        engine->point_count > engine->max_features) {
+        return FUTCACHE_ERROR_OUT_OF_RANGE;
+    }
+
     /* Grow the points array. */
     if (engine->point_count >= engine->point_capacity) {
         size_t new_cap = engine->point_capacity == 0 ? 16 : engine->point_capacity * 2;
@@ -589,9 +636,12 @@ futcache_status_t futcache_persist_observe(futcache_persist_t *engine, double x)
     }
 
     engine->points[engine->point_count++] = x;
+    futcache_status_t status = rebuild_merge_tree(engine);
+    if (status != FUTCACHE_OK) {
+        engine->point_count--;
+        return status;
+    }
     engine->observations++;
-
-    rebuild_merge_tree(engine);
     return FUTCACHE_OK;
 }
 
@@ -602,7 +652,8 @@ futcache_status_t futcache_persist_observe(futcache_persist_t *engine, double x)
 futcache_status_t futcache_persist_is_novel_at(
     const futcache_persist_t *engine, double x, double t, bool *out_is_novel)
 {
-    if (engine == NULL || out_is_novel == NULL || !isfinite(t) || t < 0.0)
+    if (engine == NULL || out_is_novel == NULL || !isfinite(x) ||
+        !isfinite(t) || t < 0.0)
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
     *out_is_novel = false;
 
@@ -636,7 +687,7 @@ futcache_status_t futcache_persist_is_novel_at(
         if (d < min_dist) min_dist = d;
     }
 
-    *out_is_novel = (min_dist > t + 1e-12);
+    *out_is_novel = (min_dist > t);
     return FUTCACHE_OK;
 }
 
@@ -648,7 +699,7 @@ futcache_status_t futcache_persist_novelty_spectrum(
     const futcache_persist_t *engine, double x, double *out_intervals,
     size_t *inout_count)
 {
-    if (engine == NULL || inout_count == NULL)
+    if (engine == NULL || inout_count == NULL || !isfinite(x))
         return FUTCACHE_ERROR_INVALID_ARGUMENT;
 
     size_t required = 1;
@@ -690,7 +741,7 @@ futcache_status_t futcache_persist_novelty_spectrum(
         if (d < min_dist) min_dist = d;
     }
 
-    if (min_dist <= 1e-12) {
+    if (min_dist == 0.0) {
         *inout_count = 0;
     } else {
         out_intervals[0] = 0.0;
@@ -841,20 +892,17 @@ futcache_status_t futcache_persist_validate(const futcache_persist_t *engine)
 }
 
 /* ============================================================
- * futcache_persist_merge_features (CRDT)
+ * futcache_persist_merge_features (deterministic signature join)
  * ============================================================ */
-
-static uint64_t feature_signature(const futcache_persist_feature_t *f)
-{
-    /* Combine birth_prime and death_prime into a single signature.
-     * Using a simple hash: XOR with a rotation. */
-    return f->birth_prime ^ (f->death_prime << 1);
-}
 
 static int feature_compare(const void *a, const void *b)
 {
     const futcache_persist_feature_t *fa = (const futcache_persist_feature_t *)a;
     const futcache_persist_feature_t *fb = (const futcache_persist_feature_t *)b;
+    if (fa->birth_prime < fb->birth_prime) return -1;
+    if (fa->birth_prime > fb->birth_prime) return 1;
+    if (fa->death_prime < fb->death_prime) return -1;
+    if (fa->death_prime > fb->death_prime) return 1;
     if (fa->birth < fb->birth) return -1;
     if (fa->birth > fb->birth) return 1;
     if (fa->death < fb->death) return -1;
@@ -898,7 +946,8 @@ futcache_status_t futcache_persist_merge_features(
     for (size_t j = 0; j < a_count; ++j) out[i++] = a[j];
     for (size_t j = 0; j < b_count; ++j) out[i++] = b[j];
 
-    /* Sort by (birth, death, persistence). */
+    /* Sort by signature first so even modular-collision groups are
+     * contiguous, then use full fields for deterministic output. */
     qsort(out, total, sizeof(futcache_persist_feature_t), feature_compare);
 
     /* Dedup: walk through sorted array, keep one feature per signature.
@@ -908,9 +957,10 @@ futcache_status_t futcache_persist_merge_features(
         if (write == 0) {
             out[write++] = out[j];
         } else {
-            uint64_t prev_sig = feature_signature(&out[write - 1]);
-            uint64_t cur_sig = feature_signature(&out[j]);
-            if (prev_sig != cur_sig) {
+            bool same_signature =
+                out[write - 1].birth_prime == out[j].birth_prime &&
+                out[write - 1].death_prime == out[j].death_prime;
+            if (!same_signature) {
                 out[write++] = out[j];
             } else {
                 /* Same signature: keep the one with larger persistence. */
@@ -947,13 +997,10 @@ futcache_status_t futcache_persist_selberg_zeta(
         double p = f->persistence;
         if (p <= 0.0) continue;
 
-        /* Z(s) *= (1 - p^{-s})^{-1} = 1 / (1 - p^{-s}) */
-        /* Z(s) *= (1 - p^{-s})^{-1}.
-         * Only include features with p > 0 to avoid division by zero.
-         * Features with p <= 1 give N^{-s} >= 1, making the factor negative
-         * or infinite — this is mathematically valid (Selberg zeta can be
-         * negative) but we skip p == 0 to avoid singularity. */
-        double term = pow(p, -s);
+        /* Use N = 1 + persistence so every finite factor has N > 1.
+         * Using persistence directly makes the advertised positive product
+         * singular at p=1 and negative for 0<p<1. */
+        double term = pow(1.0 + p, -s);
         double denom = 1.0 - term;
         if (fabs(denom) < 1e-300) {
             zeta = INFINITY;

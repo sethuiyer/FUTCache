@@ -56,7 +56,7 @@ Do **not** use it for:
 
 Quick intuition: **`pack`** is the default for embeddings and multi-D.
 **`futcache`** is the exact 1-D union with a genuine minimal representation.
-**`box`** is exact but can grow bloaty (one box per novel point). **`crdt`**
+**`box`** is exact but can grow bloaty (one box per observation). **`crdt`**
 trades recall for mergeability across nodes.
 
 ---

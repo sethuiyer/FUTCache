@@ -1,21 +1,16 @@
 # Design Sketch 01 — Persistent Novelty (Multi-Resolution Filtration)
-## Prime-Tagged Persistence Diagrams and the Selberg Trace Connection
+## Prime-Tagged Persistence Diagrams and a Zeta-Inspired Diagnostic
 
 ## Status
 
 **Design sketch (Phase 3 proposal).** This document formalizes the
-persistent novelty engine and introduces the **prime-tagged persistence
-diagram** — a CRDT-mergeable, cycle-aware encoding of the novelty
-landscape that connects to the Selberg trace formula.
+persistent novelty engine and introduces a **prime-tagged persistence
+diagram** plus an exploratory finite product over selected features.
 
-The key insight: **primes are novel by definition**. Each prime is
-"first of its kind" (not a product of smaller integers). The Prime
-Number Theorem (π(x) ~ x/ln x) gives the decay rate of novelty in a
-bounded domain. The Selberg trace formula dualizes the persistence
-diagram (spectral data) to the eviction cycle structure (geometric
-data), revealing that the **prime eviction cycles** are the genuinely
-novel patterns — and the bad actor can optimize their strategy to
-maximize the prime cycle count.
+The persistence construction is implemented. The prime tagging and finite
+product are application-defined diagnostics. They are not consequences of
+the Prime Number Theorem or Selberg trace formula, and no theorem currently
+connects them to cache eviction dynamics.
 
 ---
 
@@ -33,66 +28,50 @@ Generalize to a **one-parameter family** of unions:
 
     U_t(H) = ⋃_{y ∈ H} B̄(y, t)       for t ∈ [0, ∞)
 
-As t increases from 0, each ball grows, and the union U_t(H) changes in two
-ways:
-
-- **Birth events**: a new isolated ball appears (first observation of a
-  previously empty region).
-- **Death (merge) events**: two previously disjoint covered regions become
-  connected when their ε-balls overlap at threshold t.
+At `t=0`, each distinct observed location starts a connected component. As
+`t` increases, the balls grow and components merge. In one dimension,
+points separated by a gap `g` merge at `t=g/2`.
 
 This is exactly a **sublevel-set filtration** of the distance function
-ρ_H(x) = min_{y∈H} d(x, y). The connected components of the complement
-K \ U_t (the "novelty regions") form a **persistence module** over the
-category of vector spaces (or, for the Boolean version, a merge tree).
+ρ_H(x) = min_{y∈H} d(x, y). The zero-dimensional homology of the sublevel
+sets `U_t` forms the persistence module represented by the merge tree.
 
 ### 1.2 The Persistence Diagram
 
-Each connected component of the novelty complement has a **birth time**
-b (the t at which it first appears as a separate component) and a **death
-time** d (the t at which it merges into another component or the entire
-domain becomes covered).
+Each connected component of `U_t` has a **birth time** `b` and a **death
+time** `d` when it merges into an older component. FUTCache stores the
+`n-1` finite zero-dimensional features and omits the final infinite class.
 
 The **persistence** is p = d − b. A point with large persistence is
 "genuinely new" at many scales; a point with small persistence is "new
 only at the finest scale" (a near-duplicate of something already seen).
 
-The **persistence diagram** is the multiset of (b, d) pairs. It is a
-complete invariant of the novelty landscape: two histories H and H' induce
-the same diagram iff U_t(H) and U_t(H') have the same topological type for
-all t.
+The **persistence diagram** is the multiset of `(b,d)` pairs. It summarizes
+component lifetimes but is not a complete invariant of the metric point set
+or of every geometric detail of the covered regions.
 
 ### 1.3 Prime-Tagged Persistence Diagrams
 
-**The prime insight.** Each observation at index `i` is mapped to the
-`i`-th prime `p_i`. A persistent feature with birth at observation `b` and
-death at observation `d` gets the **prime signature**:
+Each sorted-point index `i` is mapped to the `i`-th prime `p_i`. A finite
+feature stores the pair `(p_b mod M, p_d mod M)` as a compact deterministic
+signature. These indices are local to the sorted input, not globally unique
+observation identities. The resulting feature arrays:
 
-    sig(feature) = p_b × p_d        (if d < ∞)
-    sig(feature) = p_b              (if d = ∞, still alive)
-
-By the **Fundamental Theorem of Arithmetic**, two features have the same
-prime signature iff they have the same (birth, death) pair. This makes the
-persistence diagram a **set of prime-tagged features** that:
-
-1. **Merge idempotently**: The CRDT merge of two diagrams is the union of
-   their prime-tagged features. Two features with the same prime signature
-   are the same feature (idempotent join).
-2. **Are cycle-aware**: The prime signature detects whether an eviction
-   cycle is "prime" (irreducible) or "composite" (a repeated pattern).
-3. **Are spectral**: The Selberg zeta function of the eviction dynamics
-   can be computed from the prime-tagged diagram.
+1. **Merge idempotently by signature**: two features with the same stored
+   pair are treated as the same feature and the larger persistence wins.
+2. **Are compact labels**: the signature assists deterministic merging,
+   subject to local-index aliasing and modular collisions.
 
 **Bounded encoding.** The product p_b × p_d overflows for large indices.
 The bounded version stores:
 
     sig_bounded(feature) = (p_b mod M, p_d mod M)
 
-for a large modulus M (e.g., M = 2^61 − 1, a Mersenne prime). The
-collision probability is bounded by the prime gap: for b, d < 10^6, the
-primes are distinct mod M with probability ≥ 1 − 10^{-12}.
+for a large modulus M (e.g., M = 2^61 − 1, a Mersenne prime). Modulo
+reduction is deterministic, not probabilistic. Distinct primes below M stay
+distinct; sufficiently large observation indices can collide.
 
-### 1.4 The Selberg Trace Formula Connection
+### 1.4 Zeta analogy (speculative, not a trace formula)
 
 The **Selberg trace formula** is a duality between the **spectrum**
 (eigenvalues of the Laplacian on a compact Riemann surface) and the
@@ -100,7 +79,8 @@ The **Selberg trace formula** is a duality between the **spectrum**
 
     ∑_j h(λ_j) = (geometric terms) + (spectral terms)
 
-In the novelty context:
+FUTCache does not define a hyperbolic surface, Laplacian, primitive geodesic
+classes, or trace identity. The terms below are only a research analogy:
 
 - **Spectral side** = the persistence diagram (eigenvalues of the
   "novelty Laplacian" — the operator that maps a novelty region to its
@@ -108,21 +88,20 @@ In the novelty context:
 - **Geometric side** = the **eviction cycles** — the cyclic patterns of
   rep eviction and re-observation.
 
-The trace formula says: **the persistence diagram (spectral data) is in
-bijection with the eviction cycle structure (geometric data)**. This means:
+No proof establishes a bijection between persistence and eviction cycles.
+In particular, the current implementation does not establish that:
 
 1. The **spectrum of the eviction operator** (eigenvalues of the Poincaré
    map of the eviction dynamics) determines the persistence diagram.
 2. The **prime eviction cycles** (cycles whose length is prime) are the
    "novel" eviction patterns — they can't be decomposed into shorter cycles.
-3. The **Selberg zeta function** Z(s) = ∏_p (1 − N_p^{−s})^{−1} (product
-   over prime geodesics) encodes the full eviction dynamics. Its zeros are
-   the persistence diagram.
+3. The finite zeta-inspired product encodes eviction dynamics or has zeros
+   corresponding to the persistence diagram.
 
 **The Prime Geodesic Conjecture** (the analog of the Prime Number Theorem
 for closed geodesics) says: the number of prime cycles of length ≤ L is
-asymptotic to L/ln(L). This is exactly the decay rate of novelty in a
-bounded domain — the same 1/ln(x) decay as the Prime Number Theorem.
+asymptotic to L/ln(L). That theorem does not imply a 1/ln(x) novelty-decay
+law for this cache.
 
 ### 1.5 Stability
 
@@ -143,33 +122,28 @@ flip catastrophically. The persistent structure is robust.
    "this is a duplicate at scale 0.1 but novel at scale 0.5" — i.e., it's
    a paraphrase of something known but introduces a new subtopic.
 
-2. **CRDT-mergeable persistence.** The prime-tagged diagram merges
-   idempotently: the join of two diagrams is the union of their
-   prime-tagged features. This is a **join-semilattice** operation,
-   exactly like the existing CRDT engine.
+2. **Deterministic signature merge.** The prime-tagged feature arrays merge
+   idempotently under their signature rule. This does not compute the
+   persistence diagram of the union of two raw histories and should not be
+   confused with the coordinate-quantized CRDT cache.
 
-3. **Cycle-aware eviction.** The prime signature detects whether an
-   eviction cycle is "prime" (irreducible) or "composite" (a repeated
-   pattern). The bad actor can optimize their strategy to maximize the
-   prime cycle count — the genuinely novel re-discoveries.
+3. **Cycle labels are not inferred.** Prime birth indices do not establish
+   irreducible eviction cycles; a separate dynamical model would be needed.
 
-4. **Spectral novelty.** The Selberg zeta function of the eviction
-   dynamics can be computed from the prime-tagged diagram. Its zeros give
-   the **persistence spectrum** — the eigenvalues that determine how
-   "novel" a new observation is, across all scales.
+4. **No spectral claim.** The finite product is a diagnostic only; its zeros
+   are not known to be a persistence spectrum.
 
-5. **Principled eviction.** Evicting low-persistence features is provably
-   the least-destructive eviction: you're removing the features that
-   contribute the least to the novelty landscape.
+5. **Persistence eviction is heuristic.** Removing low-persistence features
+   is plausible but is not proved globally least-destructive.
 
 ---
 
-## 3. The Bad Actor's Optimal Strategy
+## 3. Speculative adversarial model
 
 The bad actor wants to maximize the number of "prime eviction cycles" —
 the irreducible cycles that look "novel" to the advertiser.
 
-**Theorem (Prime Cycle Count).** The number of prime eviction cycles of
+**Unproved hypothesis (prime cycle count).** The number of proposed cycles of
 length ≤ L in a FUTCache with W1 eviction is asymptotic to L/ln(L) as
 L → ∞, assuming the eviction dynamics are ergodic.
 
@@ -209,11 +183,10 @@ the number of prime cycles.
 - `evict_below(tau)` replaces FIFO eviction.
 - ~400 lines of C, ~400 lines of tests.
 
-**Phase 4: Selberg zeta function.**
-- Implement the Selberg zeta function Z(s) from the prime-tagged diagram.
-- Compute the persistence spectrum (zeros of Z(s)).
-- Tests: verify the trace formula in 1-D (exact); verify the prime cycle
-  count in 1-D (asymptotic).
+**Phase 4: finite zeta-inspired diagnostic.**
+- Implement the application-defined product from prime-birth features.
+- Do not interpret its zeros spectrally without a separate theorem.
+- Tests cover numerical behavior only, not a Selberg trace formula.
 - ~300 lines of C, ~200 lines of tests.
 
 **Phase 5: Python bindings + demos.**
@@ -227,16 +200,12 @@ the number of prime cycles.
 
 ## 5. Open Questions
 
-1. **Is the W1 eviction map ergodic?** The Prime Geodesic Conjecture
-   requires the dynamics to be ergodic. For W1 eviction on a bounded
-   domain with a well-separated cluster structure, the dynamics are
-   likely ergodic, but a proof is needed.
+1. **Can an appropriate dynamical system be defined?** Ergodicity is not
+   currently established for W1 eviction.
 
-2. **What is the "novelty Laplacian"?** The Selberg trace formula
-   requires a Laplacian operator. In the novelty context, the natural
-   candidate is the **graph Laplacian** of the rep adjacency graph (reps
-   are adjacent if their ε-balls overlap). The eigenvalues of this
-   Laplacian are the "persistence spectrum."
+2. **Can a legitimate spectral construction be defined?** A graph
+   Laplacian can be studied, but its eigenvalues are not automatically the
+   persistence diagram and do not establish a Selberg trace formula.
 
 3. **How does the prime signature interact with adaptive radii?** The
    current `observe_with_radius` API gives each representative its own
@@ -245,9 +214,8 @@ the number of prime cycles.
    times. The prime signature must be generalized to handle non-uniform
    birth times.
 
-4. **What is the CRDT merge law for prime-tagged diagrams?** The join of
-   two prime-tagged diagrams is the union of their features, but
-   conflicts (two features with the same prime signature but different
-   centers) must be resolved. The natural resolution is by **priority**
-   (the feature with the higher priority wins), exactly like the existing
-   CRDT engine.
+4. **Can distributed histories produce a true global diagram?** The current
+   join only combines local feature signatures; it cannot reconstruct the
+   persistence of the union of raw points. A genuine distributed design
+   needs stable observation identities, a history merge law, and diagram
+   recomputation or an equivalent sufficient statistic.

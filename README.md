@@ -6,7 +6,7 @@
 
 **FUTCache is a metric visited-set.** It remembers which *regions* of a
 metric space you've already explored, so it can tell you when a point is
-genuinely new. C11 core, Python bindings, zero dependencies.
+genuinely new. C11 core with no third-party runtime library, plus Python bindings.
 
 ---
 
@@ -98,10 +98,10 @@ want to know which are genuinely new:
 | Property | What it means for you |
 |---|---|
 | **One-sided** | Never calls a genuinely new point "old." On the boundary it may still call a point *novel* — conservative, never swallows outliers. |
-| **Bounded memory** | Memory follows the *geometric size* of your space at scale `ε`, not how long the process has been running. Optional hard byte ceiling (`max_memory_bytes`). |
-| **Crash-safe** | Snapshots are versioned and CRC32-protected; corrupt, truncated, or out-of-domain input is rejected. |
+| **Bounded pack state** | The packing engine follows geometric size at scale `ε` and supports a hard byte ceiling. Exact full-history engines can grow with observations. |
+| **Validated snapshots** | The interval and pack snapshot formats are versioned and CRC32-protected; corrupt, truncated, or out-of-domain input is rejected. |
 | **Any metric** | L∞, L1, L2, cosine, Poincaré, or a custom C distance function. Python bindings expose the named metrics only. |
-| **Exact & verified** | Differential-verified against brute-force oracles. 126 C tests, ASan clean. |
+| **Verified contracts** | Exact engines and one-sided engines use matching brute-force oracles. 134 C test cases currently pass locally. |
 
 ---
 
@@ -123,8 +123,8 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Requirements: a C11 compiler (GCC 9+, Clang 10+, or MSVC), CMake 3.16+,
-POSIX threads.
+Requirements: a POSIX C11 environment with GCC 9+ or Clang 10+, CMake 3.16+,
+and pthreads.
 
 #### Build options
 
@@ -317,7 +317,7 @@ caller uses them explicitly.
 | **Packing cache** | `<futcache/pack.h>` | d-D | Generalized packing cache for arbitrary metric spaces. VP-tree or linear backend. FIFO pressure eviction; opt-in W1 API. |
 | **Box cache** | `<futcache/box.h>` | 1–8 D | Exact axis-aligned L∞ box-union cache for full d-D coverage. |
 | **CRDT cache** | `<futcache/crdt.h>` | d-D | Gossip-mergeable cache with deterministic Voronoi quantization. Replicas converge without coordination. |
-| **Persistent novelty** | `<futcache/persist.h>` | 1-D | Single-linkage merge tree. Multi-scale novelty, persistence diagrams, prime-tagged CRDT merge, Selberg zeta. |
+| **Persistent novelty** | `<futcache/persist.h>` | 1-D | Single-linkage merge tree, multi-scale novelty, persistence diagrams, prime-tagged merge, and a finite zeta-inspired diagnostic. |
 | **d-D persistent packing** | `<futcache/persist_nd.h>` | d-D | Per-representative birth/death tracking with persistence-based eviction. |
 | **Submodular selection** | `<futcache/select.h>` | d-D | Greedy max-coverage rep selection (1−1/e guarantee). Streaming evict-worst. |
 | **Anchor embedding** | `<futcache/embed.h>` | d→m | Distance-to-anchors projection with bounded distortion (2δ). Conservative ε adjustment. |
@@ -397,10 +397,10 @@ Single-linkage merge tree over observed points. Provides:
   distance to the nearest observation (`[]` if `x` was observed)
 - **`evict_below(τ)`**: drop low-persistence rows from the stored
   *diagram only* — the merge tree and observations are unchanged
-- **`selberg_zeta(s)`**: product over features whose birth *index* is
-  prime: `∏ (1 − p^{-s})^{-1}`
-- **CRDT merge**: `futcache_persist_merge_features` — prime-tagged
-  diagram union (idempotent, commutative)
+- **`selberg_zeta(s)`**: finite zeta-inspired product over features whose
+  sorted birth index is prime: `∏ (1 − (1 + persistence)^{-s})^{-1}`
+- **Signature merge**: `futcache_persist_merge_features` — deterministic,
+  idempotent feature join; not raw-history persistence recomputation
 - **`copy_diagram`**: full (birth, death, persistence) export
 
 ### d-D persistent packing
@@ -417,7 +417,7 @@ Per-representative nearest-neighbor tracking with:
 
 Max-coverage rep selection with the **(1 − 1/e) approximation guarantee**:
 
-- **`select_max_coverage`**: lazy greedy with lexicographic tie-breaking.
+- **`select_max_coverage`**: direct greedy with lexicographic tie-breaking.
   Brute-force optimal for `n ≤ 16` (verification).
 - **`select_evict_worst`**: streaming swap — find the rep whose removal
   causes the largest coverage loss.
@@ -432,9 +432,10 @@ distance-to-anchors space:
 embed(x) = [d(x, a_1), d(x, a_2), ..., d(x, a_m)]
 ```
 
-- **Distortion bound**: `|d(x,y) − ‖φ(x)−φ(y)‖_∞| ≤ 2δ` where `δ` is
-  the covering radius of the anchor set and `φ` is the embedding
-- **Conservative ε**: `ε_embed = ε_orig − 2δ` preserves one-sidedness
+- **Distortion bound**: `|d(x,y) − ‖φ(x)−φ(y)‖_∞| ≤ 2δ` when `δ` is a
+  certified upper bound on the anchor covering radius
+- **Conservative ε**: `ε_embed = ε_orig − 2δ` is available only with that
+  certificate; a sampled radius is diagnostic and is not accepted as proof
 
 ---
 
@@ -445,10 +446,10 @@ novelty cache to a general-purpose novelty engine:
 
 | # | Title | Status | Core contribution |
 |---|---|---|---|
-| 01 | [Persistent Novelty](docs/design/01-persistent-novelty.md) | **Implemented** (side module) | 1-D merge tree + reduced d-D NN persistence. Prime-tagged CRDT merge. Zeta product over prime-birth features. |
+| 01 | [Persistent Novelty](docs/design/01-persistent-novelty.md) | **Implemented** (side module) | 1-D merge tree + reduced d-D NN persistence. Prime-tagged signature merge. Finite prime-birth diagnostic. |
 | 02 | [Wasserstein-1 Optimal Eviction](docs/design/02-wasserstein-eviction.md) | **Implemented** (opt-in API) | `evict_w1` = min nearest-neighbor. FIFO remains the pressure path. 37% fewer cycles on a 300-point 8-D clustered synthetic. |
 | 03 | [Submodular Rep Selection](docs/design/03-submodular-selection.md) | **Implemented** (offline batch) | Greedy max-coverage (1−1/e). Streaming evict-worst. Brute-force OPT for `n ≤ 16`. |
-| 04 | [Learned Metric via Anchor Embedding](docs/design/04-learned-metric.md) | **Implemented** (anchors, not neural) | Distance-to-anchors projection. Distortion ≤ 2δ under `L∞`. Conservative ε adjustment. |
+| 04 | [Learned Metric via Anchor Embedding](docs/design/04-learned-metric.md) | **Implemented** (anchors, not neural) | Distance-to-anchors projection. Certified distortion adjustment requires a caller-supplied or grid-derived covering-radius upper bound. |
 | 05 | [Competitive Ratio for Memory-Bounded Caching](docs/design/05-competitive-theorem.md) | Theory | Competitive-ratio analysis via packing numbers. Assumes W1-under-budget, which pack does not run. |
 
 ---
@@ -625,7 +626,7 @@ Built-in distances: `futcache_distance_linf`, `_l1`, `_l2`, `_cosine`,
 | `futcache_persist_novelty_spectrum(engine, x, out, *count)` | Writes `[0, t_max]` (two-pass). |
 | `futcache_persist_evict_below(engine, τ)` | Filter the diagram; merge tree unchanged. |
 | `futcache_persist_copy_diagram(engine, buf, *count)` | Export (birth, death, persistence). |
-| `futcache_persist_merge_features(a, na, b, nb, out, *count)` | CRDT diagram union. |
+| `futcache_persist_merge_features(a, na, b, nb, out, *count)` | Deterministic feature-signature join. |
 | `futcache_persist_selberg_zeta(engine, s, *z)` | Product over prime-birth features. |
 | `futcache_persist_prime_cycle_count(engine, τ, *count)` | Prime-birth features with persistence ≥ τ. |
 
@@ -691,7 +692,7 @@ PackCache(dimension, epsilon, distance="linf", domain_min=None,
 | `is_novel_at(x, t) -> bool` | Exact novelty at scale t (`min_dist > t`). |
 | `novelty_spectrum(x) -> list[tuple]` | `[(0.0, t_max)]`, or `[]` if `x` was observed. |
 | `copy_diagram() -> list[dict]` | Full (birth, death, persistence) export. |
-| `merge(other) -> list[dict]` | CRDT diagram union (does not return an engine). |
+| `merge(other) -> list[dict]` | Deterministic signature join (does not return an engine). |
 | `selberg_zeta(s) -> float` | Product over prime-birth features. |
 | `prime_cycle_count(tau=0.0)`, `feature_count(tau=0.0)`, `observations` | Telemetry. |
 
@@ -724,7 +725,7 @@ PackCache(dimension, epsilon, distance="linf", domain_min=None,
 | `select_max_coverage(points, n, d, ε, k, dist) -> dict` | Keys: `selected_count`, `coverage_ratio`, `approx_ratio` (`-1` if `n > 16`). |
 | `select_evict_worst(points, n, d, ε, reps, dist) -> dict` | Streaming swap. |
 | `select_coverage(points, n, d, ε, reps, dist) -> float` | Coverage ratio. |
-| `merge_persistence_diagrams(a, b) -> list` | CRDT diagram merge. |
+| `merge_persistence_diagrams(a, b) -> list` | Deterministic persistence-feature signature join. |
 | `nth_prime(i) -> int` | i-th prime (0-indexed). |
 | `halton_sequence(n, d) -> ndarray` | Halton low-discrepancy sequence. |
 | `poincare_distance(x, y) -> float` | Poincaré ball distance. |

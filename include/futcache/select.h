@@ -23,7 +23,7 @@ extern "C" {
  *
  *       f(S) = |{ x in X : min_{s in S} d(x, s) <= eps }|    for S ⊆ X
  *
- *   f is monotone and submodular (diminishing returns). The lazy greedy
+ *   f is monotone and submodular (diminishing returns). The greedy
  *   algorithm — at each step add the candidate with the largest marginal
  *   gain f(S ∪ {x}) - f(S) — achieves:
  *
@@ -32,18 +32,19 @@ extern "C" {
  *   (Nemhauser, Wolsey, Fisher 1978). This is tight for submodular
  *   maximisation under a cardinality constraint.
  *
- *   Connection to metric entropy: k = P(K, eps) (the packing number) is
- *   the minimal number of reps needed for full coverage f(S) = n. The
- *   greedy tells you WHICH k to pick, not just how many.
+ *   Connection to metric entropy: the minimum k needed for full coverage is
+ *   a covering number of the observed set. Packing numbers give related
+ *   bounds but are not generally equal to covering numbers.
  *
  *   Determinism / CRDT compatibility: ties in marginal gain are broken by
  *   lexicographic order of representative coordinates. This makes the
  *   selected set a deterministic function of the input multiset,
  *   independent of arrival order.
  *
- *   Streaming swap (Chen, Mirrokni, Nanongkai, Wang 2018): when |R| > k,
- *   evict the rep with the lowest marginal loss f(R) - f(R \ {r}). This
- *   retains the 1 - 1/e guarantee in the streaming setting.
+ *   Streaming eviction heuristic: when |R| > k, evict the rep with the
+ *   lowest marginal loss f(R) - f(R \ {r}). This local deletion rule is
+ *   deterministic but does not by itself carry the batch greedy 1-1/e
+ *   guarantee.
  */
 
 /*
@@ -85,7 +86,7 @@ typedef struct futcache_select_result {
  * that maximize the number of points within distance epsilon of at least
  * one selected representative.
  *
- * Algorithm: Lazy greedy (Nemhauser-Wolsey-Fisher).
+ * Algorithm: direct greedy (Nemhauser-Wolsey-Fisher).
  *   - At each of k steps, scan all n candidates, compute marginal gain
  *     (points newly covered by adding this candidate), pick the argmax.
  *   - Ties broken by lexicographic order of point coordinates (deterministic).
@@ -137,8 +138,8 @@ FUTCACHE_API void futcache_select_free_result(futcache_select_result_t *result);
  * i.e., the number of points that ONLY r covers (no other rep is within
  * eps). Evicting r* causes the smallest loss in covered points.
  *
- * This is the swap heuristic from Chen et al. 2018 for submodular
- * maximisation under a cardinality constraint in the streaming setting.
+ * This is a deterministic local coverage-loss heuristic; no streaming
+ * approximation ratio is claimed for this function alone.
  *
  * Parameters:
  *   points        - [n * dimension] all observed points

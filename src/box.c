@@ -131,18 +131,6 @@ static bool box_covered(const futcache_box_t *x, const double *p)
     return false;
 }
 
-/* True when `outer` fully contains `inner` (inclusive bounds). */
-static bool box_rect_contains(const box_rect_t *outer, const box_rect_t *inner,
-                              size_t dimension)
-{
-    for (size_t i = 0; i < dimension; ++i) {
-        if (outer->lo[i] > inner->lo[i] || outer->hi[i] < inner->hi[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
 void futcache_box_config_init(futcache_box_config_t *c)
 {
     if (c == NULL) return;
@@ -263,13 +251,12 @@ futcache_status_t futcache_box_observe(futcache_box_t *x, const double *p,
 
     pthread_rwlock_wrlock(&x->lock);
 
-    if (box_covered(x, p)) {
-        x->observations = box_saturating(x->observations);
-        x->generation = box_saturating(x->generation);
-        if (out != NULL) *out = false;
-        pthread_rwlock_unlock(&x->lock);
-        return FUTCACHE_OK;
-    }
+    /* A covered centre can still contribute previously uncovered area.  For
+     * example, in one dimension with epsilon=1, the ball around 0 covers the
+     * centre 0.9, but the latter's ball extends coverage from 1 to 1.9.
+     * Retaining every observed box is what makes this engine an exact
+     * full-history union rather than a representative packing. */
+    bool was_novel = !box_covered(x, p);
 
     futcache_status_t st = box_grow(x);
     if (st != FUTCACHE_OK) {
@@ -300,10 +287,10 @@ futcache_status_t futcache_box_observe(futcache_box_t *x, const double *p,
     x->memory += 2U * bytes;
 
     x->observations = box_saturating(x->observations);
-    x->novel = box_saturating(x->novel);
+    if (was_novel) x->novel = box_saturating(x->novel);
     x->generation = box_saturating(x->generation);
 
-    if (out != NULL) *out = true;
+    if (out != NULL) *out = was_novel;
     pthread_rwlock_unlock(&x->lock);
     return FUTCACHE_OK;
 }
@@ -352,7 +339,7 @@ futcache_status_t futcache_box_validate(const futcache_box_t *x)
     /* Telemetry lifecycle invariants (mirror the interval engine). */
     if (x->generation < x->observations ||
         x->novel > x->observations ||
-        x->count != x->novel ||
+        x->count != (size_t)x->observations ||
         x->count > x->peak_count) {
         pthread_rwlock_unlock(lock);
         return FUTCACHE_ERROR_CORRUPT_DATA;
@@ -364,20 +351,6 @@ futcache_status_t futcache_box_validate(const futcache_box_t *x)
             if (x->rects[j].lo[i] < x->min[i] ||
                 x->rects[j].hi[i] > x->max[i] ||
                 x->rects[j].lo[i] > x->rects[j].hi[i]) {
-                pthread_rwlock_unlock(lock);
-                return FUTCACHE_ERROR_CORRUPT_DATA;
-            }
-        }
-    }
-
-    /* Containment invariant: no stored box contains another. By the
-     * novelty admission argument this always holds for genuinely novel
-     * centers; the check is a diagnostic guard against future changes
-     * to the append logic. O(n^2 * d), diagnostic only. */
-    for (size_t j = 0; j < x->count; ++j) {
-        for (size_t k = j + 1U; k < x->count; ++k) {
-            if (box_rect_contains(&x->rects[j], &x->rects[k], d) ||
-                box_rect_contains(&x->rects[k], &x->rects[j], d)) {
                 pthread_rwlock_unlock(lock);
                 return FUTCACHE_ERROR_CORRUPT_DATA;
             }

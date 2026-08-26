@@ -20,26 +20,25 @@ extern "C" {
  *
  *   The one-parameter family U_t(H) = union of B(x_i, t) over all observed
  *   points x_i defines a sublevel-set filtration of the distance function
- *   rho_H(x) = min_i |x - x_i|. As t increases from 0, the novelty regions
- *   (connected components of the complement of U_t) are born and die.
+ *   rho_H(x) = min_i |x - x_i|. As t increases from 0, connected components
+ *   of U_t merge; this is the ordinary zero-dimensional filtration.
  *
  *   In 1-D, this structure is exactly the single-linkage merge tree
  *   (dendrogram): sort the points, then merge adjacent gaps in order of
  *   increasing gap width. The merge tree has n leaves and n-1 internal
  *   nodes, each recording a (birth, death) pair.
  *
- *   Prime tagging: each observation index i is mapped to the i-th prime
+ *   Prime tagging: each sorted-point index i is mapped to the i-th prime
  *   p_i (p_0=2, p_1=3, p_2=5, ...). A persistent feature with birth at
- *   observation b and death at observation d gets the prime signature
- *   (p_b mod M, p_d mod M) for Mersenne prime M = 2^61 - 1. By the
- *   fundamental theorem of arithmetic, two features have the same tag
- *   iff they have the same (b, d) pair, enabling idempotent CRDT merge.
+ *   sorted index b and merge-partner index d gets the prime signature
+ *   (p_b mod M, p_d mod M) for Mersenne prime M = 2^61 - 1. Reduction
+ *   modulo M is compact but can collide for sufficiently large indices;
+ *   callers needing collision-free identity must retain (b, d).
  *
- *   Selberg zeta connection: the persistence diagram (spectral side)
- *   corresponds to the prime geodesic cycle structure (geometric side)
- *   of the eviction dynamics. The zeta function Z(s) = prod_p (1 - N_p^{-s})^{-1}
- *   computed over prime-length cycles has zeros at the persistence
- *   spectrum. The prime geodesic conjecture predicts L/ln(L) growth.
+ *   Zeta-inspired diagnostic: the finite product exposed below groups
+ *   features by prime birth index. It is not the Selberg zeta function of a
+ *   hyperbolic surface, and no spectral-zero or prime-geodesic theorem is
+ *   claimed for cache dynamics.
  *
  * Guarantees.
  *
@@ -47,9 +46,11 @@ extern "C" {
  *     is_novel_at() at any queried scale t (differential-tested).
  *   - One-sidedness: is_novel_at(x, t) is true only when x is genuinely
  *     outside U_t(H). No false negatives.
- *   - Stability: the persistence diagram is stable under perturbation of
- *     the input points (bottleneck distance <= perturbation).
- *   - CRDT: merge_features is idempotent, commutative, and associative.
+ *   - Stability: standard persistence stability applies to the actual
+ *     single-linkage diagram; it does not automatically extend to the
+ *     prime tags or zeta-inspired diagnostic.
+ *   - Signature merge: merge_features is idempotent, commutative, and
+ *     associative under the documented signature rule.
  *   - Bounded memory: O(n) for n observations.
  */
 
@@ -57,8 +58,8 @@ extern "C" {
 
 /*
  * A single persistent feature (barcode).
- * birth: observation index (0-based) of the component's creation.
- * death: observation index of the merge; SIZE_MAX if still alive.
+ * birth: sorted-point index (0-based) of the component's creation.
+ * death: sorted-point index of the merge partner; SIZE_MAX if still alive.
  * birth_prime: p_birth mod PRIME_MODULUS.
  * death_prime: p_death mod PRIME_MODULUS (0 if death == SIZE_MAX).
  * birth_value: the x-coordinate of the leftmost point in the component.
@@ -66,19 +67,19 @@ extern "C" {
  * persistence: death_scale - birth_scale (INFINITY if death == SIZE_MAX).
  *
  * In the merge tree, the "birth scale" of a component is always 0
- * (all points appear at t=0). The "death scale" is the gap width at
- * which the component merges into its parent. So persistence = gap_width
+ * (all points appear at t=0). Radius-t balls on opposite sides of a gap
+ * meet at its midpoint. So persistence = gap_width / 2
  * for all features, and the "persistence diagram" is a multiset of
- * (0, gap_width) pairs.
+ * (0, gap_width / 2) pairs.
  */
 typedef struct futcache_persist_feature {
-    size_t birth;         /* observation index (leftmost point in component) */
-    size_t death;         /* observation index of merge partner, or SIZE_MAX */
+    size_t birth;         /* sorted index (leftmost point in component) */
+    size_t death;         /* sorted index of merge partner, or SIZE_MAX */
     uint64_t birth_prime; /* p_birth mod M */
     uint64_t death_prime; /* p_death mod M, 0 if alive */
     double birth_value;   /* x-coordinate of leftmost point */
     double death_value;   /* x-coordinate of the merge midpoint */
-    double persistence;   /* gap width (death scale), INFINITY if alive */
+    double persistence;   /* half-gap death scale, INFINITY if alive */
 } futcache_persist_feature_t;
 
 /*
@@ -90,8 +91,8 @@ typedef struct futcache_persist_node {
     double lo;           /* left endpoint */
     double hi;           /* right endpoint */
     double death_scale;  /* t at which this component merges into parent */
-    size_t birth_obs;    /* observation index of the leftmost point */
-    size_t death_obs;    /* observation index of the merge partner */
+    size_t birth_obs;    /* sorted index of the leftmost point */
+    size_t death_obs;    /* sorted index of the merge partner */
     int32_t parent;      /* parent node index, -1 for root */
     int32_t left;        /* left child node index, -1 for leaf */
     int32_t right;       /* right child node index, -1 for leaf */
@@ -115,7 +116,7 @@ FUTCACHE_API void futcache_persist_destroy(futcache_persist_t *engine);
 
 /*
  * Observe a 1-D point x. Adds the point and rebuilds the merge tree
- * in O(n log n). This is the main state mutation.
+ * in O(n^2). This is the main state mutation.
  */
 FUTCACHE_API futcache_status_t futcache_persist_observe(
     futcache_persist_t *engine, double x);
@@ -178,17 +179,16 @@ FUTCACHE_API futcache_status_t futcache_persist_clear(futcache_persist_t *engine
  * O(n) invariant check: verify the merge tree is a valid full binary
  * tree with n leaves and n-1 internal nodes, all death scales are
  * positive and monotonically increasing along the tree, and prime
- * tags are consistent with observation indices.
+ * tags are consistent with sorted-point indices.
  */
 FUTCACHE_API futcache_status_t futcache_persist_validate(
     const futcache_persist_t *engine);
 
 /*
- * CRDT merge: combine two persistence diagrams (feature arrays) into
- * a third. The merge is the union with idempotent dedup by prime
- * signature. Features with the same (birth_prime, death_prime) are
- * considered the same feature; the one with the larger persistence
- * wins (idempotent join).
+ * Deterministic signature merge: combine two feature arrays into a third.
+ * This does not reconstruct the persistence diagram of the combined raw
+ * point histories. Features with the same (birth_prime, death_prime) are
+ * considered the same feature; the one with the larger persistence wins.
  *
  * Two-pass: pass out=NULL, *out_count=0 to get the required size.
  *
@@ -203,17 +203,16 @@ FUTCACHE_API futcache_status_t futcache_persist_merge_features(
     futcache_persist_feature_t *out, size_t *inout_out_count);
 
 /*
- * Selberg zeta function of the persistence diagram.
+ * Finite zeta-inspired product over selected persistence features.
  *
- * Z(s) = prod over prime features f: (1 - persistence(f)^{-s})^{-1}
+ * Z(s) = prod over prime features f:
+ *        (1 - (1 + persistence(f))^{-s})^{-1}
  *
- * "Prime features" are features whose birth observation index is prime
- * (i.e., birth is in the set {0, 1, 2, 4, 6, 10, 12, ...} — the indices
- * of primes in the prime table). This mirrors the Selberg zeta product
- * over prime geodesics.
+ * "Prime features" are features whose birth sorted-point index is prime
+ * (i.e., birth is in {2, 3, 5, 7, 11, ...}).
  *
- * For the 1-D merge tree, this gives a concrete computable function
- * whose analytic structure encodes the eviction cycle spectrum.
+ * This application-specific diagnostic does not establish an analytic
+ * correspondence with an eviction-cycle spectrum.
  *
  * Returns Z(s) as a double. If s <= 0, returns FUTCACHE_ERROR_INVALID_ARGUMENT.
  * For s > 0 and finite persistences, Z(s) is well-defined and >= 1.
@@ -225,7 +224,7 @@ FUTCACHE_API futcache_status_t futcache_persist_selberg_zeta(
  * Prime cycle count: the number of features whose birth index is prime
  * and whose persistence >= tau. This is the "prime geodesic count"
  * analogous to the count of prime closed geodesics of length <= L
- * in hyperbolic geometry.
+ * by analogy only; it is not a prime-geodesic count in hyperbolic geometry.
  */
 FUTCACHE_API futcache_status_t futcache_persist_prime_cycle_count(
     const futcache_persist_t *engine, double tau, size_t *out_count);

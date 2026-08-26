@@ -86,6 +86,10 @@ typedef struct futcache_embed_config {
      * Used for covering radius estimation. Required. */
     const double *domain_min;
     const double *domain_max;
+    /* Optional certified upper bound on the anchor covering radius.  Set to
+     * 0 when no proof is available; sampling will still provide a diagnostic
+     * estimate, but adjusted_epsilon will then refuse to claim a guarantee. */
+    double covering_radius_upper_bound;
     /* Allocator. NULL selects malloc/free. */
     futcache_allocator_t allocator;
 } futcache_embed_config_t;
@@ -95,8 +99,9 @@ typedef struct futcache_embed futcache_embed_t;
 /*
  * Creates a distance-to-anchors embedding from a pre-computed anchor set.
  * The anchors are copied; the caller retains ownership of the input array.
- * The covering radius delta is estimated by sampling if domain bounds are
- * provided (lower bound on true covering radius).
+ * The covering radius is certified only when
+ * covering_radius_upper_bound > 0. Sampling otherwise provides a diagnostic
+ * lower bound, not a distortion guarantee.
  */
 FUTCACHE_API futcache_status_t futcache_embed_create(
     const futcache_embed_config_t *config,
@@ -116,10 +121,10 @@ FUTCACHE_API futcache_status_t futcache_embed_point(
     double *out_embedded);
 
 /*
- * Returns the estimated covering radius delta of the anchor set.
- * This is the additive distortion bound:
+ * Returns the certified upper bound when supplied, otherwise the sampled
+ * diagnostic estimate. Only a certified upper bound establishes:
  *   |d(x,y) - ||phi(x)-phi(y)||_inf| <= 2 * delta
- * The value is a lower bound on the true covering radius (sampling-based).
+ * A sampling-only value is a lower bound and must not be used as a proof.
  */
 FUTCACHE_API double futcache_embed_covering_radius(const futcache_embed_t *embed);
 
@@ -137,8 +142,8 @@ FUTCACHE_API size_t futcache_embed_original_dimension(const futcache_embed_t *em
  * Computes the embedded-space epsilon for a given original-space epsilon.
  * For conservative one-sidedness (no false positives at original epsilon):
  *   epsilon_embedded = epsilon_original - 2 * delta
- * Returns FUTCACHE_ERROR_OUT_OF_RANGE if epsilon_original <= 2*delta
- * (embedding distortion would eat the entire threshold).
+ * Returns FUTCACHE_ERROR_OUT_OF_RANGE if no certified upper bound was
+ * supplied, or if epsilon_original <= 2*delta.
  */
 FUTCACHE_API futcache_status_t futcache_embed_adjusted_epsilon(
     const futcache_embed_t *embed,
@@ -185,7 +190,9 @@ FUTCACHE_API double futcache_embed_distance(
  * and the required cell count exceeds max_anchors, the function returns
  * FUTCACHE_ERROR_OUT_OF_RANGE.
  *
- * `probe_count` is used for Halton covering radius estimation.
+ * Only the grid strategy is accepted because it provides a certified
+ * covering-radius upper bound. A sampled Halton radius is not sufficient for
+ * the conservative distortion guarantee. `probe_count` is reserved.
  */
 FUTCACHE_API futcache_status_t futcache_embed_pack_create(
     size_t original_dimension,
