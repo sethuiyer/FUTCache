@@ -789,6 +789,17 @@ vectors, individual p-adic lenses, and a weighted combined metric. Rankings
 use nearest-prior distance; epsilon verdicts and reduced representative
 persistence are reported separately.
 
+### MDL-selected resolution
+
+The experimental MDL selector evaluates a fixed epsilon grid under an explicit
+representative, assignment, residual, and epsilon-level code:
+
+> **ε* is the description-optimal resolution of the observed geometry.**
+
+This is optimal relative to the specified metric, codec, and candidate grid—not
+an informal universal guarantee. The controlled structured/clustered/random
+comparison is in [docs/mdl-stream-comparison.md](docs/mdl-stream-comparison.md).
+
 ### KDD Cup '99 (security novelty)
 
 AUC ≈ 0.99 — identical to a trivial 1-NN baseline. FUTCache's edge is
