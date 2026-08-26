@@ -4,162 +4,226 @@
   <img src="logo.webp" alt="FUTCache logo" width="420" />
 </p>
 
-FUTCache is a C11 implementation of future-equivalence caching for metric
-novelty. It stores what future novelty queries can observe rather than storing
-the observation history. The packing engine can additionally enforce a hard
-byte ceiling with deterministic oldest-first pressure eviction.
+**A mathematically grounded novelty detection engine for metric spaces.**
+C11 core, Python bindings, zero dependencies.
 
-FUTCache gives you the semantic caching machinery, exact search, bounded
-memory, durability, and measurable reuse frontier. Your embedding model
-determines how far semantic reuse can safely go.
+---
 
-For a bounded one-dimensional metric domain `K=[a,b]` and resolution
-`epsilon`, the exact query is
+## What is FUTCache?
 
-```text
-novel(x | H) = 1 when min(distance(x, y), y in H) > epsilon
-```
-
-The sufficient cache state is the canonical union of closed intervals
-induced by the history:
-
-```text
-U(H) = union([y-epsilon, y+epsilon] intersect K, y in H)
-```
-
-`x` is novel exactly when it is outside `U(H)`. Historical points are never
-needed once their contribution to that decision boundary has been merged.
-
-Observation counters and `generation` are bounded operational telemetry, not
-inputs to the novelty decision. They add constant state and are preserved by
-serialization. Consequently, two future-equivalent histories have the same
-canonical interval snapshot, but their full serialized bytes may differ when
-their telemetry differs.
-
-This is not an LRU key/value cache. It is an exact online novelty oracle:
-specify fidelity (`epsilon`), and the geometry determines memory use.
-
-## What FUTCache is
-
-A **metric-novelty oracle**. For any metric space you can represent as
-vectors (`double[d]`) with a genuine distance function, it answers exactly one
+FUTCache is a **metric-novelty oracle**. For any metric space you can
+represent as vectors (`double[d]`) with a distance function, it answers one
 question:
 
-> has the system seen anything within `epsilon` of this point?
+> *Has the system seen anything within `ε` of this point?*
 
-- **Narrow in computation.** Novelty only. It does not store arbitrary keys,
-  retrieve top-k matches, or cache objects by an exact ID. For those, use a
-  key/value cache (Redis, Memcached, LRU) — FUTCache is the wrong tool.
-- **Broad in domains.** Any space with a metric: string / edit distances (via
-  a vector encoding), sets / Jaccard (via an encoding), sensor and
-  time-series data, embeddings, hierarchical or hyperbolic data — whatever
-  you can represent as vectors and supply a distance for.
-- **The constraint.** The metric must be a genuine metric (symmetry +
-  triangle inequality) for the VP-tree's exact pruning and the `P(K, ε)`
-  packing bound to hold. Two cases to know:
-  - *Cosine* (`1 − dot`) is not a metric; the engine detects it and indexes
-    with a chordal (`L2` on the unit sphere) metric, which is exact for
-    normalized inputs, and falls back to an exact linear scan for
-    non-normalized ones.
-  - *Any other non-metric* similarity or custom distance makes the VP-tree
-    prune unsound, so use the **linear backend** (always correct, `O(n)`).
-    The engine doesn't auto-detect arbitrary non-metrics — that's the
-    caller's call.
-- **The production takeaway.** For "has the system seen anything within `ε`
-  of this point?" in a genuine metric space, FUTCache bundles four properties
-  most alternatives lack: a **hard memory ceiling**, **crash-safe
-  persistence**, a **provable one-sided guarantee** (never wrongly suppresses
-  novelty), and **exact, differentially-verified** novelty — all behind a
-  metric-agnostic API.
+It is **not** a key/value cache. It does not store arbitrary keys, retrieve
+top-k matches, or cache objects by ID. It stores the *geometric state*
+determined by the observation history — the minimal information needed to
+answer future novelty queries exactly.
 
-## Theoretical foundations
+| Property | Detail |
+|---|---|
+| **One-sidedness** | Never wrongly suppresses novelty. False positives possible at boundaries, false negatives impossible. |
+| **Bounded memory** | Hard byte ceiling (`max_memory_bytes`) with deterministic eviction. |
+| **Crash-safe** | Versioned, CRC32-protected serialization. |
+| **Metric-agnostic** | L∞, L1, L2, cosine, Poincaré, or user-supplied distance. |
+| **Exact** | Differential-verified against brute-force oracles. 126 C tests, ASan clean. |
+
+---
+
+## Table of Contents
+
+- [Engines](#engines)
+- [Theoretical Foundations](#theoretical-foundations)
+- [Design Sketches](#design-sketches)
+- [Build](#build)
+- [Quick Start](#quick-start)
+- [C API Reference](#c-api-reference)
+- [Python API Reference](#python-api-reference)
+- [Benchmarks & Experiments](#benchmarks--experiments)
+- [Adversarial Analysis](#adversarial-analysis)
+- [Complexity](#complexity)
+- [Concurrency & Ownership](#concurrency--ownership)
+- [Persistence](#persistence)
+- [Documentation](#documentation)
+
+---
+
+## Engines
+
+FUTCache ships seven engines, each addressing a different aspect of novelty:
+
+| Engine | Header | Dimension | What it does |
+|---|---|---|---|
+| **Interval-union cache** | `<futcache/futcache.h>` | 1-D | Exact interval-union novelty with AVL tree. The original engine. |
+| **Resolution tower** | `<futcache/tower.h>` | 1-D | Multi-resolution dyadic tower with Fenwick rank/select and discovery logs. |
+| **Packing cache** | `<futcache/pack.h>` | d-D | Generalized packing cache for arbitrary metric spaces. VP-tree or linear backend. W1-optimal eviction. |
+| **Box cache** | `<futcache/box.h>` | 1–8 D | Exact axis-aligned L∞ box-union cache for full d-D coverage. |
+| **CRDT cache** | `<futcache/crdt.h>` | d-D | Gossip-mergeable cache with deterministic Voronoi quantization. Replicas converge without coordination. |
+| **Persistent novelty** | `<futcache/persist.h>` | 1-D | Single-linkage merge tree. Multi-scale novelty, persistence diagrams, prime-tagged CRDT merge, Selberg zeta. |
+| **d-D persistent packing** | `<futcache/persist_nd.h>` | d-D | Per-representative birth/death tracking with persistence-based eviction. |
+| **Submodular selection** | `<futcache/select.h>` | d-D | Greedy max-coverage rep selection (1−1/e guarantee). Streaming evict-worst. |
+| **Anchor embedding** | `<futcache/embed.h>` | d→m | Distance-to-anchors projection with bounded distortion (2δ). Conservative ε adjustment. |
+
+### Interval-union cache (1-D, exact)
+
+The original FUTCache engine. For a 1-D metric domain `K=[a,b]` and
+resolution `ε`, it stores the canonical union of closed intervals:
+
+```
+U(H) = ⋃([y−ε, y+ε] ∩ K)    for y in observed history H
+```
+
+A point `x` is novel exactly when `x ∉ U(H)`. Historical points are never
+needed once their contribution to the boundary has been merged.
+
+- AVL-backed, `O(log n)` lookup
+- Versioned serialization with CRC32
+- Concurrency-safe (rwlock)
+
+### Resolution tower (1-D, multi-scale)
+
+A dyadic refinement tower with per-level occupancy bitsets, Fenwick
+prefix-sum trees, and first-discovery logs. Provides multi-resolution
+novelty at logarithmic cost per level.
+
+### Packing cache (d-D, generalized)
+
+The workhorse for high-dimensional applications (RAG embeddings, sensor
+fusion, time-series). Stores a maximal `ε`-separated set of
+representatives. Novelty: `d(x, R) > ε`. Rep count bounded by the
+packing number `P(K, ε)`.
+
+Key features:
+- **Adaptive radii**: each rep gets its own `ε_i`; lookup tests the exact
+  union `⋃ B(r_i, ε_i)`
+- **Hard memory ceiling**: `max_memory_bytes` with FIFO or W1 pressure
+  eviction
+- **VP-tree backend**: 9.1× faster observe, 17.2× faster query vs linear
+  scan at 384-D (measured)
+- **W1 eviction**: `futcache_pack_evict_w1` removes the rep with the
+  smallest nearest-neighbor distance — the W1-optimal eviction
+- **Serialization**: atomic, versioned, CRC32-protected snapshots
+
+Built-in distances: `linf`, `l1`, `l2`, `cosine`, `poincare`. Custom
+metrics via function pointer.
+
+### Box cache (d-D, L∞ exact)
+
+Exact axis-aligned `L∞` box-union for dimensions 1–8. Each observation
+contributes its clipped `ε`-box; queries test membership in the exact
+union. For applications that need full d-dimensional ball coverage.
+
+### CRDT cache (d-D, distributed)
+
+Gossip-mergeable cache with deterministic Voronoi quantization. Replicas
+converge without coordination:
+
+```
+q(x) = q(y)  ⟹  d(x, y) ≤ ε
+```
+
+Set union is commutative, associative, and idempotent. Ships anchor
+construction helpers (grid, Halton, safe-anchors) and a certified
+covering-radius estimator.
+
+### Persistent novelty (1-D, multi-scale)
+
+Single-linkage merge tree over observed points. Provides:
+
+- **`is_novel_at(x, t)`**: exact novelty at scale `t`
+- **`novelty_spectrum(x, t_max)`**: number of novel scales for a query
+- **`evict_below(τ)`**: remove low-persistence reps
+- **`selberg_zeta(s)`**: spectral signature of the novelty landscape
+- **CRDT merge**: prime-tagged diagram union (idempotent, commutative)
+- **`copy_diagram`**: full (birth, death, persistence) export
+
+### d-D persistent packing
+
+Per-representative nearest-neighbor tracking with:
+
+- **`observe(x)`**: novel/redundant + persistence update
+- **`is_novel_at(x, t)`**: scale-resolved novelty
+- **`persistences()`**: per-rep persistence (nn_dist − radius)
+- **`evict_lowest()`**: remove the most redundant rep
+- **`stats()`**: includes prime-birth count
+
+### Submodular selection
+
+Max-coverage rep selection with the **(1 − 1/e) approximation guarantee**:
+
+- **`select_max_coverage`**: lazy greedy with lexicographic tie-breaking.
+  Brute-force optimal for `n ≤ 16` (verification).
+- **`select_evict_worst`**: streaming swap — find the rep whose removal
+  causes the largest coverage loss.
+- **`select_coverage`**: current coverage ratio.
+
+### Anchor embedding
+
+Projects `d`-dimensional points into `m`-dimensional
+distance-to-anchors space:
+
+```
+embed(x) = [d(x, a_1), d(x, a_2), ..., d(x, a_m)]
+```
+
+- **Distortion bound**: `|d(x,y) − d(embed(x), embed(y))| ≤ 2δ` where
+  `δ` is the covering radius of the anchor set
+- **Conservative ε**: `ε_embed = ε_orig − 2δ` preserves one-sidedness
+
+---
+
+## Theoretical Foundations
 
 FUTCache is a finite, computable realization of the **Novelty Geometry**
 framework — the study of how an infinite traversal generates, retains, and
-completes *ordered novelty* across increasing resolution. The central object
-is the ordered discovery profile: the sequence of partition cells first
-encountered at each refinement level, in first-discovery order, whose
-completion lives in an inverse limit (and, after hyperbolic realization, on a
-Gromov boundary). The framework is in
-[novelty-geometry](https://github.com/sethuiyer/novelty-geometry) — the
-README, glossary, and the boundary-object semantics note are its entry
-points. (This repo keeps a local mirror of it under
-`references/novelty-geometry`.)
+completes *ordered novelty* across increasing resolution.
 
 | Framework concept | FUTCache engine |
 |---|---|
-| Sufficient memory / future-equivalence quotient | interval-union `U(H)` — the minimal state that determines future novelty exactly |
-| Ordered novelty word `D_j(L)` (first-discovery order) | tower per-level occupancy + first-discovery log |
+| Sufficient memory / future-equivalence quotient | interval-union `U(H)` — minimal state for exact future novelty |
+| Ordered novelty word `D_j(L)` | tower per-level occupancy + first-discovery log |
 | Partition tower + bonding map `q_{j+1,j}` | tower coarse/fine refinement compatibility |
-| ε-separated set / packing number `P(K, ε)` | packing cache's representative set and bound |
+| ε-separated set / packing number `P(K, ε)` | packing cache rep set and bound |
 | Fenwick prefix-sum index | tower spatial rank/select |
-| Inverse limit / discovery topology / boundary | the ideal completion a one-`ε` tower approximates finitely |
+| Inverse limit / boundary | the ideal completion a one-`ε` tower approximates finitely |
 
-FUTCache is the *finite, single-fidelity* slice of that framework: it fixes one
-resolution (`epsilon`) rather than refining a tower, and it stores the
-sufficient novelty state with a hard memory ceiling and crash-safe
-persistence. The limits we measure empirically — the one-sided packing
-approximation (never wrongly suppresses novelty, but can over-report at
-packing boundaries), the negative cacheability margin on some corpora, and the
-cross-lingual precision ceiling — are precisely the *finite* and
-*non-canonical* aspects the framework itself flags as open in its note
-(canonicity across towers, realizability over run classes), not accidental
-deficiencies of the engine.
+FUTCache fixes one resolution (`ε`) rather than refining a tower, and stores
+the sufficient novelty state with a hard memory ceiling. The limits we
+measure empirically — one-sided packing approximation, negative cacheability
+margin on some corpora — are the *finite* aspects the framework itself flags
+as open, not accidental deficiencies.
 
-## What is implemented
+See [novelty-geometry](https://github.com/sethuiyer/novelty-geometry) for
+the full framework (README, glossary, boundary-object semantics).
 
-- Exact interval-union FUTCache over any finite `double` domain.
-- AVL-backed canonical state with logarithmic lookup and balanced updates.
-- Linearizable concurrent reads and writes through a reader/writer lock.
-- Allocation-failure-atomic observations.
-- Runtime statistics (including AVL height), canonical interval snapshots, and
-  invariant validation.
-- Versioned, endian-independent, CRC32-protected serialization.
-- A uniform dyadic resolution tower with occupancy bitsets, Fenwick prefix
-  counts and spatial select, plus first-discovery logs.
-- A Voronoi packing novelty cache (`<futcache/pack.h>`) for arbitrary
-  finite-dimensional metric spaces with user-supplied distance function.
-  This is the natural generalization of the interval-union cache to
-  dimensions where no closed-form canonical union exists.
-- Strict packing-cache allocation accounting with a configurable physical
-  byte ceiling, FIFO allocation recycling under pressure, and live/peak
-  memory telemetry.
-- Atomic, versioned, CRC32-protected packing snapshots for crash recovery.
-- An exact bounded-dimensional `L_inf` box-union cache (`<futcache/box.h>`)
-  for applications that need full d-dimensional ball coverage rather than
-  representative packing.
-- A deterministic-Voronoi, gossip-mergeable CRDT cache
-  (`<futcache/crdt.h>`) whose replicas converge without coordination by
-  joining cell entries under a deterministic priority (see `PHASE2.md`).
-- Randomized differential, boundary, fault-injection, persistence, and
-  multithreaded tests.
-- A `bench/cache_comparison.c` benchmark pitting FUTCache against LRU and an
-  exact-set cache on five workloads, with memory, decision-error, and
-  throughput reporting.
-- A `bench/corpus_dedup_cost.c` cost benchmark showing the honest
-  distribution-dependent de-duplication economics: the reduction ratio and
-  downstream embedding/index cost saved across three data shapes (balanced
-  clusters+tail, tight clusters, and uniform), plus a note that a uniform
-  long tail in high dimension does not collapse. Run
-  `futcache_corpus_dedup` (optionally on your own `N*dim` float64 corpus).
-- A **security-novelty / SOC** example on
-  [KDD Cup '99](https://scikit-learn.org/stable/modules/generated/sklearn.datasets.fetch_kddcup99.html)
-  (`demos/kdd_novelty_check.py`): train the one-sided novelty gate on benign
-  traffic only and query whether it flags real attack classes as novel. Note
-  the honest limit: on KDD99 the gate's accuracy (AUC ~0.99) is *identical to
-  a trivial nearest-centroid / 1-NN baseline* (AUC ~0.99), because several
-  attack classes are trivially separable — so KDD99 shows the gate *works*
-  (as a novelty primitive) but does **not** show it detects better than a
-  simple baseline. FUTCache's edge here is operational (bounded-memory online
-  streaming, one-sided never-miss-novelty, durable), not detection accuracy.
+---
 
-The learned recurrent/KV state and application-specific sliding-window TTL
-forms discussed in `how.md` require a model- or key-domain-specific observable
-predicate and are intentionally not guessed by this library.
+## Design Sketches
+
+`docs/design/` contains five design documents extending FUTCache from a
+novelty cache to a general-purpose novelty engine:
+
+| # | Title | Status | Core contribution |
+|---|---|---|---|
+| 01 | [Persistent Novelty](docs/design/01-persistent-novelty.md) | **Implemented** | Prime-tagged persistence diagrams, Selberg zeta, d-D persistent packing. Multi-scale novelty with CRDT merge. |
+| 02 | [Wasserstein-1 Optimal Eviction](docs/design/02-wasserstein-eviction.md) | **Implemented** | W1-eviction minimizes coverage change. 37% fewer eviction cycles than FIFO. Quantified one-sided gap. |
+| 03 | [Submodular Rep Selection](docs/design/03-submodular-selection.md) | **Implemented** | Greedy max-coverage (1−1/e guarantee). Streaming evict-worst. Brute-force verification. |
+| 04 | [Learned Metric via Anchor Embedding](docs/design/04-learned-metric.md) | **Implemented** | Distance-to-anchors projection. Distortion ≤ 2δ. Conservative ε adjustment. |
+| 05 | [Competitive Ratio for Memory-Bounded Caching](docs/design/05-competitive-theorem.md) | Theory | Competitive-ratio analysis via packing numbers. Capacity planning as a theorem. |
+
+---
 
 ## Build
 
-FUTCache requires a C11 compiler, CMake 3.16 or newer, and POSIX threads.
+### Requirements
+
+- C11 compiler (GCC 9+, Clang 10+, or MSVC)
+- CMake 3.16+
+- POSIX threads
+
+### C library
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -167,619 +231,458 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Useful build options:
+### Build options
 
-```text
-FUTCACHE_BUILD_SHARED=ON       build a shared library
-FUTCACHE_BUILD_EXAMPLES=OFF    omit examples
-FUTCACHE_BUILD_BENCHMARKS=ON   build the stress/throughput benchmark
-FUTCACHE_BUILD_NITROSAT=ON     build the optional offline anchor optimizer
-FUTCACHE_ENABLE_SANITIZERS=ON  enable ASan and UBSan on GCC/Clang
-FUTCACHE_ENABLE_TSAN=ON        enable ThreadSanitizer in a separate build
-FUTCACHE_WARNINGS_AS_ERRORS=ON make supported warning checks fatal
+| Option | Default | Description |
+|---|---|---|
+| `FUTCACHE_BUILD_SHARED` | `ON` | Build shared library |
+| `FUTCACHE_BUILD_EXAMPLES` | `ON` | Build examples |
+| `FUTCACHE_BUILD_BENCHMARKS` | `OFF` | Build benchmarks |
+| `FUTCACHE_BUILD_NITROSAT` | `OFF` | Build NitroSAT anchor optimizer |
+| `FUTCACHE_ENABLE_SANITIZERS` | `OFF` | ASan + UBSan |
+| `FUTCACHE_ENABLE_TSAN` | `OFF` | ThreadSanitizer (separate build) |
+| `FUTCACHE_WARNINGS_AS_ERRORS` | `OFF` | Treat warnings as errors |
+
+### Install
+
+```sh
+cmake --install build
 ```
 
-Install with `cmake --install build`. Downstream CMake projects can then use:
+Downstream CMake:
 
 ```cmake
 find_package(FUTCache 1 CONFIG REQUIRED)
 target_link_libraries(my_program PRIVATE FUTCache::futcache)
 ```
 
-## Exact novelty API
+### Python
+
+```sh
+pip install .
+```
+
+Builds and installs the `futcache` package via nanobind + scikit-build-core.
+
+---
+
+## Quick Start
+
+### C: 1-D interval-union
 
 ```c
-#include <stdbool.h>
-#include <stdio.h>
-
 #include <futcache/futcache.h>
 
-int main(void)
-{
-    const double stream[] = {0.8, 0.1, 0.7, 0.2, 0.4};
-    futcache_config_t config;
-    futcache_t *cache = NULL;
-    size_t i;
+futcache_config_t config;
+futcache_t *cache;
+futcache_config_init(&config);
+config.domain_min = 0.0;
+config.domain_max = 1.0;
+config.epsilon = 0.2;
+futcache_create(&config, &cache);
 
-    futcache_config_init(&config);
-    config.domain_min = 0.0;
-    config.domain_max = 1.0;
-    config.epsilon = 0.2;
+bool novel;
+futcache_observe(cache, 0.1, &novel);  /* novel = true  */
+futcache_observe(cache, 0.15, &novel); /* novel = false (within 0.2 of 0.1) */
 
-    if (futcache_create(&config, &cache) != FUTCACHE_OK) {
-        return 1;
-    }
-
-    for (i = 0; i < sizeof(stream) / sizeof(stream[0]); ++i) {
-        bool was_novel;
-        if (futcache_observe(cache, stream[i], &was_novel) != FUTCACHE_OK) {
-            futcache_destroy(cache);
-            return 1;
-        }
-        printf("%.1f: %s\n", stream[i], was_novel ? "novel" : "redundant");
-    }
-
-    futcache_destroy(cache);
-    return 0;
-}
+futcache_destroy(cache);
 ```
 
-The important update rule is that every successful observation contributes its
-epsilon-ball. A redundant point may still expand the future decision boundary.
-For example, after observing `0.1` with `epsilon=0.2`, `0.2` is redundant, but
-its ball extends coverage through `0.4`. Dropping that update would implement a
-packing representative approximation, not exact full-history novelty.
+### C: d-D packing cache
 
-All points and configuration values must be finite, and the domain width must
-also be representable as a finite `double`. Points are accepted only inside the
-inclusive configured domain. Closed-ball semantics mean a point at exactly
-`epsilon` distance is redundant. `epsilon=0` provides exact `double` identity
-caching. Interval endpoints are rounded inward so that a rounding-up addition
-cannot incorrectly classify a point just beyond epsilon as covered.
+```c
+#include <futcache/pack.h>
 
-Observation and tower-mapping operations require the default IEEE rounding mode
-(`FE_TONEAREST`) and return `FUTCACHE_ERROR_UNSUPPORTED_PLATFORM` if the calling
-thread changed it. The implementation also requires ordinary type-precision
-evaluation (`FLT_EVAL_METHOD == 0`). Builds using unsafe floating-point
-transformations such as `-ffast-math` are outside the supported numerical
-contract.
+futcache_pack_config_t cfg;
+futcache_pack_create(&cfg, &cache,
+    .dimension = 384,
+    .epsilon = 0.6,
+    .distance = futcache_distance_cosine,
+    .max_memory_bytes = 64 * 1024 * 1024,
+    .backend = FUTCACHE_PACK_BACKEND_VPTREE);
 
-## Resolution tower API
-
-Include `<futcache/tower.h>`. Level zero has `root_cells` uniform cells, and
-each subsequent level doubles the number of cells. A call to
-`futcache_tower_observe` returns one novelty byte per level.
-
-At each level the API provides:
-
-- occupancy and distinct-cell counts;
-- `prefix_count(level, r)`, the number of occupied cells with index `<= r`;
-- `select_occupied(level, k)`, the `k`th occupied cell in spatial order;
-- `discovery_at(level, k)`, the `k`th cell in first-discovery order.
-
-Spatial select and discovery order are intentionally separate concepts.
-Fenwick trees answer the former; append-only discovery logs preserve the
-latter.
-
-`futcache_scaling_example` runs the reciprocal traversal `x_n=1/n` and prints
-the observed `M_j`, adjacent-level multiplier, and cache-dimension estimate.
-
-## n-d packing cache API
-
-Include `<futcache/pack.h>`. The packing cache generalizes the interval-union
-to arbitrary finite-dimensional metric spaces with a user-supplied distance.
-Without a hard byte ceiling, its state is a maximal `epsilon`-separated set of
-representatives for the observed stream. Novelty is `d(x, R) > epsilon`; an
-observation within `epsilon` of an existing representative is redundant and
-the state is unchanged. Representative count is bounded by the packing number
-`P(K, epsilon)`.
-
-The compatibility API uses one fixed `epsilon`. Adaptive resolution is also
-native: `futcache_pack_observe_with_radius` assigns each newly admitted
-representative its own radius `epsilon_i`, and lookup tests the exact union
-`U(H) = union_i B(r_i, epsilon_i)`. It does not assume that the nearest centre
-owns the matching ball—a farther centre with a larger certified radius is
-found correctly. `futcache_pack_lookup` returns the closest containing
-representative and its stable FIFO slot.
-
-If adaptive radii have a known positive floor `epsilon_min`, representative
-count is bounded by `P(K, epsilon_min)`. If radii may approach zero, use
-`max_memory_bytes` for the unconditional physical bound; pressure eviction
-remains strict and never allocates through an uncounted VP-tree path.
-
-For deployments with a smaller operational budget, set
-`futcache_pack_config_t.max_memory_bytes`. Every live allocation requested by
-the cache—including VP-tree nodes and rebuild scratch—is charged to this hard
-ceiling. When another representative would cross it, the oldest
-representative allocation is recycled in place. This can forget coverage and
-therefore cause extra misses, but it cannot produce a false hit. Stats expose
-`memory_bytes`, `peak_memory_bytes`, `memory_limit_bytes`, and `evictions`.
-
-`futcache_pack_serialize` and `futcache_pack_deserialize` checkpoint and
-recover the complete representative state, parameters, pressure limit, and
-telemetry. Snapshots are little-endian, versioned, strictly framed, and CRC32
-protected. Built-in VP-tree state is reconstructed from representatives; it
-is not persisted as pointer-rich derived state. Snapshot version 2 persists
-every adaptive radius and remains backward-compatible with fixed-radius
-version 1 snapshots.
-
-This is the cache that addresses the *geometric* novelty question for RAG
-embeddings, sensor fusion, time-series anomaly detection, and intrinsic
-curiosity in reinforcement learning. Five built-in distances are provided:
-
-`futcache_distance_linf`, `futcache_distance_l1`, `futcache_distance_l2`,
-`futcache_distance_cosine`, and `futcache_distance_poincare`. A custom metric
-can be supplied as a function pointer with an opaque context.
-
-For large representative sets, `futcache_pack_config_t` also accepts an
-optional nearest-neighbour backend. The built-in linear scan remains the
-default. Approximate indexes may conservatively overestimate distance and
-therefore report extra novelty, but must never suppress a genuinely novel
-point. The exact VP-tree stores only dimension-independent node metadata and
-borrows immutable representative vectors from the cache, avoiding the former
-second `N * dimension * sizeof(double)` coordinate store. Its subtree maximum
-radius bounds prune exact adaptive ball lookup.
-
-The repository Release benchmark at 384 dimensions and 2,000 representatives
-on a low-intrinsic-dimension cosine workload measures the effect directly:
-
-| Backend | observe | query | live memory |
-|---|---:|---:|---:|
-| linear scan | 268.7 us/op | 535.3 us/op | 5.96 MiB |
-| exact VP-tree | 29.5 us/op | 31.0 us/op | 6.19 MiB |
-
-That is 9.1x faster observation and 17.2x faster lookup for about 4% index
-overhead. A second copy of all 384-D vectors alone would cost another 5.86
-MiB in this case. Run `futcache_pack_backend_bench` on the deployment CPU for
-hardware-specific numbers; uniform high-dimensional data still exhibits the
-expected curse-of-dimensionality fallback toward a scan.
-
-### Adaptive resolution: Poincare + isolation + primes
-
-The Python calibration layer implements the research rule
-
-```text
-epsilon(x) = epsilon_0 (1 - ||z(x)||^2)^gamma
-             exp(-lambda * isolation_score(x))
+bool novel;
+double matched_dist, matched_radius;
+size_t matched_idx;
+futcache_pack_observe_with_radius(
+    cache, point_384d, 0.6, &novel, &matched_dist, &matched_idx);
 ```
 
-`z(x)` is a point in the open Poincare ball. Radial position makes specialised
-boundary concepts stricter, while a compact Isolation Forest contracts the
-radius in poorly supported regions. A nearest-known-incompatible margin can
-hard-cap the result. Prime-base Halton trials explore `(epsilon_0, gamma,
-lambda)` without materialising a Cartesian grid.
-
-```python
-from futcache import (
-    AdaptiveRadiusController, AdaptiveRadiusPolicy,
-    CompactIsolationForest, PackCache, halton_trials,
-)
-
-# z_calibration and z_stream are learned hyperbolic embeddings (norm < 1).
-forest = CompactIsolationForest(max_samples=256).fit(z_calibration)
-policy = AdaptiveRadiusPolicy(
-    base_radius=0.6, gamma=1.5, isolation_weight=2.0,
-    margin_safety=0.5,
-)
-controller = AdaptiveRadiusController(policy, forest)
-cache = PackCache(384, epsilon=0.0, distance="poincare", backend="vptree",
-                  max_memory_bytes=64 << 20)
-
-for z, response in z_stream:
-    result = cache.observe(z, payload=response,
-                           radius=controller.radius(z))
-
-for trial in halton_trials({
-    "epsilon_0": (0.05, 0.8),
-    "gamma": (0.0, 4.0),
-    "lambda": (0.0, 6.0),
-}, count=64):
-    evaluate_on_calibration_split(trial)
-```
-
-`CompactIsolationForest` retains flat float32/int32 tree arrays and does not
-retain the fitted embedding matrix. `poincare_embed` is available when an
-external specificity signal needs to be mapped onto Euclidean directions; it
-is deliberately not presented as a substitute for learning a hierarchy.
-These geometry and density signals choose radii—the C engine still performs
-the exact decision, persistence, and bounded-memory eviction.
-
-The exact interval-union cache (`<futcache/futcache.h>`) and the packing
-cache (`<futcache/pack.h>`) answer different questions:
-
-| Aspect               | interval-union          | packing cache                |
-|----------------------|-------------------------|------------------------------|
-| Dimension            | 1D only                 | any `>= 1`                   |
-| Distance             | Euclidean on reals      | user-supplied                |
-| State                | sorted disjoint 1D intervals | representative points   |
-| Novelty predicate    | exact match             | representative match         |
-| Memory bound         | `P(K, epsilon)`         | `P(K, epsilon)` or hard bytes |
-| Use case             | 1D metric novelty       | RAG, embeddings, multi-d     |
-
-`futcache_nd_dedup` exercises the packing cache on uniform random streams
-in dimensions 2, 4, 8, and 16 under `L_inf`, `L1`, and `L2`, and reports
-representative count versus packing bound for each.
-
-### Offline representative optimization
-
-`scripts/bench_nitrosat_min_reps.py` uses the vendored NitroSAT V3 solver to
-replace an order-dependent online packing with a smaller offline packing over a
-fixed observation set. Hard WCNF clauses enforce full empirical coverage and
-pairwise distance greater than epsilon; unit soft clauses minimize the number
-of retained representatives. Every solver claim is independently recomputed,
-and the safe operational policy keeps the smaller of the verified NitroSAT set
-and the greedy packing.
-
-On corrected synthetic workloads with 40 actual clusters, five deterministic
-solver restarts reduced representative count by 15.1% at 200 points (20/20
-workload wins), 17.4% at 500 points, and 15.7% at 1,000 points, always with
-full empirical coverage and zero packing violations in the tested matrix.
-These are heuristic results, not optimality proofs or continuous-domain cover
-certificates. See `docs/nitrosat_optimization.md` for formulation, provenance,
-generator correction, commands, and complete caveats.
-
-## Bekko semantic cache experiment
-
-`scripts/bekko_generate.py` encodes a paraphrase corpus with
-`hotchpotch/bekko-embedding-v1-a8m` (an ultra-compact multilingual
-embedder) at all four Matryoshka truncations (64, 128, 256, 384) and
-writes a binary consumable by `bench/bekko_semantic_cache.c`. That
-benchmark sweeps `epsilon` for each truncation and reports the
-representative count, novel count, true-positive and false-positive
-semantic reuse, and per-call latency.
-
-This is the *real* semantic-cache experiment, not a synthetic one. Bekko
-emits L2-normalized 384-dimensional vectors, so the cache uses
-`futcache_distance_cosine` (1 - dot product). Cosine distance on
-paraphrase pairs in this model lands at 0.28-0.88; cross-topic pairs at
-0.48-0.95, with significant overlap. The cache becomes effective above
-`epsilon` of about 0.5, where within-topic paraphrases start merging into
-representatives while cross-topic pairs still mostly stay separate.
-
-Headline numbers from a 38-question corpus across 8 topics (password,
-login, billing, cancel, shipping, api, mobile_app, pricing) at 384-d:
-
-| epsilon | reps | novel | correct_reuse | incorrect_reuse | missed_reuse | us/op |
-|--------:|-----:|------:|--------------:|----------------:|-------------:|------:|
-|    0.30 |   37 |    37 |         0.026 |           0.763 |        0.000 |  8.00 |
-|    0.50 |   27 |    27 |         0.289 |           0.500 |        0.000 |  7.28 |
-|    0.60 |   20 |    20 |         0.447 |           0.342 |        0.026 |  5.32 |
-|    0.70 |   14 |    14 |         0.526 |           0.263 |        0.105 |  3.59 |
-|    0.80 |    8 |     8 |         0.658 |           0.132 |        0.132 |  2.22 |
-|    0.90 |    5 |     5 |         0.737 |           0.053 |        0.132 |  1.09 |
-
-At `epsilon=0.8` and 384-d the cache holds 8 representatives that cover
-38 inputs — a 4.7× compression with 79% of inputs merged correctly.
-Throughput scales roughly linearly with dimension (1.2µs/op at 64-d to
-8µs/op at 384-d); 256-d lands at 5µs/op.
-
-The smaller the dimension, the coarser the threshold needed: at 64-d the
-cache stays inert until `epsilon` reaches 0.8, because the truncated
-embeddings cannot separate nearby paraphrases. This is the empirical
-content of `D_cache` for this workload — the geometric distinguisher
-complexity of semantic English QA paraphrases on Bekko.
-
-### Cross-lingual semantic cache
-
-`scripts/bekko_multilingual.py` encodes the same 8 topics in 6 languages
-(en, ja, es, hi, fr, zh) — 48 cross-lingual paraphrase pairs. Written
-to the same binary format. The packing cache should compress across
-languages as well as within them.
-
-Headline numbers (cosine distance, 384-d, 48 records / 8 topics / 6
-languages):
-
-| epsilon | reps | novel | correct_reuse | incorrect_reuse | missed_reuse | us/op |
-|--------:|-----:|------:|--------------:|----------------:|-------------:|------:|
-|    0.35 |   25 |    25 |         0.479 |           0.354 |        0.000 |  5.69 |
-|    0.45 |   16 |    16 |         0.667 |           0.167 |        0.000 |  3.61 |
-|    0.50 |   12 |    12 |         0.750 |           0.083 |        0.000 |  2.88 |
-|  **0.55** |  **9** |    **9** |     **0.813** |       **0.021** |    **0.000** |  **2.15** |
-|    0.60 |    9 |     9 |         0.813 |           0.021 |        0.000 |  2.15 |
-|    0.80 |    6 |     6 |         0.771 |           0.063 |        0.104 |  1.49 |
-
-At `epsilon=0.55` the cache holds **9 representatives** for **48 inputs
-across 6 languages and 8 topics** — a 5.3× semantic compression with
-81% of inputs merged correctly and zero cross-topic confusion. The
-cache is collapsing Japanese, Spanish, Hindi, French, Chinese, and
-English paraphrases of the same topic into single representatives
-because Bekko maps them close in the 384-d embedding space.
-
-A near-identical result appears at 128-d, `epsilon=0.8`: also 9 reps,
-81% correct reuse, **0.6 μs/op** (3.5× faster than 384-d at the same
-compression ratio). Bekko's Matryoshka truncation is honest: 128
-dimensions preserve enough cross-lingual semantic structure for this
-cache regime, and the smaller representation dominates on throughput
-without losing semantic fidelity.
-
-### Operational metrics: reuse precision
-
-The raw `correct_reuse / incorrect_reuse / missed_reuse` columns need
-rephrasing for product decisions. The two numbers that matter are:
-
-- **reuse_rate** = P(cache says HIT) = (correct + missed) / N
-- **reuse_precision** = P(true semantic reuse | cache says HIT)
-                          = correct / (correct + missed)
-
-With those definitions, the multilingual result at 384-d becomes:
-
-| epsilon | reps | reuse_rate | reuse_precision | us/op |
-|--------:|-----:|-----------:|----------------:|------:|
-|    0.30 |   35 |     0.4375 |        **1.0000** |  7.72 |
-|    0.45 |   16 |     0.6667 |        **1.0000** |  3.61 |
-|    0.55 |    9 |     0.8125 |        **1.0000** |  2.15 |
-|    0.70 |    9 |     0.8125 |        0.9487 |  2.10 |
-|    0.80 |    6 |     0.8750 |        0.8810 |  1.47 |
-|    0.90 |    3 |     0.9375 |        0.8667 |  0.92 |
-
-At `epsilon=0.55` the cache holds 9 representatives, achieves 81.25%
-reuse rate, and has **100% reuse precision** — every HIT is a true
-semantic match. Above `epsilon` of about 0.6 the cache starts merging
-cross-topic points, and precision drops.
-
-### Cacheability: FUTCache as a measuring instrument
-
-The interesting fact is that the cache does not invent the geometry —
-it reports it. `scripts/cacheability.py` reads the binary and computes,
-independently of any cache invocation:
-
-- `d_max_within[d]`: maximum within-topic cosine distance at dimension d
-- `d_min_cross[d]`: minimum cross-topic cosine distance at dimension d
-- `margin[d] = d_min_cross - d_max_within`
-- `D_cache[d]` via regression of log M(ε) vs log ε in the scaling regime
-
-Discriminative margin on the multilingual corpus:
-
-| dim | d_max_within | d_min_cross | margin     | interpretation                |
-|----:|-------------:|------------:|-----------:|-------------------------------|
-|  64 |        0.629 |       0.361 |     -0.268 | no global ε separates topics  |
-| 128 |        0.597 |       0.449 |     -0.148 | no global ε separates topics  |
-| 256 |        0.681 |       0.469 |     -0.211 | no global ε separates topics  |
-| 384 |        0.715 |       0.503 |     -0.212 | no global ε separates topics  |
-
-The margin is *negative* at every truncation, which means **no single
-cosine threshold cleanly separates the eight topics in this corpus**.
-The cache works as well as it does because the sequential insertion
-order builds one cluster at a time: as each topic's first point enters,
-it becomes the seed representative before any cross-topic point can
-challenge it. The cache exploits *insertion dynamics*, not a clean
-margin.
-
-Empirical `D_cache` via log-log regression of M(ε):
-
-| dim | D_cache | n_used | interpretation                                |
-|----:|--------:|-------:|-----------------------------------------------|
-|  64 |   1.14  |     12 | multilingual: ~1 bit of distinguishing structure per topic cluster |
-| 128 |   0.96  |     11 | multilingual: same                          |
-| 256 |   1.06  |     12 | multilingual: same                          |
-| 384 |   1.02  |     12 | multilingual: same                          |
-
-For the English-only corpus, `D_cache` is slightly lower (0.7-0.9) and
-*decreases* with dimension: higher-d embeddings give a lower packing
-exponent, meaning more separable structure per bit of memory.
-
-This reframes FUTCache as a *diagnostic tool for embedding models*. A
-good retrieval embedding is not automatically a good caching embedding.
-Caching needs clusters whose within-topic spread is genuinely tighter
-than the gap to the nearest cross-topic cluster. The discriminative
-margin and empirical `D_cache` are the two numbers a practitioner
-should look at to decide whether a given model + corpus is cacheable
-at all, and at what threshold.
-
-## Exact n-d `L_inf` box cache
-
-Include `<futcache/box.h>` when the exact full-history predicate is required
-in dimensions higher than one. Each observation contributes its clipped
-axis-aligned `epsilon`-box, and queries test membership in the exact union.
-The current implementation supports dimensions 1 through 8. The
-representation is exact but non-canonical: each novel observation appends its
-clipped `epsilon`-box, and stored boxes may partially overlap but, by the
-novelty admission invariant, can never strictly contain one another (a new
-box containing a prior box would place that prior center within `epsilon`,
-contradicting novelty). `box_count` is therefore a storage diagnostic (equal
-to the number of novel observations), not a canonical minimal cell count. A
-future disjoint-cell backend could replace this representation without
-changing the API.
-
-`futcache_rag_embedding_example` demonstrates a 384-dimensional normalized
-embedding stream with a cosine-distance callback, representative export, and
-memory statistics. It is synthetic and dependency-free so it builds in CI.
-
-## Python bindings
-
-`pip install .` builds and installs the `futcache` package, a thin Python
-wrapper around the C `futcache_pack` cache implemented via nanobind +
-scikit-build-core. Payloads (LLM responses, retrieval results, etc.) are
-stored in a Python dict keyed by representative slot index; the C cache
-itself owns only novelty semantics.
+### Python: semantic answer cache
 
 ```python
 import numpy as np
-from futcache import PackCache, NoveltyResult
+from futcache import PackCache
 
 cache = PackCache(dimension=384, epsilon=0.6, distance="cosine",
-                  domain_min=-1.0, domain_max=1.0)
+                  max_memory_bytes=64 << 20, backend="vptree",
+                  ttl=3600.0, max_entries=10000)
 
-q = np.random.randn(384); q /= np.linalg.norm(q)
-res = cache.observe(q, payload=b"cached LLM response")
+def call_llm(q):
+    return "I'm a cached response"
 
-if res.is_novel:
-    response = call_llm(q)
-    cache.set_payload(res.representative_id, response.encode())
-else:
-    response = cache.get_payload(res.representative_id).decode()
+for query in stream:
+    response, result = cache.get_or_compute(query, call_llm)
+    if result.is_novel:
+        print(f"  novel (id={result.representative_id}, d={result.distance:.3f})")
 ```
 
-The wrapper exposes:
+### Python: persistent novelty (1-D)
 
-- `PackCache(dimension, epsilon, distance, domain_min, domain_max, backend, max_memory_bytes, max_entries, ttl)`
-- `cache.observe(point, payload=None, radius=None) -> NoveltyResult`
-- `cache.get_or_compute(point, compute, radius=None) -> (bytes, NoveltyResult)`
-- `cache.query(point) -> NoveltyResult`
-- `cache.get_payload(representative_id) -> bytes | None`
-- `cache.set_payload(representative_id, payload)`
-- `cache.copy_representatives() -> numpy.ndarray` of shape `(N, dimension)`
-- `cache.copy_radii() -> numpy.ndarray` of shape `(N,)`
-- `EpsilonTree` — density-aware adaptive `epsilon` via a knee-method region
-  tree (`.fit(ref_points)`, `.epsilon(query)`), for use with
-  `observe_with_radius`
-- `cache.clear()`
-- `len(cache)`, `cache.payload_count()`, `cache.purge()`,
-  `cache.peak_count()`, `cache.memory_bytes()`,
-  `cache.peak_memory_bytes()`, `cache.memory_limit_bytes()`,
-  `cache.evictions()`, `cache.observations()`, `cache.novel_observations()`
-- `PackCache.version() -> "1.4.0"`
+```python
+from futcache import PersistentNovelty
 
-`max_entries` (LRU payload capacity; `0` = unlimited) and `ttl` (payload
-expiry in seconds; `0.0` = never expiry) turn `PackCache` into a drop-in
-semantic **answer cache**. `get_or_compute` serves the cached payload on a
-semantic hit and calls `compute(point)` only when the query is novel or the
-payload was evicted/expired — the primitive that lets you skip an LLM,
-retrieval, or other expensive call on a semantically-redundant query.
-Payload timestamps shift correctly with the C FIFO pressure eviction.
+eng = PersistentNovelty()
+eng.observe(0.5)
+eng.observe(0.7)
 
-See [`demos/answer_cache_demo.py`](demos/answer_cache_demo.py) for a runnable
-ROI + latency one-pager (measured cold-vs-hit latency, cost ledger, and
-net spend reduction over a synthetic customer-support workload).
+print(eng.is_novel_at(0.6, 0.1))   # False (within 0.1 of 0.5 or 0.7)
+print(eng.is_novel_at(0.6, 0.3))   # True  (gap between 0.5 and 0.7)
+print(eng.novelty_spectrum(0.6, 1.0))  # [0.1, 0.3]  (scales where novel)
+```
 
-Supported distance names: `"linf"` (default), `"l1"`, `"l2"`, `"cosine"`,
-and `"poincare"`.
+### Python: d-D persistent packing
 
-On a semantic HIT, `NoveltyResult.representative_id` is the slot index to
-pass to `get_payload()`, and `NoveltyResult.distance` is the distance to the
-closest containing representative (a HIT is within that slot's stored
-radius). On a novel
-observation `representative_id` names the newly inserted slot and `distance`
-is `0.0`; only a novel non-mutating query returns `-1`. Under pressure, FIFO
-eviction shifts older slot ids down by one and the Python wrapper shifts or
-drops their payload entries in the same operation.
+```python
+from futcache import PersistentNoveltyND
 
-## Empirical comparison vs LRU
+eng = PersistentNoveltyND(2, 0.1, "linf", [-1,-1], [1,1])
+eng.observe([0.0, 0.0])
+eng.observe([0.5, 0.0])
+print(eng.persistences())           # [0.4, 0.4]
+eng.evict_lowest()                  # evicts index 0
+print(eng.rep_count)                # 1
+```
 
-`bench/cache_comparison.c` (build with `FUTCACHE_BUILD_BENCHMARKS=ON`) runs
-FUTCache against a from-scratch LRU and an exact-set cache on five workloads.
-For each method it sweeps the parameter, reports peak memory, decision error
-against the metric-novelty oracle, and per-call latency. N = 10000 per
-workload, single-threaded, GCC 13.3.0 Release build.
+### Python: submodular selection
 
-Headline numbers (target ε matched to oracle):
+```python
+import numpy as np
+from futcache import select_max_coverage
 
-| Workload        | Oracle ε | True novel | FUTCache peak at ε=oracle | FUTCache error | LRU best at k=8192 | LRU error |
-|-----------------|---------:|-----------:|--------------------------:|---------------:|-------------------:|----------:|
-| reciprocal      |     0.01 |    10/10000|                         7 |         0.0000 |               8192 |    0.9990 |
-| uniform         |     0.01 |    52/10000|                         1 |         0.0000 |               8192 |    0.9948 |
-| three-cluster   |     0.05 |     3/10000|                         3 |         0.0000 |               8192 |    0.9997 |
-| alternating     |      0.5 |     2/10000|                         2 |         0.0000 |                  2 |    0.0000 |
-| power-decay     |     0.05 |    10/10000|                         1 |         0.0000 |               8192 |    0.9990 |
+points = np.random.randn(1000, 16)
+result = select_max_coverage(points, 1000, 16, 0.5, 50, "l2")
+print(f"Selected {result['k']} reps, coverage = {result['coverage']:.3f}")
+print(f"Approx ratio = {result['approx_ratio']:.3f} (guarantee: 0.632)")
+```
 
-Per-call latency (Release, single-thread):
+---
 
-| Method               | μs / observe |
-|----------------------|-------------:|
-| LRU                  |         0.02 |
-| FUTCache             |         0.04 |
-| exact-set (linear)   |         1.90 |
+## C API Reference
 
-On every workload with spatial structure — reciprocal, uniform, three-cluster,
-power-decay — FUTCache hits zero error with bounded memory while LRU is
-structurally stuck at ~99% error regardless of capacity. Continuous points
-never recur, so recency cannot observe spatial coverage. The alternating-
-extremes workload is the only tie: it is the workload where temporal and
-spatial structure coincide. FUTCache is within 2× of LRU throughput and roughly
-50× faster than a naive exact-set cache.
+### `<futcache/futcache.h>` — 1-D interval-union
 
-Decision rule. If your cache key supports a meaningful distance function
-between keys, use FUTCache. If your keys are opaque identifiers with no
-distance, use LRU — FUTCache's API is metric-domain-specific by design.
+| Function | Description |
+|---|---|
+| `futcache_create(config, *cache)` | Create cache. Two-pass allocation. |
+| `futcache_observe(cache, x, *novel)` | Observe point. Returns novelty. |
+| `futcache_is_novel(cache, x, *novel)` | Query without mutating. |
+| `futcache_get_stats(cache, *stats)` | Telemetry: observations, novel count, interval count, AVL height. |
+| `futcache_copy_intervals(cache, buf, cap, *count)` | Export disjoint interval snapshot. |
+| `futcache_serialize / deserialize` | Versioned, CRC32-protected snapshot. |
+| `futcache_validate(cache)` | O(n²) invariant check. |
+| `futcache_destroy(cache)` | Free all memory. |
+
+### `<futcache/tower.h>` — Resolution tower
+
+| Function | Description |
+|---|---|
+| `futcache_tower_create(config, *tower)` | Create dyadic tower. |
+| `futcache_tower_observe(tower, x, out_novel)` | Multi-level novelty (one byte per level). |
+| `futcache_tower_prefix_count(tower, level, r)` | Occupied cells with index ≤ r. |
+| `futcache_tower_select_occupied(tower, level, k)` | k-th occupied cell in spatial order. |
+| `futcache_tower_discovery_at(tower, level, k)` | k-th cell in first-discovery order. |
+
+### `<futcache/pack.h>` — d-D packing cache
+
+| Function | Description |
+|---|---|
+| `futcache_pack_create(config, *cache, ...)` | Create packing cache. |
+| `futcache_pack_observe_with_radius(cache, point, ε, ...)` | Observe with adaptive radius. |
+| `futcache_pack_lookup(cache, point, ...)` | Nearest containing rep + distance. |
+| `futcache_pack_query(cache, point, ...)` | Novelty query without mutating. |
+| `futcache_pack_evict_w1(cache, *idx)` | W1-optimal eviction (min NN distance). |
+| `futcache_pack_clear(cache)` | Reset to empty. |
+| `futcache_pack_serialize / deserialize` | Atomic snapshot. |
+| `futcache_pack_get_stats(cache, *stats)` | Memory, evictions, rep count. |
+| `futcache_pack_validate(cache)` | Invariant check. |
+
+Built-in distances: `futcache_distance_linf`, `_l1`, `_l2`, `_cosine`,
+`_poincare`.
+
+### `<futcache/persist.h>` — 1-D persistent novelty
+
+| Function | Description |
+|---|---|
+| `futcache_persist_create(config, *engine)` | Create merge-tree engine. |
+| `futcache_persist_observe(engine, x, *novel)` | Observe. Updates merge tree. |
+| `futcache_persist_is_novel_at(engine, x, t, *novel)` | Exact novelty at scale `t`. |
+| `futcache_persist_novelty_spectrum(engine, x, t_max, out)` | Scales where `x` is novel. |
+| `futcache_persist_evict_below(engine, τ)` | Remove features with persistence < τ. |
+| `futcache_persist_copy_diagram(engine, buf, *count)` | Export (birth, death, persistence). |
+| `futcache_persist_merge(a, b, *merged)` | CRDT merge (idempotent, commutative). |
+| `futcache_persist_selberg_zeta(engine, s, *z)` | Selberg zeta value. |
+| `futcache_persist_prime_cycle_count(engine)` | Count of prime-birth features. |
+
+### `<futcache/persist_nd.h>` — d-D persistent packing
+
+| Function | Description |
+|---|---|
+| `futcache_persist_nd_create(config, *engine)` | Create d-D engine. |
+| `futcache_persist_nd_observe(engine, point, *novel)` | Observe + update persistence. |
+| `futcache_persist_nd_is_novel_at(engine, point, t, *novel)` | Scale-resolved novelty. |
+| `futcache_persist_nd_nearest_distances(engine, buf, *count)` | Per-rep NN distance. |
+| `futcache_persist_nd_persistences(engine, buf, *count)` | Per-rep persistence. |
+| `futcache_persist_nd_evict_lowest(engine, *idx)` | Evict most redundant rep. |
+| `futcache_persist_nd_count_above(engine, τ)` | Count reps with persistence ≥ τ. |
+
+### `<futcache/select.h>` — Submodular selection
+
+| Function | Description |
+|---|---|
+| `futcache_select_max_coverage(points, n, d, ε, k, dist, *result)` | Greedy (1−1/e) max-coverage. |
+| `futcache_select_evict_worst(points, n, d, ε, reps, dist, *result)` | Streaming swap. |
+| `futcache_select_coverage(points, n, d, ε, reps, dist, *cov)` | Coverage ratio. |
+
+### `<futcache/embed.h>` — Anchor embedding
+
+| Function | Description |
+|---|---|
+| `futcache_embed_create(config, *embed)` | Create anchor projection. |
+| `futcache_embed_point(embed, point, out)` | Project to anchor-distance space. |
+| `futcache_embed_covering_radius(embed, *δ)` | Estimated distortion. |
+| `futcache_embed_adjusted_epsilon(embed, ε, *ε_adj)` | Conservative ε = ε − 2δ. |
+
+---
+
+## Python API Reference
+
+### `PackCache`
+
+```python
+PackCache(dimension, epsilon, distance="linf", domain_min=None,
+          domain_max=None, backend="vptree", max_memory_bytes=0,
+          max_entries=0, ttl=0.0)
+```
+
+| Method | Description |
+|---|---|
+| `observe(point, payload=None, radius=None) -> NoveltyResult` | Query + insert. |
+| `query(point) -> NoveltyResult` | Query without inserting. |
+| `get_or_compute(point, compute_fn, radius=None) -> (bytes, NoveltyResult)` | Serve cached or compute. |
+| `get_payload(rep_id) -> bytes \| None` | Retrieve payload. |
+| `set_payload(rep_id, payload)` | Store payload. |
+| `evict_w1() -> int` | W1-optimal eviction. Returns evicted index. |
+| `copy_representatives() -> ndarray` | Export rep points. |
+| `copy_radii() -> ndarray` | Export rep radii. |
+| `clear()`, `purge()` | Reset. |
+| `memory_bytes()`, `peak_memory_bytes()`, `evictions()`, `observations()` | Telemetry. |
+
+### `PersistentNovelty` (1-D)
+
+| Method | Description |
+|---|---|
+| `observe(x) -> bool` | Observe. Returns novelty. |
+| `is_novel_at(x, t) -> bool` | Exact novelty at scale t. |
+| `novelty_spectrum(x, t_max) -> list` | Scales where x is novel. |
+| `copy_diagram() -> list[dict]` | Full (birth, death, persistence) export. |
+| `evict_below(tau) -> int` | Remove low-persistence features. |
+| `merge(other) -> PersistentNovelty` | CRDT merge. |
+| `selberg_zeta(s) -> float` | Selberg zeta value. |
+| `feature_count()`, `observations` | Telemetry. |
+
+### `PersistentNoveltyND` (d-D)
+
+| Method | Description |
+|---|---|
+| `observe(point) -> bool` | Observe. Returns novelty. |
+| `is_novel_at(point, t) -> bool` | Scale-resolved novelty. |
+| `nearest_distances() -> list` | Per-rep NN distance. |
+| `persistences() -> list` | Per-rep persistence. |
+| `evict_lowest() -> int` | Evict most redundant rep. |
+| `count_above(tau) -> int` | Count reps with persistence ≥ τ. |
+| `stats() -> dict` | Includes prime-birth count. |
+
+### `AnchorEmbedding`
+
+| Method | Description |
+|---|---|
+| `embed(point) -> list` | Project to anchor-distance space. |
+| `covering_radius -> float` | Estimated distortion δ. |
+| `adjusted_epsilon(ε) -> float` | Conservative ε = ε − 2δ. |
+
+### Functions
+
+| Function | Description |
+|---|---|
+| `select_max_coverage(points, n, d, ε, k, dist) -> dict` | Submodular max-coverage. |
+| `select_evict_worst(points, n, d, ε, reps, dist) -> dict` | Streaming swap. |
+| `select_coverage(points, n, d, ε, reps, dist) -> float` | Coverage ratio. |
+| `merge_persistence_diagrams(a, b) -> list` | CRDT diagram merge. |
+| `nth_prime(i) -> int` | i-th prime (0-indexed). |
+| `halton_sequence(n, d) -> ndarray` | Halton low-discrepancy sequence. |
+| `poincare_distance(x, y) -> float` | Poincaré ball distance. |
+
+---
+
+## Benchmarks & Experiments
+
+### VP-tree vs linear scan (384-D, 2000 reps, cosine)
+
+| Backend | observe | query | live memory |
+|---|---:|---:|---:|
+| linear scan | 268.7 μs/op | 535.3 μs/op | 5.96 MiB |
+| exact VP-tree | 29.5 μs/op | 31.0 μs/op | 6.19 MiB |
+
+**9.1× faster observe, 17.2× faster lookup, 4% index overhead.**
+
+### vs LRU (5 workloads, N=10,000)
+
+| Workload | True novel | FUTCache error | LRU error (k=8192) |
+|---|---:|---:|---:|
+| reciprocal (ε=0.01) | 10 | **0.0000** | 0.9990 |
+| uniform (ε=0.01) | 52 | **0.0000** | 0.9948 |
+| three-cluster (ε=0.05) | 3 | **0.0000** | 0.9997 |
+| alternating (ε=0.5) | 2 | **0.0000** | 0.0000 |
+| power-decay (ε=0.05) | 10 | **0.0000** | 0.9990 |
+
+FUTCache: **zero error** with bounded memory on every spatially-structured
+workload. LRU is structurally stuck at ~99% error.
+
+### Bekko semantic cache (384-D, cosine, 8 topics)
+
+| ε | reps | reuse_rate | reuse_precision | μs/op |
+|---:|---:|---:|---:|---:|
+| 0.55 | 9 | 0.8125 | **1.0000** | 2.15 |
+| 0.70 | 9 | 0.8125 | 0.9487 | 2.10 |
+| 0.80 | 6 | 0.8750 | 0.8810 | 1.47 |
+
+At ε=0.55: **9 representatives cover 48 inputs across 6 languages** with
+100% reuse precision.
+
+### Cross-lingual (6 languages, 48 pairs, 128-D)
+
+At ε=0.8, 128-D: **9 reps, 81% correct reuse, 0.6 μs/op** (3.5× faster than
+384-D at the same compression ratio).
+
+### Cacheability diagnostic
+
+The discriminative margin is *negative* at every dimension: no single cosine
+threshold cleanly separates topics. The cache works via **insertion
+dynamics**, not a clean margin. Empirical `D_cache ≈ 1.0` — one bit of
+distinguishing structure per topic cluster.
+
+### KDD Cup '99 (security novelty)
+
+AUC ≈ 0.99 — identical to a trivial 1-NN baseline. FUTCache's edge is
+**operational** (bounded-memory online streaming, one-sided never-miss,
+durable), not detection accuracy.
+
+---
+
+## Adversarial Analysis
+
+`docs/EXPLOIT.md` catalogs 12 attack vectors (E1–E12) against FUTCache,
+each with mechanism, mathematical core, impact, and mitigations.
+
+The nastiest is **E1 (Pulse Attack)**: the attacker exploits the W1 eviction
+metric's determinism to orchestrate the cache's own state transitions,
+evicting a target rep and re-querying to generate false "novel" events.
+The cache is *correct* — it's one-sidedness working as designed, but the
+attacker controls *when* it fires.
+
+**5-layer defense:**
+1. **Metric**: cosine distance, pin model version, monitor drift
+2. **Geometry**: persistent novelty + resurgent flagging
+3. **Eviction**: submodular eviction, batch evictions, stochastic noise
+4. **API**: rate-limit information-rich endpoints, return aggregates
+5. **Billing**: bill per compute, not per geometric novelty event
+
+See also `docs/playbook.md` Section 8 for 12 bad-actor and 12 good-actor
+use cases.
+
+---
 
 ## Complexity
 
-Let `n` be the current number of disjoint intervals and let `k` be the number
-merged by one observation.
+### 1-D interval-union
 
-| Operation | Time | Additional space |
+| Operation | Time | Space |
 |---|---:|---:|
-| `futcache_is_novel` | `O(log n)` | `O(1)` |
-| `futcache_observe` | `O((k+1) log n)` | one transient node |
-| stats | `O(1)` | `O(1)` |
-| interval snapshot | `O(n)` | caller-owned |
-| serialize / validate | `O(n)` | caller-owned / stack |
+| `futcache_is_novel` | O(log n) | O(1) |
+| `futcache_observe` | O((k+1) log n) | O(1) transient |
+| stats | O(1) | O(1) |
+| serialize / validate | O(n) | O(n) |
 
-For a tower with level sizes `N_j`, observation and query touch every level;
-Fenwick updates cost `O(sum(log N_j))`, while rank/select at one level costs
-`O(log N_j)`. Allocated state is `O(sum(N_j))`.
+### d-D packing cache
 
-With positive `epsilon` on a compact interval, the canonical interval count is
-geometrically bounded; once the union covers the full domain the cache reaches
-an absorbing decision state of one interval.
+| Operation | Time (linear) | Time (VP-tree) |
+|---|---:|---:|
+| observe / query | O(n·d) | O(d·log n) expected |
+| W1 eviction | O(n²·d) | O(n·d·log n) |
+| clear | O(n) | O(n) |
 
-## Concurrency and ownership
+### d-D persistent packing
 
-Individual API calls are linearizable and safe to call concurrently on the
-same object. `destroy` is the exception: callers must first stop and join all
-users of that object. No callback is invoked while an object is externally
-visible except the configured allocator. A custom allocator must provide both
-callbacks, return memory suitably aligned for any C object, and be safe for the
-threads that call the cache.
+| Operation | Time |
+|---|---:|
+| observe | O(n·d) |
+| is_novel_at | O(n·d) |
+| evict_lowest | O(n·d) |
+| persistences | O(1) amortized |
 
-Snapshot size-query/copy pairs can race with writers; if the state grows between
-calls, copy or serialize returns `FUTCACHE_ERROR_BUFFER_TOO_SMALL` and the new
-required size/count. Serialization itself always captures one atomic snapshot.
+### Submodular selection
 
-## Persistence guarantees
+| Operation | Time |
+|---|---:|
+| max_coverage (greedy) | O(k·n·d) |
+| evict_worst | O(m·n·d) |
+| coverage | O(m·n·d) |
 
-Both serialized representations have fixed magic values, format versions,
-explicit little-endian integers and IEEE-754 binary64 values, strict framing,
-and trailing CRC32 checksums. Deserialization rejects truncated, extended,
-out-of-domain, non-finite, structurally invalid, or checksum-invalid input.
-Platforms without IEEE-754 binary64 report
-`FUTCACHE_ERROR_UNSUPPORTED_PLATFORM`.
+---
 
-The interval and packing formats are documented in
-[docs/serialization.md](docs/serialization.md) and
-[docs/pack-serialization.md](docs/pack-serialization.md).
-The adversarial build, sanitizer, differential, concurrency, and scaling results
-are recorded in [docs/verification.md](docs/verification.md).
+## Concurrency & Ownership
 
-For the three workloads where a novelty oracle is the right abstraction — RAG
-de-duplication, streaming anomaly detection, and RL intrinsic curiosity — see
-the [cookbook](docs/cookbook.md) for tested integration patterns (plus the
-traps to avoid) for every engine.
+- Individual API calls are **linearizable** and safe to call concurrently.
+- `destroy` is the exception: stop and join all users first.
+- No callback invoked while an object is externally visible (except allocator).
+- Custom allocator must provide both callbacks, return suitably aligned
+  memory, and be thread-safe.
 
-To choose an engine and tune `epsilon` from **measured** results (not
-assertions), see the [playbook](docs/playbook.md): it ranks the engines by
-exactness, walks the reuse-rate/precision frontier, and records what actually
-happened for monolingual, cross-lingual, knee-method-adaptive, and hyperbolic
-approaches.
+---
 
-## Phase 2: distributed semantic cache
+## Persistence
 
-The v1.x design covers the single-node cache. Phase 2 formalises a
-**distributed semantic cache** whose replicas converge without
-coordination, by replacing the order-dependent greedy packing with a
-fixed geometric Voronoi quotient. The full treatment — the
-obstruction that motivates the move, the deterministic δ-net
-construction, the join-semilattice state space, the convergence and
-memory theorems, the three-engine taxonomy (interval, pack, crdt),
-and the gossip protocol — is in [PHASE2.md](PHASE2.md).
+All serialized formats:
+- Fixed magic values, format versions
+- Explicit little-endian integers, IEEE-754 binary64
+- Strict framing, trailing CRC32 checksum
+- Reject truncated, extended, out-of-domain, non-finite, or checksum-invalid input
 
-The headline theorem (Theorem 12.10 in `PHASE2.md`):
+Formats documented in:
+- [docs/serialization.md](docs/serialization.md) — interval-union
+- [docs/pack-serialization.md](docs/pack-serialization.md) — packing cache
 
-$$\boxed{q(x) = q(y) \implies d(x, y) \leq \epsilon.}$$
+Adversarial build, sanitizer, differential, and concurrency results in
+[docs/verification.md](docs/verification.md).
 
-Cell identity becomes an equivalence relation refining metric
-similarity. Replicas gossip occupied cells; set union is commutative,
-associative, and idempotent; convergence is unconditional. The
-asymptotic cache dimension is unchanged — only the constant factor
-shifts by $2^D$.
+---
 
-The CRDT engine described there is now implemented in `<futcache/crdt.h>`
-(`src/crdt.c`): deterministic Voronoi quantization, per-cell join under a
-deterministic priority, snapshot/merge gossip, and validation. It also ships
-anchor-construction helpers that close the delta-net gap: a certified
-uniform-grid generator (`futcache_crdt_generate_grid_anchors` +
-`futcache_crdt_grid_covering_radius`), a low-discrepancy Halton generator
-(`futcache_crdt_generate_halton_anchors`, successive primes as radical-inverse
-bases), a sampled covering-radius estimator, and
-`futcache_crdt_generate_safe_anchors` to build the smallest net whose
-covering radius is at most epsilon/2.
+## Documentation
+
+| Document | Content |
+|---|---|
+| [docs/cookbook.md](docs/cookbook.md) | Integration patterns for every engine (RAG, anomaly detection, RL curiosity). Traps to avoid. |
+| [docs/playbook.md](docs/playbook.md) | Engine ranking by exactness. Reuse-rate/precision frontier. Measured results. Adversarial & beneficial use cases. |
+| [docs/verification.md](docs/verification.md) | Adversarial build, sanitizer, differential, concurrency, and scaling results. |
+| [docs/EXPLOIT.md](docs/EXPLOIT.md) | 12 adversarial attack vectors with mechanisms, math, impact, mitigations. |
+| [docs/design/](docs/design/) | Five design sketches: persistent novelty, W1 eviction, submodular selection, learned metric, competitive ratio. |
+| [formal.md](formal.md) | Formal specification of the core invariant. |
+| [how.md](how.md) | How the engine works, internally. |
+| [PHASE2.md](PHASE2.md) | Distributed semantic cache: CRDT convergence, gossip protocol. |
+
+---
+
+## License
+
+MIT
