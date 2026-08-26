@@ -1724,6 +1724,316 @@ static bool test_poincare_distance_and_domain(void)
  * Test suite registration
  * ============================================================ */
 
+/* ============================================================
+ * W1-optimal eviction tests
+ * ============================================================ */
+
+/* Opaque struct futcache_pack hides `count`; use stats to read it. */
+static size_t w1_rep_count(const futcache_pack_t *c)
+{
+    futcache_pack_stats_t s;
+    if (futcache_pack_get_stats(c, &s) != FUTCACHE_OK) return 0;
+    return s.representative_count;
+}
+
+static bool test_w1_evict_empty(void)
+{
+    double lo[1] = {0.0}, hi[1] = {1.0};
+    futcache_pack_config_t cfg;
+    futcache_pack_config_init(&cfg);
+    cfg.dimension = 1;
+    cfg.epsilon = 0.1;
+    cfg.distance = futcache_distance_l1;
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+    futcache_pack_t *c = NULL;
+    TEST_STATUS(futcache_pack_create(&cfg, &c), FUTCACHE_OK);
+
+    size_t evicted = 99;
+    TEST_STATUS(futcache_pack_evict_w1(c, &evicted), FUTCACHE_ERROR_OUT_OF_RANGE);
+    TEST_ASSERT(evicted == 99); /* unchanged on failure */
+
+    futcache_pack_destroy(c);
+    return true;
+}
+
+static bool test_w1_evict_single(void)
+{
+    double lo[1] = {0.0}, hi[1] = {1.0};
+    futcache_pack_config_t cfg;
+    futcache_pack_config_init(&cfg);
+    cfg.dimension = 1;
+    cfg.epsilon = 0.1;
+    cfg.distance = futcache_distance_l1;
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+    futcache_pack_t *c = NULL;
+    TEST_STATUS(futcache_pack_create(&cfg, &c), FUTCACHE_OK);
+
+    double pt[1] = {0.5};
+    bool novel;
+    TEST_STATUS(futcache_pack_observe(c, pt, &novel), FUTCACHE_OK);
+    TEST_ASSERT(novel);
+
+    size_t evicted = 99;
+    TEST_STATUS(futcache_pack_evict_w1(c, &evicted), FUTCACHE_OK);
+    TEST_ASSERT(evicted == 0);
+
+    size_t n = 0;
+    TEST_STATUS(futcache_pack_copy_representatives(c, NULL, &n), FUTCACHE_OK);
+    TEST_ASSERT(n == 0);
+
+    TEST_STATUS(futcache_pack_validate(c), FUTCACHE_OK);
+    futcache_pack_destroy(c);
+    return true;
+}
+
+static bool test_w1_evicts_most_crowded(void)
+{
+    /* Three reps in 1D: 0.1, 0.3, 0.9 with eps=0.1 (L1).
+     * NN distances: 0.1->0.3=0.2, 0.3->0.1=0.2, 0.9->0.3=0.6
+     * Most crowded = index 0 (tie with index 1, lower index wins). */
+    double lo[1] = {0.0}, hi[1] = {1.0};
+    futcache_pack_config_t cfg;
+    futcache_pack_config_init(&cfg);
+    cfg.dimension = 1;
+    cfg.epsilon = 0.1;
+    cfg.distance = futcache_distance_l1;
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+    futcache_pack_t *c = NULL;
+    TEST_STATUS(futcache_pack_create(&cfg, &c), FUTCACHE_OK);
+
+    double pts[] = {0.1, 0.3, 0.9};
+    bool novel;
+    for (int i = 0; i < 3; i++) {
+        TEST_STATUS(futcache_pack_observe(c, &pts[i], &novel), FUTCACHE_OK);
+        TEST_ASSERT(novel);
+    }
+
+    size_t evicted = 99;
+    TEST_STATUS(futcache_pack_evict_w1(c, &evicted), FUTCACHE_OK);
+    TEST_ASSERT(evicted == 0); /* 0.1 evicted (tied NN dist 0.2, lower index) */
+
+    size_t n = 0;
+    TEST_STATUS(futcache_pack_copy_representatives(c, NULL, &n), FUTCACHE_OK);
+    TEST_ASSERT(n == 2);
+    double *buf = (double *)calloc(n, sizeof(double));
+    TEST_STATUS(futcache_pack_copy_representatives(c, buf, &n), FUTCACHE_OK);
+    TEST_NEAR(buf[0], 0.3, 1e-15);
+    TEST_NEAR(buf[1], 0.9, 1e-15);
+    free(buf);
+
+    TEST_STATUS(futcache_pack_validate(c), FUTCACHE_OK);
+    futcache_pack_destroy(c);
+    return true;
+}
+
+static bool test_w1_tail_eviction(void)
+{
+    /* 0.1, 0.5, 0.6 with eps=0.05: NN of 0.5 is 0.6 (d=0.1), NN of 0.6 is 0.5 (d=0.1).
+     * NN of 0.1 is 0.5 (d=0.4). Min NN = 0.1, shared by indices 1 and 2.
+     * Pair (1,2): left=1, right=2, left < right -> best_index=1. */
+    double lo[1] = {0.0}, hi[1] = {1.0};
+    futcache_pack_config_t cfg;
+    futcache_pack_config_init(&cfg);
+    cfg.dimension = 1;
+    cfg.epsilon = 0.05;
+    cfg.distance = futcache_distance_l1;
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+    futcache_pack_t *c = NULL;
+    TEST_STATUS(futcache_pack_create(&cfg, &c), FUTCACHE_OK);
+
+    double pts[] = {0.1, 0.5, 0.6};
+    bool novel;
+    for (int i = 0; i < 3; i++) {
+        TEST_STATUS(futcache_pack_observe(c, &pts[i], &novel), FUTCACHE_OK);
+        TEST_ASSERT(novel);
+    }
+
+    size_t evicted = 99;
+    TEST_STATUS(futcache_pack_evict_w1(c, &evicted), FUTCACHE_OK);
+    TEST_ASSERT(evicted == 1); /* 0.5 evicted */
+
+    size_t n = 0;
+    TEST_STATUS(futcache_pack_copy_representatives(c, NULL, &n), FUTCACHE_OK);
+    TEST_ASSERT(n == 2);
+    double *buf = (double *)calloc(n, sizeof(double));
+    TEST_STATUS(futcache_pack_copy_representatives(c, buf, &n), FUTCACHE_OK);
+    TEST_NEAR(buf[0], 0.1, 1e-15);
+    TEST_NEAR(buf[1], 0.6, 1e-15);
+    free(buf);
+
+    TEST_STATUS(futcache_pack_validate(c), FUTCACHE_OK);
+    futcache_pack_destroy(c);
+    return true;
+}
+
+static bool test_w1_multiple_evictions(void)
+{
+    /* 5 well-separated points, evict 3, verify count and validate. */
+    double lo[1] = {0.0}, hi[1] = {1.0};
+    futcache_pack_config_t cfg;
+    futcache_pack_config_init(&cfg);
+    cfg.dimension = 1;
+    cfg.epsilon = 0.1;
+    cfg.distance = futcache_distance_l1;
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+    futcache_pack_t *c = NULL;
+    TEST_STATUS(futcache_pack_create(&cfg, &c), FUTCACHE_OK);
+
+    double pts[] = {0.05, 0.25, 0.45, 0.65, 0.85};
+    bool novel;
+    for (int i = 0; i < 5; i++) {
+        TEST_STATUS(futcache_pack_observe(c, &pts[i], &novel), FUTCACHE_OK);
+        TEST_ASSERT(novel);
+    }
+    TEST_ASSERT(w1_rep_count(c) == 5);
+
+    size_t ev;
+    for (int i = 0; i < 3; i++) {
+        TEST_STATUS(futcache_pack_evict_w1(c, &ev), FUTCACHE_OK);
+    }
+    TEST_ASSERT(w1_rep_count(c) == 2);
+    TEST_STATUS(futcache_pack_validate(c), FUTCACHE_OK);
+
+    /* Telemetry invariant: count + evictions == novel_observations */
+    futcache_pack_stats_t stats;
+    TEST_STATUS(futcache_pack_get_stats(c, &stats), FUTCACHE_OK);
+    TEST_ASSERT((uint64_t)stats.representative_count + stats.evictions ==
+                stats.novel_observations);
+
+    futcache_pack_destroy(c);
+    return true;
+}
+
+static bool test_w1_one_sidedness_preserved(void)
+{
+    /* After W1 eviction, points near surviving reps must still be found. */
+    double lo[1] = {0.0}, hi[1] = {1.0};
+    futcache_pack_config_t cfg;
+    futcache_pack_config_init(&cfg);
+    cfg.dimension = 1;
+    cfg.epsilon = 0.1;
+    cfg.distance = futcache_distance_l1;
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+    futcache_pack_t *c = NULL;
+    TEST_STATUS(futcache_pack_create(&cfg, &c), FUTCACHE_OK);
+
+    double pts[] = {0.05, 0.35, 0.65, 0.95};
+    bool novel;
+    for (int i = 0; i < 4; i++) {
+        TEST_STATUS(futcache_pack_observe(c, &pts[i], &novel), FUTCACHE_OK);
+        TEST_ASSERT(novel);
+    }
+
+    size_t ev;
+    TEST_STATUS(futcache_pack_evict_w1(c, &ev), FUTCACHE_OK);
+
+    /* 0.06 is within 0.1 of 0.05. If 0.05 survived, it must be found. */
+    double query_pt[1] = {0.06};
+    bool is_novel;
+    TEST_STATUS(futcache_pack_is_novel(c, query_pt, &is_novel), FUTCACHE_OK);
+    if (ev != 0) {
+        /* 0.05 survived, so 0.06 must NOT be novel */
+        TEST_ASSERT(!is_novel);
+    }
+
+    TEST_STATUS(futcache_pack_validate(c), FUTCACHE_OK);
+    futcache_pack_destroy(c);
+    return true;
+}
+
+static bool test_w1_vptree_backend(void)
+{
+    /* W1 eviction with VP-tree backend in 4D. */
+    double lo[4] = {0, 0, 0, 0};
+    double hi[4] = {1, 1, 1, 1};
+    futcache_pack_config_t cfg;
+    futcache_pack_config_init(&cfg);
+    cfg.dimension = 4;
+    cfg.epsilon = 0.3;
+    cfg.distance = futcache_distance_l2;
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+    cfg.backend = &futcache_pack_vptree_backend;
+    futcache_pack_t *c = NULL;
+    TEST_STATUS(futcache_pack_create(&cfg, &c), FUTCACHE_OK);
+
+    /* Insert 20 deterministic points */
+    bool novel;
+    for (int i = 0; i < 20; i++) {
+        double pt[4];
+        for (int d = 0; d < 4; d++) {
+            pt[d] = fmod(0.07 * (i + 1) * (d + 1), 1.0);
+        }
+        TEST_STATUS(futcache_pack_observe(c, pt, &novel), FUTCACHE_OK);
+    }
+
+    size_t before = 0;
+    TEST_STATUS(futcache_pack_copy_representatives(c, NULL, &before), FUTCACHE_OK);
+    TEST_ASSERT(before >= 5); /* at least some points survived epsilon filtering */
+
+    /* Evict 3 */
+    size_t ev;
+    for (int i = 0; i < 3; i++) {
+        TEST_STATUS(futcache_pack_evict_w1(c, &ev), FUTCACHE_OK);
+    }
+
+    size_t after = 0;
+    TEST_STATUS(futcache_pack_copy_representatives(c, NULL, &after), FUTCACHE_OK);
+    TEST_ASSERT(after == before - 3);
+
+    /* Query should still work after eviction */
+    double query_pt[4] = {0.5, 0.5, 0.5, 0.5};
+    bool found;
+    double dist;
+    size_t idx;
+    TEST_STATUS(futcache_pack_lookup(c, query_pt, &found, &dist, &idx), FUTCACHE_OK);
+
+    TEST_STATUS(futcache_pack_validate(c), FUTCACHE_OK);
+    futcache_pack_destroy(c);
+    return true;
+}
+
+static bool test_w1_evict_all(void)
+{
+    /* Evict until empty. */
+    double lo[1] = {0.0}, hi[1] = {1.0};
+    futcache_pack_config_t cfg;
+    futcache_pack_config_init(&cfg);
+    cfg.dimension = 1;
+    cfg.epsilon = 0.1;
+    cfg.distance = futcache_distance_l1;
+    cfg.domain_min = lo;
+    cfg.domain_max = hi;
+    futcache_pack_t *c = NULL;
+    TEST_STATUS(futcache_pack_create(&cfg, &c), FUTCACHE_OK);
+
+    double pts[] = {0.05, 0.35, 0.65, 0.95};
+    bool novel;
+    for (int i = 0; i < 4; i++) {
+        TEST_STATUS(futcache_pack_observe(c, &pts[i], &novel), FUTCACHE_OK);
+    }
+
+    size_t ev;
+    for (int i = 0; i < 4; i++) {
+        TEST_STATUS(futcache_pack_evict_w1(c, &ev), FUTCACHE_OK);
+    }
+
+    size_t n = 0;
+    TEST_STATUS(futcache_pack_copy_representatives(c, NULL, &n), FUTCACHE_OK);
+    TEST_ASSERT(n == 0);
+    TEST_STATUS(futcache_pack_evict_w1(c, &ev), FUTCACHE_ERROR_OUT_OF_RANGE);
+
+    TEST_STATUS(futcache_pack_validate(c), FUTCACHE_OK);
+    futcache_pack_destroy(c);
+    return true;
+}
+
 int pack_test_suite(void)
 {
     static const test_case_t tests[] = {
@@ -1759,6 +2069,14 @@ int pack_test_suite(void)
             test_adaptive_snapshot_and_v1_compatibility},
         {"Poincare metric and open-ball domain",
             test_poincare_distance_and_domain},
+        {"W1 evict empty cache", test_w1_evict_empty},
+        {"W1 evict single rep", test_w1_evict_single},
+        {"W1 evicts most-crowded rep", test_w1_evicts_most_crowded},
+        {"W1 tail eviction renumbering", test_w1_tail_eviction},
+        {"W1 multiple evictions + telemetry", test_w1_multiple_evictions},
+        {"W1 one-sidedness preserved", test_w1_one_sidedness_preserved},
+        {"W1 with VP-tree backend", test_w1_vptree_backend},
+        {"W1 evict all to empty", test_w1_evict_all},
     };
     return run_test_cases("pack", tests, sizeof(tests) / sizeof(tests[0]));
 }

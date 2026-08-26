@@ -58,5 +58,9 @@ int pack_vptree_test_suite(void);
 int pack_stress_test_suite(void);
 int box_test_suite(void);
 int crdt_test_suite(void);
+int embed_test_suite(void);
+int select_test_suite(void);
+int persist_test_suite(void);
+int persist_nd_test_suite(void);
 
 #endif

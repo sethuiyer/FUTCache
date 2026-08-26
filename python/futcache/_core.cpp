@@ -26,6 +26,10 @@
 
 #include "futcache/futcache.h"
 #include "futcache/pack.h"
+#include "futcache/embed.h"
+#include "futcache/select.h"
+#include "futcache/persist.h"
+#include "futcache/persist_nd.h"
 
 namespace nb = nanobind;
 
@@ -117,6 +121,9 @@ public:
         cfg.dimension = dimension_;
         cfg.epsilon = epsilon;
         cfg.distance = resolve_distance(distance);
+        distance_name_ = distance;
+        distance_fn_ = cfg.distance;
+        distance_context_ = nullptr;
         cfg.distance_context = nullptr;
         cfg.domain_min = lo.data();
         cfg.domain_max = hi.data();
@@ -448,6 +455,55 @@ public:
     double ttl_seconds() const { return ttl_seconds_; }
     size_t max_entries() const { return max_entries_; }
 
+    /* W1-optimal eviction: evict the representative with the smallest
+     * distance to its nearest neighbour (the "most crowded" rep).
+     * Returns the slot index that was evicted. */
+    size_t evict_w1() {
+        std::lock_guard<std::mutex> lock(payload_mutex_);
+        size_t evicted = 0;
+        futcache_status_t st = futcache_pack_evict_w1(cache_, &evicted);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error("evict_w1 failed with status " +
+                                     std::to_string(static_cast<int>(st)));
+        }
+        /* After eviction, slot indices shift down by 1 for all reps
+         * that were after the evicted one. Re-key the payload maps. */
+        size_t before_count = evicted + 1; /* rep count before eviction */
+        shift_payloads_from(evicted, before_count);
+        return evicted;
+    }
+
+    /* Returns the W1 "importance" of each rep: its distance to the
+     * nearest other rep. Lower = more redundant = evicted first. */
+    std::vector<double> rep_importance() {
+        size_t n = 0;
+        futcache_status_t st = futcache_pack_copy_representatives(
+            cache_, nullptr, &n);
+        if (st != FUTCACHE_OK) throw std::runtime_error("copy reps failed");
+        if (n == 0) return {};
+        size_t cols = dimension_;
+        std::vector<double> buf(n * cols);
+        size_t written = n;
+        st = futcache_pack_copy_representatives(cache_, buf.data(), &written);
+        if (st != FUTCACHE_OK) throw std::runtime_error("copy reps failed");
+
+        /* Compute nearest-neighbour distance for each rep. */
+        std::vector<double> importance(n, INFINITY);
+        for (size_t i = 0; i < n; ++i) {
+            double best = INFINITY;
+            for (size_t j = 0; j < n; ++j) {
+                if (i == j) continue;
+                double d = distance_fn_(
+                    buf.data() + i * cols,
+                    buf.data() + j * cols,
+                    cols, distance_context_);
+                if (d < best) best = d;
+            }
+            importance[i] = best;
+        }
+        return importance;
+    }
+
     static int version_major() { return FUTCACHE_PY_VERSION_MAJOR; }
     static int version_minor() { return FUTCACHE_PY_VERSION_MINOR; }
     static int version_patch() { return FUTCACHE_PY_VERSION_PATCH; }
@@ -509,6 +565,9 @@ private:
     std::unordered_map<size_t, double> insert_time_;
     size_t max_entries_;   /* 0 = unlimited payload entries            */
     double ttl_seconds_;   /* 0.0 = no expiry                          */
+    std::string distance_name_;
+    futcache_distance_fn distance_fn_;
+    void *distance_context_ = nullptr;
 
     static double now_secs() {
         return std::chrono::duration<double>(
@@ -520,6 +579,36 @@ private:
         auto it = insert_time_.find(slot);
         if (it == insert_time_.end()) return true; /* stale: no known birth */
         return now_secs() - it->second > ttl_seconds_;
+    }
+
+    /* Shift payload/timestamp keys down by one for slots >= evicted_index,
+     * exactly as the C W1 eviction renumbers representatives. */
+    void shift_payloads_from(size_t evicted_index, size_t before_count) {
+        std::unordered_map<size_t, std::string> new_p;
+        std::unordered_map<size_t, double> new_a;
+        std::unordered_map<size_t, double> new_i;
+        new_p.reserve(payloads_.size());
+        for (auto &e : payloads_) {
+            if (e.first == evicted_index) continue;
+            size_t new_key = e.first;
+            if (e.first > evicted_index) new_key = e.first - 1U;
+            new_p.emplace(new_key, std::move(e.second));
+        }
+        for (auto &e : access_time_) {
+            if (e.first == evicted_index) continue;
+            size_t new_key = e.first;
+            if (e.first > evicted_index) new_key = e.first - 1U;
+            new_a.emplace(new_key, e.second);
+        }
+        for (auto &e : insert_time_) {
+            if (e.first == evicted_index) continue;
+            size_t new_key = e.first;
+            if (e.first > evicted_index) new_key = e.first - 1U;
+            new_i.emplace(new_key, e.second);
+        }
+        payloads_.swap(new_p);
+        access_time_.swap(new_a);
+        insert_time_.swap(new_i);
     }
 
     /* Shift every payload/id/timestamp map down by one slot (drop slot 0)
@@ -587,6 +676,494 @@ private:
     }
 };
 
+class AnchorEmbedding {
+public:
+    AnchorEmbedding(int dimension,
+                    std::vector<double> anchors,
+                    std::string distance,
+                    std::vector<double> domain_min,
+                    std::vector<double> domain_max)
+        : dimension_(static_cast<size_t>(dimension)),
+          distance_name_(distance) {
+        if (dimension_ == 0U) {
+            throw std::invalid_argument("dimension must be >= 1");
+        }
+        if (anchors.empty()) {
+            throw std::invalid_argument("anchors must be non-empty");
+        }
+        if (anchors.size() % dimension_ != 0U) {
+            throw std::invalid_argument(
+                "anchors.size must be a multiple of dimension");
+        }
+        anchor_count_ = anchors.size() / dimension_;
+
+        if (domain_min.size() != dimension_ || domain_max.size() != dimension_) {
+            throw std::invalid_argument(
+                "domain bounds must have length == dimension");
+        }
+        for (size_t i = 0; i < dimension_; ++i) {
+            if (domain_max[i] <= domain_min[i]) {
+                throw std::invalid_argument(
+                    "domain bounds: min must be < max per coordinate");
+            }
+        }
+
+        futcache_distance_fn dist_fn = resolve_distance(distance);
+
+        futcache_embed_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.dimension = dimension_;
+        cfg.anchor_count = anchor_count_;
+        cfg.anchors = anchors.data();
+        cfg.distance = dist_fn;
+        cfg.distance_context = nullptr;
+        cfg.domain_min = domain_min.data();
+        cfg.domain_max = domain_max.data();
+
+        futcache_status_t st = futcache_embed_create(&cfg, &embed_);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("embed create failed: ") +
+                futcache_status_string(st));
+        }
+
+        covering_radius_ = futcache_embed_covering_radius(embed_);
+        anchors_ = std::move(anchors);
+        domain_min_ = std::move(domain_min);
+        domain_max_ = std::move(domain_max);
+    }
+
+    ~AnchorEmbedding() {
+        if (embed_ != nullptr) {
+            futcache_embed_destroy(embed_);
+        }
+    }
+
+    std::vector<double> embed(const std::vector<double> &point) const {
+        if (point.size() != dimension_) {
+            throw std::invalid_argument(
+                "point dimension mismatch: expected " +
+                std::to_string(dimension_) +
+                ", got " + std::to_string(point.size()));
+        }
+        std::vector<double> result(anchor_count_);
+        futcache_status_t st = futcache_embed_point(
+            embed_, point.data(), result.data());
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("embed_point failed: ") +
+                futcache_status_string(st));
+        }
+        return result;
+    }
+
+    double covering_radius() const { return covering_radius_; }
+    size_t anchor_count() const { return anchor_count_; }
+    size_t dimension() const { return dimension_; }
+
+    double adjusted_epsilon(double epsilon_original) const {
+        double out;
+        futcache_status_t st = futcache_embed_adjusted_epsilon(
+            embed_, epsilon_original, &out);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("adjusted_epsilon failed: ") +
+                futcache_status_string(st));
+        }
+        return out;
+    }
+
+private:
+    size_t dimension_;
+    size_t anchor_count_;
+    futcache_embed_t *embed_ = nullptr;
+    double covering_radius_;
+    std::string distance_name_;
+    std::vector<double> anchors_;
+    std::vector<double> domain_min_;
+    std::vector<double> domain_max_;
+};
+
+/* PersistentNovelty wrapper */
+class PersistentNovelty {
+   public:
+    PersistentNovelty() {
+        futcache_persist_config_t cfg = {};
+        futcache_status_t st =
+            futcache_persist_create(&cfg, &engine_);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("futcache_persist_create failed: ") +
+                futcache_status_string(st));
+        }
+    }
+
+    ~PersistentNovelty() {
+        if (engine_ != nullptr) {
+            futcache_persist_destroy(engine_);
+            engine_ = nullptr;
+        }
+    }
+
+    /* Non-copyable */
+    PersistentNovelty(const PersistentNovelty &) = delete;
+    PersistentNovelty &operator=(const PersistentNovelty &) = delete;
+
+    void observe(double x) {
+        futcache_status_t st = futcache_persist_observe(engine_, x);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("futcache_persist_observe failed: ") +
+                futcache_status_string(st));
+        }
+    }
+
+    bool is_novel_at(double x, double t) const {
+        bool novel;
+        futcache_status_t st =
+            futcache_persist_is_novel_at(engine_, x, t, &novel);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("futcache_persist_is_novel_at failed: ") +
+                futcache_status_string(st));
+        }
+        return novel;
+    }
+
+    std::vector<double> novelty_spectrum(double x) const {
+        size_t count = 0;
+        futcache_status_t st = futcache_persist_novelty_spectrum(
+            engine_, x, nullptr, &count);
+        if (st != FUTCACHE_OK && st != FUTCACHE_ERROR_BUFFER_TOO_SMALL) {
+            throw std::runtime_error(
+                std::string("novelty_spectrum query failed: ") +
+                futcache_status_string(st));
+        }
+        std::vector<double> buf(count * 2);
+        st = futcache_persist_novelty_spectrum(engine_, x, buf.data(), &count);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("novelty_spectrum fill failed: ") +
+                futcache_status_string(st));
+        }
+        buf.resize(count * 2);
+        return buf;
+    }
+
+    std::vector<std::vector<double>> copy_diagram() const {
+        size_t count = 0;
+        futcache_status_t st = futcache_persist_copy_diagram(
+            engine_, nullptr, &count);
+        if (st != FUTCACHE_OK && st != FUTCACHE_ERROR_BUFFER_TOO_SMALL) {
+            throw std::runtime_error(
+                std::string("copy_diagram query failed: ") +
+                futcache_status_string(st));
+        }
+        std::vector<futcache_persist_feature_t> buf(count);
+        st = futcache_persist_copy_diagram(engine_, buf.data(), &count);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("copy_diagram fill failed: ") +
+                futcache_status_string(st));
+        }
+        // Convert to vector of vectors:
+        // [birth, death, birth_prime, death_prime, birth_value, death_value, persistence]
+        std::vector<std::vector<double>> result;
+        result.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            result.push_back({
+                (double)buf[i].birth,
+                (double)buf[i].death,
+                (double)buf[i].birth_prime,
+                (double)buf[i].death_prime,
+                buf[i].birth_value,
+                buf[i].death_value,
+                buf[i].persistence
+            });
+        }
+        return result;
+    }
+
+    std::vector<futcache_persist_feature_t> copy_diagram_raw() const {
+        size_t count = 0;
+        futcache_status_t st = futcache_persist_copy_diagram(
+            engine_, nullptr, &count);
+        if (st != FUTCACHE_OK && st != FUTCACHE_ERROR_BUFFER_TOO_SMALL) {
+            throw std::runtime_error(
+                std::string("copy_diagram query failed: ") +
+                futcache_status_string(st));
+        }
+        std::vector<futcache_persist_feature_t> buf(count);
+        st = futcache_persist_copy_diagram(engine_, buf.data(), &count);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("copy_diagram fill failed: ") +
+                futcache_status_string(st));
+        }
+        buf.resize(count);
+        return buf;
+    }
+
+    std::vector<futcache_persist_feature_t> merge_with(
+        const PersistentNovelty &other) const {
+        auto a = copy_diagram_raw();
+        auto b = other.copy_diagram_raw();
+        size_t out_count = a.size() + b.size();
+        std::vector<futcache_persist_feature_t> out(out_count);
+        futcache_status_t st = futcache_persist_merge_features(
+            a.data(), a.size(), b.data(), b.size(), out.data(), &out_count);
+        if (st != FUTCACHE_OK && st != FUTCACHE_ERROR_BUFFER_TOO_SMALL) {
+            throw std::runtime_error(
+                std::string("merge_features failed: ") +
+                futcache_status_string(st));
+        }
+        out.resize(out_count);
+        return out;
+    }
+
+    double selberg_zeta(double s) const {
+        double zeta;
+        futcache_status_t st =
+            futcache_persist_selberg_zeta(engine_, s, &zeta);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("selberg_zeta failed: ") +
+                futcache_status_string(st));
+        }
+        return zeta;
+    }
+
+    size_t prime_cycle_count(double tau = 0.0) const {
+        size_t count;
+        futcache_status_t st =
+            futcache_persist_prime_cycle_count(engine_, tau, &count);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("prime_cycle_count failed: ") +
+                futcache_status_string(st));
+        }
+        return count;
+    }
+
+    size_t feature_count(double tau = 0.0) const {
+        size_t count;
+        futcache_status_t st =
+            futcache_persist_feature_count(engine_, tau, &count);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("feature_count failed: ") +
+                futcache_status_string(st));
+        }
+        return count;
+    }
+
+    void clear() { futcache_persist_clear(engine_); }
+
+    nb::dict stats() const {
+        futcache_persist_stats_t s;
+        futcache_status_t st = futcache_persist_get_stats(engine_, &s);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("get_stats failed: ") +
+                futcache_status_string(st));
+        }
+        nb::dict d;
+        d["observations"] =
+            (uint64_t)s.observations;
+        d["feature_count"] = (size_t)s.feature_count;
+        d["prime_cycle_count"] = (size_t)s.prime_cycle_count;
+        d["max_persistence"] = (double)s.max_persistence;
+        d["min_persistence"] = (double)s.min_persistence;
+        d["total_persistence"] = (double)s.total_persistence;
+        d["memory_bytes"] = (size_t)s.memory_bytes;
+        return d;
+    }
+
+    uint64_t observations() const {
+        futcache_persist_stats_t s;
+        if (futcache_persist_get_stats(engine_, &s) == FUTCACHE_OK) {
+            return s.observations;
+        }
+        return 0;
+    }
+
+   private:
+    futcache_persist_t *engine_ = nullptr;
+};
+
+/* PersistentNoveltyND wrapper (d-D persistent packing, Design Sketch 01 Phase 3) */
+class PersistentNoveltyND {
+   public:
+    PersistentNoveltyND(int dimension,
+                        double epsilon,
+                        std::string distance,
+                        std::vector<double> domain_min,
+                        std::vector<double> domain_max)
+        : dimension_(static_cast<size_t>(dimension)),
+          distance_name_(distance) {
+        if (dimension_ == 0U) {
+            throw std::invalid_argument("dimension must be >= 1");
+        }
+        if (domain_min.size() != dimension_ || domain_max.size() != dimension_) {
+            throw std::invalid_argument("domain bounds must have length == dimension");
+        }
+        for (size_t i = 0; i < dimension_; ++i) {
+            if (!std::isfinite(domain_min[i]) || !std::isfinite(domain_max[i]) ||
+                domain_max[i] <= domain_min[i]) {
+                throw std::invalid_argument("domain bounds: finite, min < max per coord");
+            }
+        }
+        futcache_distance_fn dist_fn = resolve_distance(distance);
+        futcache_status_t st = futcache_persist_nd_create(
+            dimension_, epsilon, dist_fn, nullptr,
+            domain_min.data(), domain_max.data(), 0, nullptr, &engine_);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("persist_nd create failed: ") +
+                futcache_status_string(st));
+        }
+    }
+
+    ~PersistentNoveltyND() {
+        if (engine_ != nullptr) {
+            futcache_persist_nd_destroy(engine_);
+            engine_ = nullptr;
+        }
+    }
+
+    PersistentNoveltyND(const PersistentNoveltyND &) = delete;
+    PersistentNoveltyND &operator=(const PersistentNoveltyND &) = delete;
+
+    bool observe(std::vector<double> x) {
+        check_dim(x);
+        bool novel;
+        futcache_status_t st = futcache_persist_nd_observe(
+            engine_, x.data(), &novel);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("observe failed: ") + futcache_status_string(st));
+        }
+        return novel;
+    }
+
+    bool is_novel_at(std::vector<double> x, double t) const {
+        check_dim(x);
+        bool novel;
+        futcache_status_t st = futcache_persist_nd_is_novel_at(
+            engine_, x.data(), t, &novel);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("is_novel_at failed: ") + futcache_status_string(st));
+        }
+        return novel;
+    }
+
+    std::vector<double> nearest_distances() const {
+        size_t count = 0;
+        futcache_status_t st = futcache_persist_nd_nearest_distances(
+            engine_, nullptr, &count);
+        if (st != FUTCACHE_OK && st != FUTCACHE_ERROR_BUFFER_TOO_SMALL) {
+            throw std::runtime_error(
+                std::string("nearest_distances query failed: ") +
+                futcache_status_string(st));
+        }
+        std::vector<double> buf(count);
+        st = futcache_persist_nd_nearest_distances(engine_, buf.data(), &count);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("nearest_distances fill failed: ") +
+                futcache_status_string(st));
+        }
+        buf.resize(count);
+        return buf;
+    }
+
+    std::vector<double> persistences() const {
+        size_t count = 0;
+        futcache_status_t st = futcache_persist_nd_persistences(
+            engine_, nullptr, &count);
+        if (st != FUTCACHE_OK && st != FUTCACHE_ERROR_BUFFER_TOO_SMALL) {
+            throw std::runtime_error(
+                std::string("persistences query failed: ") +
+                futcache_status_string(st));
+        }
+        std::vector<double> buf(count);
+        st = futcache_persist_nd_persistences(engine_, buf.data(), &count);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("persistences fill failed: ") +
+                futcache_status_string(st));
+        }
+        buf.resize(count);
+        return buf;
+    }
+
+    size_t evict_lowest() {
+        size_t evicted;
+        futcache_status_t st = futcache_persist_nd_evict_lowest(engine_, &evicted);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("evict_lowest failed: ") + futcache_status_string(st));
+        }
+        return evicted;
+    }
+
+    size_t count_above(double tau) const {
+        size_t count;
+        futcache_status_t st = futcache_persist_nd_count_above(engine_, tau, &count);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("count_above failed: ") + futcache_status_string(st));
+        }
+        return count;
+    }
+
+    void clear() {
+        futcache_persist_nd_clear(engine_);
+    }
+
+    nb::dict stats() const {
+        futcache_persist_nd_stats_t s;
+        futcache_status_t st = futcache_persist_nd_get_stats(engine_, &s);
+        if (st != FUTCACHE_OK) {
+            throw std::runtime_error(
+                std::string("get_stats failed: ") + futcache_status_string(st));
+        }
+        nb::dict d;
+        d["observations"] = (uint64_t)s.observations;
+        d["rep_count"] = (size_t)s.rep_count;
+        d["max_persistence"] = (double)s.max_persistence;
+        d["min_persistence"] = (double)s.min_persistence;
+        d["avg_persistence"] = (double)s.avg_persistence;
+        d["prime_birth_count"] = (size_t)s.prime_birth_count;
+        d["memory_bytes"] = (size_t)s.memory_bytes;
+        return d;
+    }
+
+    size_t dimension() const { return dimension_; }
+    size_t rep_count() const {
+        futcache_persist_nd_stats_t s;
+        if (futcache_persist_nd_get_stats(engine_, &s) == FUTCACHE_OK) {
+            return s.rep_count;
+        }
+        return 0;
+    }
+
+   private:
+    void check_dim(const std::vector<double> &x) const {
+        if (x.size() != dimension_) {
+            throw std::invalid_argument(
+                "point dimension mismatch: engine has " +
+                std::to_string(dimension_) +
+                ", got " + std::to_string(x.size()));
+        }
+    }
+
+    size_t dimension_;
+    std::string distance_name_;
+    futcache_persist_nd_t *engine_ = nullptr;
+};
+
 }  // namespace
 
 NB_MODULE(futcache_ext, m) {
@@ -640,8 +1217,250 @@ NB_MODULE(futcache_ext, m) {
         .def("memory_limit_bytes", &PackCache::memory_limit_bytes)
         .def("copy_representatives", &PackCache::copy_representatives)
         .def("copy_radii", &PackCache::copy_radii)
+        .def("evict_w1", &PackCache::evict_w1,
+             "W1-optimal eviction: remove the rep with the smallest nearest-neighbour distance.")
+        .def("rep_importance", &PackCache::rep_importance,
+             "Per-rep nearest-neighbour distance (lower = more redundant).")
         .def("clear", &PackCache::clear)
         .def_static("version_major", &PackCache::version_major)
         .def_static("version_minor", &PackCache::version_minor)
         .def_static("version_patch", &PackCache::version_patch);
+
+    nb::class_<AnchorEmbedding>(m, "AnchorEmbedding")
+        .def(nb::init<int, std::vector<double>, std::string,
+                      std::vector<double>, std::vector<double>>(),
+             nb::arg("dimension"),
+             nb::arg("anchors"),
+             nb::arg("distance") = std::string("linf"),
+             nb::arg("domain_min"),
+             nb::arg("domain_max"))
+        .def("embed", &AnchorEmbedding::embed, nb::arg("point"),
+             "phi(x) = (d(x, a_1), ..., d(x, a_m)) — one coordinate per anchor.")
+        .def("covering_radius", &AnchorEmbedding::covering_radius,
+             "Estimated covering radius delta (lower bound). Distortion is 2*delta.")
+        .def("anchor_count", &AnchorEmbedding::anchor_count,
+             "Number of anchors (embedded dimension m).")
+        .def("dimension", &AnchorEmbedding::dimension,
+             "Original-space dimension d.")
+        .def("adjusted_epsilon", &AnchorEmbedding::adjusted_epsilon,
+             nb::arg("epsilon"),
+             "Conservative embedded epsilon = epsilon - 2*delta (no false positives at original epsilon).");
+
+    /* --- Submodular representative selection (Design Sketch 03) --- */
+
+    /* Max-coverage selection: given n points and a budget k, select k reps
+     * that maximize the number of points within epsilon of at least one rep.
+     * Returns a dict with 'indices', 'coverage', 'total', 'ratio',
+     * 'marginal_gains', 'opt_coverage', 'approx_ratio'. */
+    m.def("select_max_coverage",
+          [](nb::ndarray<double, nb::ndim<1>> points,
+             size_t n, size_t dimension, double epsilon, size_t k,
+             std::string distance) {
+              if (points.size() != n * dimension) {
+                  throw std::invalid_argument(
+                      "points.size must be n * dimension");
+              }
+              futcache_distance_fn dist_fn = resolve_distance(distance);
+              futcache_select_result_t *res = nullptr;
+              futcache_status_t st = futcache_select_max_coverage(
+                  points.data(), n, dimension, epsilon, k,
+                  dist_fn, nullptr, &res);
+              if (st != FUTCACHE_OK) {
+                  throw std::runtime_error(
+                      std::string("select_max_coverage failed: ") +
+                      futcache_status_string(st));
+              }
+              nb::dict d;
+              std::vector<size_t> idx(res->selected_indices,
+                                       res->selected_indices + res->selected_count);
+              d["indices"] = nb::cast(idx);
+              d["selected_count"] = nb::cast(res->selected_count);
+              d["total_covered"] = nb::cast(res->total_covered);
+              d["total_points"] = nb::cast(res->total_points);
+              d["coverage_ratio"] = nb::cast(res->coverage_ratio);
+              std::vector<double> mg(res->marginal_gains,
+                                     res->marginal_gains + res->selected_count);
+              d["marginal_gains"] = nb::cast(mg);
+              d["opt_coverage"] = nb::cast(res->opt_coverage);
+              d["approx_ratio"] = nb::cast(res->approximation_ratio);
+              futcache_select_free_result(res);
+              return d;
+          },
+          nb::arg("points"), nb::arg("n"), nb::arg("dimension"),
+          nb::arg("epsilon"), nb::arg("k"),
+          nb::arg("distance") = std::string("linf"),
+          "Submodular max-coverage selection with 1-1/e guarantee.");
+
+    /* Coverage of a given rep set over observed points. */
+    m.def("select_coverage",
+          [](nb::ndarray<double, nb::ndim<1>> points,
+             size_t n, size_t dimension, double epsilon,
+             nb::ndarray<double, nb::ndim<2>> reps,
+             std::string distance) {
+              size_t rep_count = reps.shape(0);
+              futcache_distance_fn dist_fn = resolve_distance(distance);
+              double coverage;
+              futcache_status_t st = futcache_select_coverage(
+                  points.data(), n,
+                  reps.data(), rep_count, dimension, epsilon,
+                  dist_fn, nullptr, &coverage);
+              if (st != FUTCACHE_OK) {
+                  throw std::runtime_error(
+                      std::string("select_coverage failed: ") +
+                      futcache_status_string(st));
+              }
+              return coverage;
+          },
+          nb::arg("points"), nb::arg("n"), nb::arg("dimension"),
+          nb::arg("epsilon"), nb::arg("reps"),
+          nb::arg("distance") = std::string("linf"),
+          "Fraction of observed points within epsilon of at least one rep.");
+
+    /* Streaming swap eviction: find the rep with lowest marginal coverage. */
+    m.def("select_evict_worst",
+          [](nb::ndarray<double, nb::ndim<1>> points,
+             size_t n, size_t dimension, double epsilon,
+             nb::ndarray<double, nb::ndim<2>> reps,
+             std::string distance) {
+              size_t rep_count = reps.shape(0);
+              futcache_distance_fn dist_fn = resolve_distance(distance);
+              size_t evict_idx;
+              double marginal_loss;
+              futcache_status_t st = futcache_select_evict_worst(
+                  points.data(), n,
+                  reps.data(), rep_count, dimension, epsilon,
+                  dist_fn, nullptr, &evict_idx, &marginal_loss);
+              if (st != FUTCACHE_OK) {
+                  throw std::runtime_error(
+                      std::string("select_evict_worst failed: ") +
+                      futcache_status_string(st));
+              }
+              nb::dict d;
+              d["evict_index"] = nb::cast(evict_idx);
+              d["marginal_loss"] = nb::cast(marginal_loss);
+              return d;
+          },
+          nb::arg("points"), nb::arg("n"), nb::arg("dimension"),
+          nb::arg("epsilon"), nb::arg("reps"),
+          nb::arg("distance") = std::string("linf"),
+          "Find the rep with lowest marginal coverage (streaming swap). Returns 'evict_index' and 'marginal_loss'.");
+
+    /* --- Persistent novelty (Design Sketch 01) --- */
+
+    nb::class_<PersistentNovelty>(m, "PersistentNovelty")
+        .def(nb::init<>())
+        .def("observe", &PersistentNovelty::observe, nb::arg("x"))
+        .def("is_novel_at", &PersistentNovelty::is_novel_at,
+             nb::arg("x"), nb::arg("t"))
+        .def("novelty_spectrum", &PersistentNovelty::novelty_spectrum,
+             nb::arg("x"),
+             "Return [0, t_max] or [] if x is observed.")
+        .def("copy_diagram", &PersistentNovelty::copy_diagram,
+             "Return list of [birth, death, birth_prime, death_prime, birth_value, death_value, persistence].")
+        .def("merge", [](const PersistentNovelty &self,
+                         const PersistentNovelty &other) {
+             auto a = self.copy_diagram_raw();
+             auto b = other.copy_diagram_raw();
+             size_t out_count = a.size() + b.size();
+             std::vector<futcache_persist_feature_t> out(out_count);
+             futcache_status_t st = futcache_persist_merge_features(
+                 a.data(), a.size(), b.data(), b.size(),
+                 out.data(), &out_count);
+             if (st != FUTCACHE_OK &&
+                 st != FUTCACHE_ERROR_BUFFER_TOO_SMALL) {
+                 throw std::runtime_error(std::string("merge failed: ") +
+                                          futcache_status_string(st));
+             }
+             out.resize(out_count);
+             // Convert to vector<vector<double>> for Python
+             std::vector<std::vector<double>> result;
+             result.reserve(out.size());
+             for (size_t i = 0; i < out.size(); ++i) {
+                 result.push_back({
+                     (double)out[i].birth, (double)out[i].death,
+                     (double)out[i].birth_prime, (double)out[i].death_prime,
+                     out[i].birth_value, out[i].death_value,
+                     out[i].persistence
+                 });
+             }
+             return result;
+         }, nb::arg("other"),
+             "CRDT merge: union of features (idempotent, commutative).")
+        .def("selberg_zeta", &PersistentNovelty::selberg_zeta,
+             nb::arg("s"))
+        .def("prime_cycle_count", &PersistentNovelty::prime_cycle_count,
+             nb::arg("tau") = 0.0)
+        .def("feature_count", &PersistentNovelty::feature_count,
+             nb::arg("tau") = 0.0)
+        .def("clear", &PersistentNovelty::clear)
+        .def("stats", &PersistentNovelty::stats)
+        .def("observations", &PersistentNovelty::observations)
+        .def("__repr__", [](const PersistentNovelty &e) {
+             char buf[256];
+             snprintf(buf, sizeof(buf),
+                      "PersistentNovelty(observations=%llu)",
+                      (unsigned long long)e.observations());
+             return std::string(buf);
+         });
+
+    /* Prime table accessors */
+    m.def("nth_prime", [](size_t i) {
+        return (size_t)futcache_persist_nth_prime(i);
+    }, nb::arg("i"), "Return the i-th prime (0-indexed). p_0=2, p_1=3, ...");
+
+    /* CRDT merge of two diagrams (free function) */
+    m.def("merge_persistence_diagrams",
+          [](const std::vector<futcache_persist_feature_t> &a,
+             const std::vector<futcache_persist_feature_t> &b) {
+              size_t out_count = a.size() + b.size();
+              std::vector<futcache_persist_feature_t> out(out_count);
+              futcache_status_t st = futcache_persist_merge_features(
+                  a.data(), a.size(), b.data(), b.size(),
+                  out.data(), &out_count);
+              if (st != FUTCACHE_OK &&
+                  st != FUTCACHE_ERROR_BUFFER_TOO_SMALL) {
+                  throw std::runtime_error(std::string("merge failed: ") +
+                                           futcache_status_string(st));
+              }
+              out.resize(out_count);
+              return out;
+          },
+          nb::arg("diagram_a"), nb::arg("diagram_b"),
+          "CRDT merge: union of two persistence diagrams.");
+
+    /* --- d-D persistent novelty (Design Sketch 01, Phase 3) --- */
+    nb::class_<PersistentNoveltyND>(m, "PersistentNoveltyND")
+        .def(nb::init<int, double, std::string, std::vector<double>, std::vector<double>>(),
+             nb::arg("dimension"), nb::arg("epsilon"),
+             nb::arg("distance") = std::string("linf"),
+             nb::arg("domain_min"), nb::arg("domain_max"),
+             "d-D persistent novelty engine. Tracks per-rep birth, nearest distance, and persistence.")
+        .def("observe", &PersistentNoveltyND::observe,
+             nb::arg("point"), "Observe a point. Returns true if novel.")
+        .def("is_novel_at", &PersistentNoveltyND::is_novel_at,
+             nb::arg("point"), nb::arg("t"),
+             "Is the point novel at scale t (distance threshold)?")
+        .def("nearest_distances", &PersistentNoveltyND::nearest_distances,
+             "Nearest-neighbour distance for each rep.")
+        .def("persistences", &PersistentNoveltyND::persistences,
+             "Persistence = nearest_dist - radius for each rep.")
+        .def("evict_lowest", &PersistentNoveltyND::evict_lowest,
+             "Evict the rep with the lowest persistence. Returns evicted index.")
+        .def("count_above", &PersistentNoveltyND::count_above,
+             nb::arg("tau"), "Count reps with persistence >= tau.")
+        .def("rep_count", &PersistentNoveltyND::rep_count)
+        .def("stats", &PersistentNoveltyND::stats)
+        .def("clear", &PersistentNoveltyND::clear)
+        .def("__repr__", [](const PersistentNoveltyND &e) {
+             char buf[256];
+             snprintf(buf, sizeof(buf),
+                      "PersistentNoveltyND(dim=%zu, reps=%zu)",
+                      e.dimension(), e.rep_count());
+             return std::string(buf);
+         });
+
+    m.attr("__version__") =
+        std::to_string(FUTCACHE_PY_VERSION_MAJOR) + "." +
+        std::to_string(FUTCACHE_PY_VERSION_MINOR) + "." +
+        std::to_string(FUTCACHE_PY_VERSION_PATCH);
 }

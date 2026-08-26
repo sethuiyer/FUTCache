@@ -61,6 +61,10 @@ add_library(futcache ${FUTCACHE_LIBRARY_TYPE}
   src/pack_vptree.c
   src/box.c
   src/crdt.c
+  src/embed.c
+  src/select.c
+  src/persist.c
+  src/persist_nd.c
 )
 add_library(FUTCache::futcache ALIAS futcache)
 
@@ -108,6 +112,10 @@ if(BUILD_TESTING)
     tests/test_pack_stress.c
     tests/test_box.c
     tests/test_crdt.c
+    tests/test_embed.c
+    tests/test_select.c
+    tests/test_persist.c
+    tests/test_persist_nd.c
   )
   target_link_libraries(futcache_tests PRIVATE FUTCache::futcache)
   target_compile_features(futcache_tests PRIVATE c_std_11)

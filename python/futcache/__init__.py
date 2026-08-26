@@ -24,8 +24,16 @@ from .adaptive import (
 )
 from .epsilon_tree import EpsilonTree
 from .futcache_ext import (
+    AnchorEmbedding as _AnchorEmbeddingRaw,
     NoveltyResult as _NoveltyResultRaw,
     PackCache as _PackCacheRaw,
+    PersistentNovelty as _PersistentNoveltyRaw,
+    PersistentNoveltyND as _PersistentNoveltyNDRaw,
+    merge_persistence_diagrams as _merge_persistence_diagrams,
+    nth_prime as _nth_prime,
+    select_max_coverage as _select_max_coverage,
+    select_coverage as _select_coverage,
+    select_evict_worst as _select_evict_worst,
 )
 
 
@@ -291,6 +299,25 @@ class PackCache:
         """Empty the representative set and drop all payloads."""
         self._impl.clear()
 
+    def evict_w1(self) -> int:
+        """W1-optimal eviction: remove the rep with the smallest
+        nearest-neighbour distance (the "most crowded" rep).
+
+        Returns the slot index that was evicted.
+        Payloads with ids above the evicted slot shift down by one.
+        """
+        return self._impl.evict_w1()
+
+    def rep_importance(self):
+        """Per-rep nearest-neighbour distance (lower = more redundant).
+
+        Returns a numpy array of shape (N,). A lower value means the
+        rep is closer to its nearest neighbour and thus a better
+        eviction candidate under the W1 policy.
+        """
+        import numpy as np
+        return np.asarray(self._impl.rep_importance(), dtype=np.float64)
+
     @staticmethod
     def version() -> str:
         return (f"{_PackCacheRaw.version_major()}."
@@ -344,14 +371,271 @@ def _as_ndarray(point, dimension: int):
 __all__ = [
     "AdaptiveRadiusController",
     "AdaptiveRadiusPolicy",
+    "AnchorEmbedding",
     "CompactIsolationForest",
     "EpsilonTree",
     "NoveltyResult",
     "PackCache",
+    "PersistentNovelty",
+    "PersistentNoveltyND",
     "halton_sequence",
     "halton_trials",
+    "merge_persistence_diagrams",
+    "nth_prime",
     "poincare_distance",
     "poincare_embed",
+    "select_coverage",
+    "select_evict_worst",
+    "select_max_coverage",
     "__version__",
 ]
 __version__ = PackCache.version()
+
+
+def nth_prime(i: int) -> int:
+    """Return the i-th prime (0-indexed). p_0=2, p_1=3, p_2=5, ..."""
+    return _nth_prime(i)
+
+
+def merge_persistence_diagrams(diagram_a: list, diagram_b: list) -> list:
+    """CRDT merge: union of two persistence diagrams (idempotent, commutative)."""
+    return _merge_persistence_diagrams(diagram_a, diagram_b)
+
+
+class PersistentNovelty:
+    """1-D persistent novelty engine (Design Sketch 01).
+
+    Maintains a merge tree (single-linkage dendrogram) over observed 1-D
+    points. Supports scale-resolved novelty queries, prime-tagged
+    persistence diagrams, CRDT merge, and the Selberg zeta function.
+
+    Typical use:
+
+        eng = PersistentNovelty()
+        eng.observe(0.5)
+        eng.observe(0.8)
+        eng.is_novel_at(0.55, 0.1)   # False (within 0.1 of 0.5)
+        eng.novelty_spectrum(0.6)     # [0.0, 0.1]  (novel up to t=0.1)
+        eng.copy_diagram()            # list of feature dicts
+        eng.selberg_zeta(2.0)         # Selberg zeta at s=2
+    """
+
+    def __init__(self):
+        self._impl = _PersistentNoveltyRaw()
+
+    def observe(self, x: float) -> None:
+        """Add a 1-D observation point."""
+        self._impl.observe(x)
+
+    def is_novel_at(self, x: float, t: float) -> bool:
+        """True iff x is outside U_t(H) — novel at scale t."""
+        return self._impl.is_novel_at(x, t)
+
+    def novelty_spectrum(self, x: float) -> list:
+        """Return [0, t_max] if x is novel, or [] if x is already observed."""
+        raw = self._impl.novelty_spectrum(x)
+        if not raw:
+            return []
+        # raw = [0.0, t_max] pairs; return as list of (lo, hi) tuples
+        return list(zip(raw[0::2], raw[1::2]))
+
+    def copy_diagram(self) -> list:
+        """Return the prime-tagged persistence diagram as a list of dicts.
+
+        Each dict has: birth, death, birth_prime, death_prime,
+        birth_value, death_value, persistence.
+        """
+        raw = self._impl.copy_diagram()
+        keys = ["birth", "death", "birth_prime", "death_prime",
+                 "birth_value", "death_value", "persistence"]
+        return [dict(zip(keys, row)) for row in raw]
+
+    def merge(self, other: "PersistentNovelty") -> list:
+        """CRDT merge: idempotent, commutative union of two diagrams.
+
+        Returns list of dicts with same structure as copy_diagram().
+        """
+        raw = self._impl.merge(other._impl)
+        keys = ["birth", "death", "birth_prime", "death_prime",
+                 "birth_value", "death_value", "persistence"]
+        return [dict(zip(keys, row)) for row in raw]
+
+    def selberg_zeta(self, s: float) -> float:
+        """Selberg zeta function over prime-birth features."""
+        return self._impl.selberg_zeta(s)
+
+    def prime_cycle_count(self, tau: float = 0.0) -> int:
+        """Count features with prime birth index and persistence >= tau."""
+        return self._impl.prime_cycle_count(tau)
+
+    def feature_count(self, tau: float = 0.0) -> int:
+        """Count features with persistence >= tau."""
+        return self._impl.feature_count(tau)
+
+    def clear(self) -> None:
+        """Reset all state."""
+        self._impl.clear()
+
+    @property
+    def observations(self) -> int:
+        return self._impl.observations()
+
+    def stats(self) -> dict:
+        """Return engine statistics dict."""
+        return self._impl.stats()
+
+    def __repr__(self):
+        return f"PersistentNovelty(observations={self.observations})"
+
+
+class PersistentNoveltyND:
+    """d-D persistent novelty engine (Design Sketch 01, Phase 3).
+
+    Wraps per-representative birth/death tracking on top of the pack cache.
+    Supports scale-resolved novelty queries, persistence computation, and
+    persistence-based eviction.
+
+    Typical use:
+
+        eng = PersistentNoveltyND(2, 0.1, distance="linf",
+                                   domain_min=[-1,-1], domain_max=[1,1])
+        eng.observe([0.0, 0.0])     # True (novel)
+        eng.observe([0.5, 0.0])     # True (novel)
+        eng.persistences()           # [0.4, 0.4]
+        eng.is_novel_at([0.25, 0.0], 0.1)  # False
+        eng.is_novel_at([0.25, 0.0], 0.2)  # True
+        eng.evict_lowest()           # evicts index 0
+    """
+
+    def __init__(self, dimension: int, epsilon: float, distance: str = "linf",
+                 domain_min: list = None, domain_max: list = None):
+        if domain_min is None:
+            domain_min = [-1.0] * dimension
+        if domain_max is None:
+            domain_max = [1.0] * dimension
+        self._impl = _PersistentNoveltyNDRaw(
+            dimension, epsilon, distance, domain_min, domain_max)
+        self._dimension = dimension
+
+    def observe(self, point: list) -> bool:
+        """Observe a d-dimensional point. Returns True if novel."""
+        return self._impl.observe(list(point))
+
+    def is_novel_at(self, point: list, t: float) -> bool:
+        """Is the point novel at scale t (distance threshold)?"""
+        return self._impl.is_novel_at(list(point), t)
+
+    def nearest_distances(self) -> list:
+        """Nearest-neighbour distance for each representative."""
+        return self._impl.nearest_distances()
+
+    def persistences(self) -> list:
+        """Persistence (nearest_dist - radius) for each rep."""
+        return self._impl.persistences()
+
+    def evict_lowest(self) -> int:
+        """Evict the rep with the lowest persistence. Returns evicted index."""
+        return self._impl.evict_lowest()
+
+    def count_above(self, tau: float) -> int:
+        """Count reps with persistence >= tau."""
+        return self._impl.count_above(tau)
+
+    @property
+    def rep_count(self) -> int:
+        return self._impl.rep_count()
+
+    def stats(self) -> dict:
+        return self._impl.stats()
+
+    def clear(self) -> None:
+        self._impl.clear()
+
+    def __repr__(self):
+        return (f"PersistentNoveltyND(dim={self._dimension}, "
+                f"reps={self.rep_count})")
+
+
+class AnchorEmbedding:
+    """Distance-to-anchors embedding (Design Sketch 04).
+
+    Projects d-dimensional points into m-dimensional space where m =
+    number of anchors. The distortion bound is 2*delta (delta = covering
+    radius of the anchor set). One-sidedness is preserved: if two points
+    are at distance > epsilon in the original space, their embeddings are
+    at distance > epsilon - 2*delta.
+
+    Typical use:
+
+        emb = AnchorEmbedding(dimension=384, anchors=[...], distance="cosine",
+                              domain_min=[-1]*384, domain_max=[1]*384)
+        embedded = emb.embed(point)   # m-dimensional vector
+        eps_adj = emb.adjusted_epsilon(0.45)  # conservative epsilon
+    """
+
+    def __init__(self, dimension: int, anchors: list, distance: str = "linf",
+                 domain_min: list = None, domain_max: list = None):
+        if domain_min is None:
+            domain_min = [-1.0] * dimension
+        if domain_max is None:
+            domain_max = [1.0] * dimension
+        self._impl = _AnchorEmbeddingRaw(
+            dimension, anchors, distance, domain_min, domain_max)
+        self._dimension = dimension
+
+    def embed(self, point: list) -> list:
+        """Project a point into anchor-distance space."""
+        return self._impl.embed(list(point))
+
+    @property
+    def covering_radius(self) -> float:
+        """Estimated covering radius delta (distortion = 2*delta)."""
+        return self._impl.covering_radius()
+
+    @property
+    def anchor_count(self) -> int:
+        return self._impl.anchor_count()
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    def adjusted_epsilon(self, epsilon: float) -> float:
+        """Conservative epsilon = epsilon - 2*delta (one-sidedness preserved)."""
+        return self._impl.adjusted_epsilon(epsilon)
+
+    def __repr__(self):
+        return (f"AnchorEmbedding(dim={self.dimension}, "
+                f"anchors={self.anchor_count}, "
+                f"delta={self.covering_radius:.4f})")
+
+
+def select_max_coverage(points, n: int, dimension: int, epsilon: float,
+                        k: int, distance: str = "linf") -> dict:
+    """Submodular max-coverage selection (Design Sketch 03).
+
+    Selects k representatives that maximize coverage of n points within
+    epsilon. Returns dict with indices, coverage ratio, marginal gains,
+    and (for n<=16) the optimal coverage for approximation ratio.
+    """
+    import numpy as np
+    pts = np.array(points).flatten()
+    return _select_max_coverage(pts, n, dimension, epsilon, k, distance)
+
+
+def select_coverage(points, n: int, dimension: int, epsilon: float,
+                    reps, distance: str = "linf") -> float:
+    """Fraction of points within epsilon of at least one rep."""
+    import numpy as np
+    pts = np.array(points).flatten()
+    r = np.array(reps).reshape(-1, dimension)
+    return _select_coverage(pts, n, dimension, epsilon, r, distance)
+
+
+def select_evict_worst(points, n: int, dimension: int, epsilon: float,
+                       reps, distance: str = "linf") -> dict:
+    """Find the rep with lowest marginal coverage (streaming swap)."""
+    import numpy as np
+    pts = np.array(points).flatten()
+    r = np.array(reps).reshape(-1, dimension)
+    return _select_evict_worst(pts, n, dimension, epsilon, r, distance)

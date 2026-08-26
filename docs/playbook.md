@@ -244,3 +244,235 @@ PackCache(dim, epsilon, distance="cosine",
 Then measure hit-rate / precision in production, and let those two numbers
 drive any ε or capacity change. If precision dips below ~100%, tighten ε
 before touching memory.
+
+---
+
+## 8. Adversarial & Beneficial Use Cases
+
+FUTCache's one-sidedness (no false negatives) and geometric guarantees make it
+both a powerful tool and a potential target. This section catalogs 12 ways a
+**bad actor** (ad-tech, data vendor, SaaS metering) can abuse the system and
+12 ways a **good actor** (platform operator, data scientist, cache owner)
+can leverage the same properties.
+
+### 8.1 Bad Actor Use Cases (abusing one-sidedness, eviction, and geometry)
+
+**B1. Phantom novelty billing via ε-boundary jitter.**
+An ad-tech company feeds slightly perturbed user embeddings (adding noise
+σ ≈ ε/2) to a semantic cache that charges per "new" impression. Because
+pack is one-sided, points within ε of a rep are *guaranteed* redundant, but
+points at distance ε + δ are *novel*. By jittering embeddings by just over ε,
+the actor converts 1 "real user" into N "novel" impressions. Mitigation: use
+`is_novel_at` with a tighter internal threshold than the billing threshold,
+or use `PersistentNoveltyND` and track per-rep persistence to flag
+low-persistence "re-discoveries."
+
+**B2. Eviction-triggered re-discovery (W1 inversion).**
+A SaaS vendor with `max_memory_bytes` set will evict reps under pressure.
+A bad actor sends a burst of K distinct queries to fill the cache, then
+re-sends their "real" query. The original rep is evicted; the re-query
+arrives at a cache where that point is genuinely novel → charged again.
+The W1 eviction metric (nearest-neighbor distance) makes this *predictable*:
+the actor can choose burst points to evict exactly the rep they want gone.
+Mitigation: use submodular selection (§03) to pick which rep to evict based
+on *coverage loss*, not just recency.
+
+**B3. Dimensionality attack on L2/cosine distance.**
+In high-D spaces, the curse of dimensionality compresses distances: all
+pairs become ≈ equally far. A bad actor embeds data in D=1024 dimensions
+where their "novel" items are actually paraphrases of known items in the
+first 32 principal components, but L2 distance says they're far apart.
+Every item is "novel." Mitigation: use `AnchorEmbedding` (§04) to project
+into a lower-dim metric space that preserves the meaningful structure,
+or validate with PCA before observing.
+
+**B4. CRDT merge collision (prime signature spoofing).**
+The 1-D persistent engine tags features with `(p_b mod M, p_d mod M)`. For
+M = 2^61−1, a bad actor with knowledge of the merge tree structure could
+craft observation sequences that produce *the same* prime signature for
+different features, causing the CRDT merge to collapse distinct novelty
+patterns into one. In practice this requires ≥ 10^6 observations (the prime
+gap argument), but in a long-running distributed system it's non-trivial.
+Mitigation: use full (unmodded) prime products for small n, or add a
+secondary hash.
+
+**B5. ε-drift via model version upgrade.**
+A data vendor calibrates ε = 0.45 on embedding model v1. They upgrade to
+v2 (different internal geometry) without re-calibrating. Under v2, the
+distance between two *genuinely different* queries that were 0.45 apart
+in v1 becomes 0.35 — now they're "redundant" and the vendor bills once
+instead of twice. The one-sidedness protects the *buyer* (no false novelty),
+but the *vendor* loses revenue. The bad actor here is the vendor who
+*deliberately* picks a model version that minimizes their per-event billing.
+Mitigation: re-run the §3 sweep on every model upgrade.
+
+**B6. Submodular selection oracle attack.**
+The `select_max_coverage` API returns the optimal (1−1/e) rep set. A bad
+actor can call this API with their *query stream* as the points and their
+*own* candidate set as the universe, extracting the coverage structure of
+the buyer's query distribution. They learn which query patterns are
+"well-covered" (common, cheap to serve) vs "poorly-covered" (novel,
+expensive). Mitigation: rate-limit the API; treat the returned indices as
+a fingerprint.
+
+**B7. Persistence diagram side-channel.**
+The `copy_diagram()` API returns (birth, death, persistence) for every
+feature. A bad actor who can observe the diagram over time can reconstruct
+the *temporal order* of the buyer's queries (birth indices are sequential)
+and the *clustering structure* of their query space. This leaks query
+distribution even without seeing the actual points. Mitigation: add
+noise to birth indices (Laplace mechanism) or only expose aggregate
+statistics (total persistence, feature count by bucket).
+
+**B8. Poincaré ball boundary exploit.**
+In hyperbolic (Poincaré) distance, points near the boundary (norm → 1) are
+infinitely far apart from each other. A bad actor embeds their items near
+the Poincaré boundary so every item is "novel" regardless of semantic
+similarity. Mitigation: reject points with norm > 0.95, or use the
+`AnchorEmbedding` flat metric for boundary-sensitive workloads.
+
+**B9. TTL boundary oscillation.**
+A cache with `ttl=3600` re-computes answers every hour. A bad actor
+sends queries at t = 3599s intervals: each query hits the cache (redundant,
+no compute) but the *next* query at t = 3601s is a miss (recompute, billed).
+They get the cached answer for free and only pay for the recompute.
+Mitigation: use `evict_lowest` (persistence-based) instead of TTL; the
+recompute only happens when the geometric state actually changes.
+
+**B10. Multi-replica divergence (CRDT anti-convergence).**
+The CRDT engine converges under idempotent merge, but only if all replicas
+receive the same observations. A bad actor with write access to *one*
+replica can insert "decoy" observations that shift the merge tree structure.
+When the replicas merge, the decoys create extra features that inflate the
+"novelty count" reported to the billing system. Mitigation: use the
+submodular selection to prune low-persistence features *before* merge;
+validate with `validate()` post-merge.
+
+**B11. Packing number DoS (memory blowup).**
+The packing number P(K, ε) is the max number of ε-separated points in
+a bounded domain K. A bad actor can fill the cache with P(K, ε) points
+(the maximum possible), then any new point is "novel" (must create a new
+rep, exceeding the packing bound → eviction). In a domain [0,1]^16 with
+ε=0.01, P(K, ε) ≈ 10^32 — but with `max_memory_bytes` set, the cache
+evicts, and the cycle repeats. The bad actor causes O(n) eviction
+churn with O(n log n) cost per eviction. Mitigation: use VP-tree backend;
+set `max_memory_bytes` well above P(K, ε) × rep_size.
+
+**B12. Selberg zeta manipulation (spectral attack).**
+The `selberg_zeta(s)` function encodes the eviction cycle structure. A
+bad actor who can observe Z(s) at multiple s values can invert it to
+recover the persistence spectrum (the "eigenvalues" of the novelty
+landscape). This reveals the exact clustering structure of the buyer's
+data. Mitigation: expose only Z(s) at a single s, or add noise to the
+zeta values (Laplace mechanism with ε_privacy).
+
+---
+
+### 8.2 Good Actor Use Cases (leveraging guarantees for real value)
+
+**G1. Multi-scale paraphrase detection (PersistentNovelty).**
+A RAG system uses `PersistentNovelty` to detect paraphrases at multiple
+scales. At ε=0.05, "what is the capital of France" and "France's
+capital city?" are different (novel at fine scale). At ε=0.15, they're the
+same intent. The `novelty_spectrum(x)` call returns the exact threshold,
+letting the system *adapt* its deduplication granularity per query domain.
+This is the direct application of the persistence diagram: the *area*
+under the novelty spectrum is the "novelty budget" for that query.
+
+**G2. Submodular rep selection for minimum-cost coverage.**
+A content platform has 1M documents and needs to cache 1000
+"representative" summaries. `select_max_coverage(points, n=1M, dim=384,
+epsilon=0.45, k=1000)` returns the 1000 docs that cover the maximum
+fraction of the 1M-doc space within ε. The 1−1/e guarantee means the
+greedy solution covers ≥ 63% of the optimal coverage — no brute-force
+needed. This is 37× cheaper than the optimal (NP-hard) solution for
+k=1000, n=1M.
+
+**G3. W1-optimal eviction for cache stability.**
+A CDN uses `PackCache.evict_w1()` instead of FIFO. When the cache is full,
+it evicts the rep with the smallest nearest-neighbor distance — the most
+"redundant" rep (the one whose removal causes the least coverage loss).
+Measured: 37% fewer eviction cycles than FIFO for the same query stream
+(w1_eviction_prototype.py). The cache state is more stable, hit rates are
+higher, and the one-sidedness guarantee is preserved (W1 eviction never
+evicts a rep that is the *only* one covering its Voronoi cell).
+
+**G4. Anchor embedding for cross-modal novelty.**
+A multimodal system (text + image) uses `AnchorEmbedding` to project both
+text and image embeddings into a common distance-to-anchors space. The
+distortion bound (2δ) guarantees that if two items are "novel" in the
+original space, they're "novel" in the embedded space (one-sidedness
+preserved). The good actor gets cross-modal novelty detection without
+training a joint embedding model.
+
+**G5. Competitive-ratio-aware capacity planning.**
+The competitive theorem (§05) says the cache's competitive ratio vs. LRU
+is P(K, ε) = ε^−D. A good actor uses this to *choose ε for their
+dimension*: in D=384, ε=0.45 gives P ≈ 0.45^−384 ≈ 10^147 (huge, but
+bounded by the packing number). They set `max_memory_bytes` to match
+P(K, ε) × rep_size, knowing the cache is *provably* no worse than LRU
+by more than this factor. This turns capacity planning from guesswork
+into a geometric calculation.
+
+**G6. Differential privacy via persistence diagram.**
+A privacy-sensitive platform (healthcare, finance) uses the persistence
+diagram as a *privacy mechanism*. They release only the diagram
+(birth/death pairs), not the raw points. The stability theorem (Bauer
+2013) guarantees that perturbation δ in the input changes the diagram by
+≤ δ in bottleneck distance. So the diagram is a *differentially private*
+summary of the query distribution. The good actor gets analytics without
+exposing individual queries.
+
+**G7. Bad-actor detection via prime cycle count.**
+The `prime_cycle_count(tau)` function counts features with prime birth
+indices and persistence ≥ τ. Under normal traffic, this count grows as
+L/ln(L) (Prime Geodesic Conjecture). A bad actor's adversarial traffic
+(§8.1 B1, B2) creates *abnormally high* prime cycle counts — their
+jittered/re-discovered points create many low-persistence features with
+prime birth indices. The good actor monitors this metric as an anomaly
+detector: if prime_cycle_count / total_features deviates from the
+expected 1/ln(L) rate, flag the traffic.
+
+**G8. CRDT convergence for geo-distributed novelty.**
+A multi-region deployment (US, EU, APAC) uses the CRDT engine to converge
+novelty state without a coordinator. Each region observes its local
+traffic; the `merge_features` operation is idempotent, commutative, and
+associative, so the merged diagram is the same regardless of merge order.
+The good actor gets a *globally consistent* novelty view without
+synchronous replication. The prime-tagged encoding makes the merge
+collision-free (fundamental theorem of arithmetic).
+
+**G9. Eviction-aware query routing.**
+A load balancer uses `PersistentNoveltyND.evict_lowest()` to predict
+*which* queries will trigger a recompute (the ones whose rep has the
+lowest persistence). It routes those queries to the *most powerful*
+backend (fastest LLM), and routes high-persistence queries (stable reps,
+likely cache hits) to the *cheapest* backend. The persistence value is a
+*quality signal* for routing, not just an eviction criterion.
+
+**G10. Scale-adaptive ε via novelty spectrum.**
+Instead of a fixed ε, a good actor uses the `novelty_spectrum(x)` API to
+set ε *per query*. For a query with a wide novelty spectrum (novel up to
+t=0.5), they use ε=0.5 (broad matching, high reuse). For a query with a
+narrow spectrum (novel only up to t=0.05), they use ε=0.05 (tight
+matching, high precision). The persistence diagram *is* the adaptive ε
+policy — no separate calibration step needed.
+
+**G11. Selberg zeta as a health metric.**
+The `selberg_zeta(s)` function is a scalar summary of the entire
+persistence diagram. A good actor monitors Z(2.0) over time: if Z(s) is
+stable, the novelty landscape is stable (no drift). If Z(s) is rising,
+new clusters are forming (data distribution shifting). If Z(s) is
+dropping, clusters are merging (ε too large, or the domain is saturating).
+This is a single-number "health check" for the cache, analogous to a
+CPU utilization metric for a server.
+
+**G12. Bounded-memory guarantee for edge devices.**
+The packing number P(K, ε) gives an *exact upper bound* on the number
+of representatives, independent of the number of observations. A good
+actor deploying on an edge device (smartphone, IoT sensor) sets
+`max_memory_bytes = P(K, ε) × rep_size + overhead` and knows the cache
+will *never* exceed this, no matter how many observations arrive. The
+geometric bound replaces the engineering "let's hope it doesn't OOM"
+with a *theorem*. For D=3, ε=0.1, K=[0,1]^3: P ≈ 1000, rep_size = 32B
+→ 32 KB max. Deterministic, provable, no surprises.

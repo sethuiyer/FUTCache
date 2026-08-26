@@ -26,6 +26,10 @@ int main(void)
     failures += pack_stress_test_suite();
     failures += box_test_suite();
     failures += crdt_test_suite();
+    failures += embed_test_suite();
+    failures += select_test_suite();
+    failures += persist_test_suite();
+    failures += persist_nd_test_suite();
     if (failures != 0) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

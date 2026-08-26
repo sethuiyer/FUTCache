@@ -362,6 +362,34 @@ FUTCACHE_API futcache_status_t futcache_pack_nearest(
 FUTCACHE_API futcache_status_t futcache_pack_clear(futcache_pack_t *cache);
 
 /*
+ * Evicts the representative with the smallest distance to its nearest
+ * neighbour (the "most crowded" rep). This is the W1-optimal eviction
+ * from Design Sketch 02: removing the rep whose mass is closest to a
+ * surviving rep causes the smallest change in the coverage measure.
+ *
+ * Unlike FIFO pressure eviction, this is a *selective* eviction: the
+ * caller chooses when to call it, and it is not triggered automatically
+ * by memory pressure. The evicted rep is removed from the representative
+ * set and the backend index; stats.evictions advances. If the cache is
+ * empty, FUTCACHE_ERROR_OUT_OF_RANGE is returned.
+ *
+ * On success, *out_evicted_index (if non-NULL) receives the slot index
+ * of the evicted representative *before* the shift. All subsequent slot
+ * indices are shifted down by one (the same renumbering as FIFO
+ * pressure eviction). Callers must not retain slot indices across this
+ * call.
+ *
+ * Complexity: O(n^2 * d) for the nearest-neighbour scan plus O(n) for
+ * the list splice and backend rebuild. For the VP-tree backend, the
+ * nearest-neighbour scan can be accelerated to O(n log n) by querying
+ * the tree for each rep (excluding itself); this is a future
+ * optimization.
+ */
+FUTCACHE_API futcache_status_t futcache_pack_evict_w1(
+    futcache_pack_t *cache,
+    size_t *out_evicted_index);
+
+/*
  * Validates the insertion-order packing invariant (each later representative
  * lies strictly outside every earlier representative's stored radius), the
  * telemetry lifecycle

@@ -1163,6 +1163,126 @@ futcache_status_t futcache_pack_nearest(
     return FUTCACHE_OK;
 }
 
+/*
+ * W1-optimal eviction: remove the representative with the smallest
+ * distance to its nearest neighbour.
+ *
+ * Rationale (Design Sketch 02): treating the representative set R as an
+ * empirical measure mu_R = (1/|R|) sum delta_r, the W1 cost of removing r
+ * is the distance from r to the nearest surviving representative. Removing
+ * the "most crowded" representative therefore minimises the redistribution
+ * of coverage mass. This is the nearest-neighbor-minimum heuristic.
+ *
+ * The evicted representative is spliced out of the FIFO list. Its
+ * allocation is freed (not recycled, unlike FIFO pressure eviction where
+ * the recycled allocation is immediately refilled). The backend index is
+ * rebuilt from scratch, matching the existing eviction pattern.
+ */
+static futcache_status_t evict_w1_locked(
+    futcache_pack_t *cache,
+    size_t *out_evicted_index)
+{
+    if (cache->count == 0U) {
+        return FUTCACHE_ERROR_OUT_OF_RANGE;
+    }
+
+    /* Phase 1: find the representative with the smallest nearest-neighbour
+     * distance. O(n^2 * d) brute force. For n > ~5000 the VP-tree backend
+     * can accelerate this to O(n log n) but the brute force is sufficient
+     * for the memory-ceiling regime where n is bounded by P(K, epsilon). */
+    double best_nn_distance = INFINITY;
+    size_t best_index = 0U;
+    const pack_representative_t *left = cache->representatives;
+    size_t left_index = 0U;
+
+    while (left != NULL) {
+        const pack_representative_t *right = left->next;
+        size_t right_index = left_index + 1U;
+        while (right != NULL) {
+            double d = cache->distance(
+                left->coordinates, right->coordinates,
+                cache->dimension, cache->distance_context);
+            if (d < best_nn_distance) {
+                best_nn_distance = d;
+                /* Pick the lower index on ties for determinism. */
+                if (left_index < right_index) {
+                    best_index = left_index;
+                } else {
+                    best_index = right_index;
+                }
+            }
+            right = right->next;
+            ++right_index;
+        }
+        left = left->next;
+        ++left_index;
+    }
+
+    /* If count == 1, best_index stays 0 (no pairs to compare). */
+    if (out_evicted_index != NULL) {
+        *out_evicted_index = best_index;
+    }
+
+    /* Phase 2: prepare backend for eviction. */
+    futcache_status_t status = prepare_backend_for_eviction_locked(cache);
+    if (status != FUTCACHE_OK) return status;
+
+    /* Phase 3: splice out the representative at best_index. */
+    pack_representative_t *to_free;
+    pack_representative_t **prev_ptr;
+    size_t i = 0U;
+    if (best_index == 0U) {
+        to_free = cache->representatives;
+        if (cache->count > 1U) {
+            cache->representatives = to_free->next;
+        } else {
+            cache->representatives = NULL;
+            cache->representatives_tail = NULL;
+        }
+        prev_ptr = NULL;
+    } else {
+        pack_representative_t *prev = cache->representatives;
+        for (i = 1U; i < best_index; ++i) {
+            prev = prev->next;
+        }
+        to_free = prev->next;
+        prev->next = to_free->next;
+        if (to_free == cache->representatives_tail) {
+            cache->representatives_tail = prev;
+        }
+        prev_ptr = &prev->next;
+    }
+    (void)prev_ptr;
+    to_free->next = NULL;
+    free_representative(&cache->allocator, to_free);
+    cache->count--;
+    cache->evictions = increment_saturating(cache->evictions);
+
+    /* Phase 4: rebuild backend. */
+    rebuild_backend_after_eviction_locked(cache);
+    return FUTCACHE_OK;
+}
+
+futcache_status_t futcache_pack_evict_w1(
+    futcache_pack_t *cache,
+    size_t *out_evicted_index)
+{
+    if (cache == NULL) return FUTCACHE_ERROR_INVALID_ARGUMENT;
+
+    pthread_rwlock_t *lock = &cache->lock;
+    pthread_rwlock_wrlock(lock);
+
+    if (cache->count == 0U) {
+        pthread_rwlock_unlock(lock);
+        return FUTCACHE_ERROR_OUT_OF_RANGE;
+    }
+
+    futcache_status_t status = evict_w1_locked(cache, out_evicted_index);
+    cache->generation = increment_saturating(cache->generation);
+    pthread_rwlock_unlock(lock);
+    return status;
+}
+
 futcache_status_t futcache_pack_clear(futcache_pack_t *cache)
 {
     if (cache == NULL) return FUTCACHE_ERROR_INVALID_ARGUMENT;
