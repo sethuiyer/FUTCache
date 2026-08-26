@@ -65,6 +65,7 @@ add_library(futcache ${FUTCACHE_LIBRARY_TYPE}
   src/select.c
   src/persist.c
   src/persist_nd.c
+  src/mdl.c
 )
 add_library(FUTCache::futcache ALIAS futcache)
 
@@ -116,6 +117,7 @@ if(BUILD_TESTING)
     tests/test_select.c
     tests/test_persist.c
     tests/test_persist_nd.c
+    tests/test_mdl.c
   )
   target_link_libraries(futcache_tests PRIVATE FUTCache::futcache)
   target_compile_features(futcache_tests PRIVATE c_std_11)
@@ -145,6 +147,34 @@ if(FUTCACHE_BUILD_EXAMPLES)
   target_link_libraries(futcache_box_example PRIVATE FUTCache::futcache m)
   target_compile_features(futcache_box_example PRIVATE c_std_11)
   futcache_enable_warnings(futcache_box_example)
+
+  add_executable(futcache_prime_novelty_experiment
+    examples/prime_novelty_experiment.c)
+  target_link_libraries(futcache_prime_novelty_experiment
+    PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_prime_novelty_experiment PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_prime_novelty_experiment)
+  if(BUILD_TESTING)
+    add_test(
+      NAME prime_novelty_experiment
+      COMMAND futcache_prime_novelty_experiment
+        --count 64 --epsilon 0.65 --local-primes 2,3,5,7 --top 3
+    )
+    set_tests_properties(prime_novelty_experiment PROPERTIES
+      TIMEOUT 60
+      PASS_REGULAR_EXPRESSION
+        "\\[archimedean\\] novel=63 representatives=63"
+    )
+  endif()
+
+  # Offline MDL comparison on equal-size structured, clustered, and random
+  # streams. This is intentionally an experiment, not stable-core machinery.
+  add_executable(futcache_mdl_stream_comparison
+    examples/mdl_stream_comparison.c)
+  target_link_libraries(futcache_mdl_stream_comparison
+    PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_mdl_stream_comparison PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_mdl_stream_comparison)
 
   # Deterministic empirical benchmark: checks the metric-caching invariants
   # (medoid collapse, outlier admission, separation, interval holes/ceilings,
@@ -308,6 +338,9 @@ install(FILES
   docs/verification.md
   docs/cookbook.md
   docs/playbook.md
+  docs/prime-novelty.md
+  docs/mdl.md
+  docs/mdl-stream-comparison.md
   docs/nitrosat_optimization.md
   DESTINATION ${CMAKE_INSTALL_DOCDIR}
 )

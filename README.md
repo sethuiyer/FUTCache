@@ -321,6 +321,7 @@ caller uses them explicitly.
 | **d-D persistent packing** | `<futcache/persist_nd.h>` | d-D | Per-representative birth/death tracking with persistence-based eviction. |
 | **Submodular selection** | `<futcache/select.h>` | d-D | Greedy max-coverage rep selection (1−1/e guarantee). Streaming evict-worst. |
 | **Anchor embedding** | `<futcache/embed.h>` | d→m | Distance-to-anchors projection with bounded distortion (2δ). Conservative ε adjustment. |
+| **MDL selector** | `<futcache/mdl.h>` | d-D | Offline finite-grid epsilon selection using measured model bytes and explicit residual code. |
 
 ### Interval-union cache (1-D, exact)
 
@@ -779,6 +780,15 @@ threshold cleanly separates topics. The cache works via **insertion
 dynamics**, not a clean margin. Empirical `D_cache ≈ 1.0` — one bit of
 distinguishing structure per topic cluster.
 
+### Arithmetic prime novelty
+
+The reproducible arithmetic experiment is documented in
+[docs/prime-novelty.md](docs/prime-novelty.md) and built as
+`futcache_prime_novelty_experiment`. It compares bounded prime gaps, residue
+vectors, individual p-adic lenses, and a weighted combined metric. Rankings
+use nearest-prior distance; epsilon verdicts and reduced representative
+persistence are reported separately.
+
 ### KDD Cup '99 (security novelty)
 
 AUC ≈ 0.99 — identical to a trivial 1-NN baseline. FUTCache's edge is
@@ -888,6 +898,9 @@ Adversarial build, sanitizer, differential, and concurrency results in
 | [docs/playbook.md](docs/playbook.md) | Engine ranking by exactness. Reuse-rate/precision frontier. Measured results. Adversarial & beneficial use cases. |
 | [docs/verification.md](docs/verification.md) | Adversarial build, sanitizer, differential, concurrency, and scaling results. |
 | [docs/EXPLOIT.md](docs/EXPLOIT.md) | 12 adversarial attack vectors with mechanisms, math, impact, mitigations. |
+| [docs/prime-novelty.md](docs/prime-novelty.md) | Arithmetic prime novelty experiment and CSV schema. |
+| [docs/mdl.md](docs/mdl.md) | Explicit MDL code and offline epsilon-selection API. |
+| [docs/mdl-stream-comparison.md](docs/mdl-stream-comparison.md) | Controlled structured/clustered/random MDL curves. |
 | [docs/design/](docs/design/) | Five design sketches: persistent novelty, W1 eviction, submodular selection, learned metric, competitive ratio. |
 | [formal.md](formal.md) | Formal specification of the core invariant. |
 | [how.md](how.md) | How the engine works, internally. |

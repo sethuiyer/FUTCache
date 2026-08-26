@@ -79,6 +79,17 @@ class TreeTests(unittest.TestCase):
         # scaling the data by 2 doubles the distances -> epsilon doubles
         self.assertAlmostEqual(eps_b, 2.0 * eps_a, places=6)
 
+    def test_mdl_selection_returns_finite_local_objectives(self):
+        pts = self._clustered(size=10)
+        tree = EpsilonTree(k=2, min_leaf=4, max_depth=2,
+                           distance="l2", selection="mdl",
+                           mdl_mode="lossy", mdl_lambda=1000.0).fit(pts)
+        self.assertTrue(np.isfinite(tree.global_epsilon_))
+        self.assertGreaterEqual(tree.global_epsilon_, 0.0)
+        self.assertIsNotNone(tree.mdl_objectives_)
+        self.assertTrue(np.all(np.isfinite(tree.mdl_objectives_)))
+        self.assertTrue(all(np.isfinite(eps) for _, eps, _ in tree.leaves()))
+
 
 if __name__ == "__main__":
     unittest.main()

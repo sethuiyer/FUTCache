@@ -30,6 +30,7 @@ int main(void)
     failures += select_test_suite();
     failures += persist_test_suite();
     failures += persist_nd_test_suite();
+    failures += mdl_test_suite();
     if (failures != 0) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

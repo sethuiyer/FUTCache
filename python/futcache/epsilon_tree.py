@@ -1,4 +1,4 @@
-"""Density-aware adaptive epsilon via a region tree + knee method.
+"""Density-aware adaptive epsilon via a region tree + knee or MDL method.
 
 The engine's single global ``epsilon`` is a blunt instrument: a threshold
 that "just works" everywhere is either too loose in dense regions or too
@@ -7,8 +7,8 @@ region*:
 
   1. Build a binary space-partition tree (recursive median split) over a
      calibration set of points (the reference density).
-  2. At each leaf, estimate a local ``epsilon`` as the **knee** of the
-     k-th-nearest-neighbour distance curve of the points in that leaf.
+  2. At each leaf, estimate a local ``epsilon`` using either the historical
+     **knee** method or an explicit finite-grid **MDL** objective.
      The knee of a k-distance plot is the canonical density-based clustering
      threshold (the DBSCAN heuristic): distances drop smoothly within a
      cluster and then the curve turns up sharply at the between-cluster
@@ -23,7 +23,8 @@ stabbing on the radii you hand it.
 
 Usage:
 
-    tree = EpsilonTree(k=3, min_leaf=6, max_depth=4).fit(ref_points)
+    tree = EpsilonTree(k=3, min_leaf=6, max_depth=4,
+                       selection="mdl").fit(ref_points)
     eps = tree.epsilon(query)          # a region-specific radius
     cpu  = PackCache(dim, 0.0, ...)    # base radius 0; adaptive per query
     res = cpu.observe(query, radius=eps)
@@ -51,10 +52,18 @@ class EpsilonTree:
     max_depth:
         Maximum binary-split depth (bounds tree size / over-fitting on the
         calibration set).
+    selection:
+        ``"knee"`` preserves the historical elbow heuristic; ``"mdl"``
+        evaluates a finite local k-distance grid with the explicit MDL code.
+    mdl_mode, mdl_lambda, mdl_precision:
+        Lossy squared-distortion settings or lossless precision settings for
+        the MDL selector.
     """
 
     def __init__(self, k: int = 3, min_leaf: int = 6, max_depth: int = 4,
-                 distance: str = "l2"):
+                 distance: str = "l2", selection: str = "knee",
+                 mdl_mode: str = "lossy", mdl_lambda: float = 1000.0,
+                 mdl_precision: float = 1e-3):
         if k < 1:
             raise ValueError("k must be >= 1")
         if min_leaf < 3:
@@ -63,14 +72,27 @@ class EpsilonTree:
             raise ValueError("max_depth must be >= 1")
         if distance not in ("l2", "l1", "linf", "cosine"):
             raise ValueError("distance must be l2, l1, linf, or cosine")
+        if selection not in ("knee", "mdl"):
+            raise ValueError("selection must be knee or mdl")
+        if mdl_mode not in ("lossless", "lossy"):
+            raise ValueError("mdl_mode must be lossless or lossy")
+        if not math.isfinite(mdl_lambda) or mdl_lambda < 0.0:
+            raise ValueError("mdl_lambda must be finite and non-negative")
+        if not math.isfinite(mdl_precision) or mdl_precision <= 0.0:
+            raise ValueError("mdl_precision must be finite and positive")
         self.k = k
         self.min_leaf = min_leaf
         self.max_depth = max_depth
         self.distance = distance
+        self.selection = selection
+        self.mdl_mode = mdl_mode
+        self.mdl_lambda = float(mdl_lambda)
+        self.mdl_precision = float(mdl_precision)
         self.ref_ = None
         self.root_ = None
         self.global_epsilon_ = None
         self.knee_curve_ = None
+        self.mdl_objectives_ = None
 
     # ------------------------------------------------------------ distance
     def _dist_matrix(self, pts):
@@ -129,10 +151,82 @@ class EpsilonTree:
 
     def _leaf_epsilon(self, idx):
         pts = self.ref_[idx]
+        if self.selection == "mdl":
+            return self._mdl_select(pts)[0]
         curve = self._k_distance_curve(pts)
         if curve is None or curve.size < 4:
             return self.global_epsilon_
         return self.knee(curve)
+
+    def _mdl_candidates(self, pts):
+        curve = self._k_distance_curve(pts)
+        if curve is None:
+            return np.array([0.0], dtype=np.float64)
+        values = np.unique(curve[np.isfinite(curve) & (curve > 0.0)])
+        if values.size == 0:
+            return np.array([0.0], dtype=np.float64)
+        return values
+
+    def _mdl_select(self, pts):
+        """Return (epsilon, objective curve) for one region.
+
+        The model term uses the exact native PackCache allocation for each
+        candidate. The data term follows the C MDL selector's assignment plus
+        lossless residual or squared-distortion code.
+        """
+        from . import PackCache
+
+        candidates = self._mdl_candidates(pts)
+        lo = np.min(pts, axis=0)
+        hi = np.max(pts, axis=0)
+        equal = hi <= lo
+        if np.any(equal):
+            hi = hi.copy()
+            lo = lo.copy()
+            hi[equal] = lo[equal] + 1.0
+        objectives = []
+        for index, epsilon in enumerate(candidates):
+            if self.mdl_mode == "lossless" and epsilon < self.mdl_precision:
+                objectives.append(float("inf"))
+                continue
+            cache = PackCache(
+                pts.shape[1], float(epsilon), self.distance,
+                domain_min=lo, domain_max=hi)
+            for point in pts:
+                cache.observe(point)
+            reps = cache.copy_representatives()
+            if reps.shape[0] == 0:
+                objectives.append(float("inf"))
+                continue
+            distances = self._distance_to_reps(pts, reps)
+            model_bits = 8.0 * cache.memory_bytes()
+            epsilon_bits = math.log2(index + 2.0)
+            data_bits = pts.shape[0] * math.log2(reps.shape[0])
+            if self.mdl_mode == "lossless":
+                data_bits += pts.shape[0] * pts.shape[1] * math.log2(
+                    float(epsilon) / self.mdl_precision)
+            else:
+                data_bits += self.mdl_lambda * float(np.sum(distances ** 2))
+            objectives.append(model_bits + epsilon_bits + data_bits)
+        objective_array = np.asarray(objectives, dtype=np.float64)
+        best = int(np.argmin(objective_array))
+        return float(candidates[best]), objective_array
+
+    def _distance_to_reps(self, pts, reps):
+        if self.distance == "cosine":
+            left = pts / np.maximum(np.linalg.norm(pts, axis=1, keepdims=True),
+                                    1e-15)
+            right = reps / np.maximum(np.linalg.norm(reps, axis=1, keepdims=True),
+                                      1e-15)
+            return 1.0 - np.clip(left @ right.T, -1.0, 1.0).max(axis=1)
+        diff = pts[:, None, :] - reps[None, :, :]
+        if self.distance == "l2":
+            matrix = np.sqrt(np.sum(diff * diff, axis=2))
+        elif self.distance == "l1":
+            matrix = np.sum(np.abs(diff), axis=2)
+        else:
+            matrix = np.max(np.abs(diff), axis=2)
+        return np.min(matrix, axis=1)
 
     # ------------------------------------------------------------ tree
     def _build(self, idx, depth):
@@ -156,7 +250,10 @@ class EpsilonTree:
         # global epsilon = knee of the global k-distance curve
         curve = self._k_distance_curve(self.ref_)
         self.knee_curve_ = curve
-        self.global_epsilon_ = self.knee(curve) if curve is not None else 0.0
+        if self.selection == "mdl":
+            self.global_epsilon_, self.mdl_objectives_ = self._mdl_select(self.ref_)
+        else:
+            self.global_epsilon_ = self.knee(curve) if curve is not None else 0.0
         idx = np.arange(self.ref_.shape[0])
         self.root_ = self._build(idx, 0)
         return self

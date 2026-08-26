@@ -62,5 +62,6 @@ int embed_test_suite(void);
 int select_test_suite(void);
 int persist_test_suite(void);
 int persist_nd_test_suite(void);
+int mdl_test_suite(void);
 
 #endif
