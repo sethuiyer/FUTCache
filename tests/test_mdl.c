@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 static bool test_mdl_lossless_grid(void)
@@ -83,11 +84,88 @@ static bool test_mdl_lossy_and_validation(void)
     return true;
 }
 
+static size_t semantic_false_merges(const double *points, const char *labels,
+                                    size_t point_count, double epsilon)
+{
+    const double lo[] = {0.0};
+    const double hi[] = {1.0};
+    futcache_pack_config_t config;
+    futcache_pack_config_init(&config);
+    config.dimension = 1U;
+    config.epsilon = epsilon;
+    config.distance = futcache_distance_l2;
+    config.domain_min = lo;
+    config.domain_max = hi;
+    futcache_pack_t *cache = NULL;
+    if (futcache_pack_create(&config, &cache) != FUTCACHE_OK) return SIZE_MAX;
+
+    char representative_labels[8] = {0};
+    size_t false_merges = 0U;
+    for (size_t i = 0U; i < point_count; ++i) {
+        bool found = false;
+        double distance = 0.0;
+        size_t index = SIZE_MAX;
+        if (futcache_pack_lookup(cache, points + i, &found, &distance,
+                                 &index) != FUTCACHE_OK) {
+            futcache_pack_destroy(cache);
+            return SIZE_MAX;
+        }
+        if (found && representative_labels[index] != labels[i]) {
+            false_merges++;
+        }
+        bool novel = false;
+        if (futcache_pack_observe(cache, points + i, &novel) != FUTCACHE_OK) {
+            futcache_pack_destroy(cache);
+            return SIZE_MAX;
+        }
+        if (novel) {
+            futcache_pack_stats_t stats;
+            if (futcache_pack_get_stats(cache, &stats) != FUTCACHE_OK ||
+                stats.representative_count > sizeof(representative_labels)) {
+                futcache_pack_destroy(cache);
+                return SIZE_MAX;
+            }
+            representative_labels[stats.representative_count - 1U] = labels[i];
+        }
+    }
+    futcache_pack_destroy(cache);
+    return false_merges;
+}
+
+static bool test_mdl_is_not_semantic_safety(void)
+{
+    /* Three duplicated intents; coarse geometric compression merges them. */
+    const double points[] = {0.10, 0.10, 0.45, 0.45, 0.80, 0.80};
+    const char labels[] = {'A', 'A', 'B', 'B', 'C', 'C'};
+    const double lo[] = {0.0};
+    const double hi[] = {1.0};
+    const double grid[] = {0.01, 0.50, 1.00};
+    futcache_mdl_config_t config;
+    futcache_mdl_config_init(&config);
+    config.epsilon_grid = grid;
+    config.epsilon_count = 3U;
+    config.mode = FUTCACHE_MDL_LOSSY;
+    config.distortion_weight = 1.0;
+
+    futcache_mdl_result_t curve[3];
+    size_t count = 3U;
+    size_t best = SIZE_MAX;
+    TEST_STATUS(futcache_mdl_select_epsilon(
+        points, 6U, 1U, futcache_distance_l2, NULL, lo, hi, &config,
+        curve, &count, &best), FUTCACHE_OK);
+    TEST_ASSERT(best == 2U);
+    TEST_ASSERT(curve[best].objective_bits < curve[0].objective_bits);
+    TEST_ASSERT(semantic_false_merges(points, labels, 6U, grid[0]) == 0U);
+    TEST_ASSERT(semantic_false_merges(points, labels, 6U, curve[best].epsilon) > 0U);
+    return true;
+}
+
 int mdl_test_suite(void)
 {
     static const test_case_t tests[] = {
         {"lossless finite-grid MDL selection", test_mdl_lossless_grid},
         {"lossy MDL and validation", test_mdl_lossy_and_validation},
+        {"geometric MDL is not semantic safety", test_mdl_is_not_semantic_safety},
     };
     return run_test_cases("mdl", tests, sizeof(tests) / sizeof(tests[0]));
 }

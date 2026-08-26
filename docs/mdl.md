@@ -67,3 +67,7 @@ streaming self-tuner can periodically rerun it on a sliding or reservoir
 sample, then apply the selected epsilon to a new generation of cache state.
 Changing epsilon in place would otherwise invalidate the meaning of existing
 representative balls.
+
+For the semantic-cache boundary, see
+[mdl-semantic-negative.md](mdl-semantic-negative.md): geometric description
+length is not a semantic-safety objective.

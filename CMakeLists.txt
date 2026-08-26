@@ -341,6 +341,7 @@ install(FILES
   docs/prime-novelty.md
   docs/mdl.md
   docs/mdl-stream-comparison.md
+  docs/mdl-semantic-negative.md
   docs/nitrosat_optimization.md
   DESTINATION ${CMAKE_INSTALL_DOCDIR}
 )

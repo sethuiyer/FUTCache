@@ -912,6 +912,7 @@ Adversarial build, sanitizer, differential, and concurrency results in
 | [docs/prime-novelty.md](docs/prime-novelty.md) | Arithmetic prime novelty experiment and CSV schema. |
 | [docs/mdl.md](docs/mdl.md) | Explicit MDL code and offline epsilon-selection API. |
 | [docs/mdl-stream-comparison.md](docs/mdl-stream-comparison.md) | Controlled structured/clustered/random MDL curves. |
+| [docs/mdl-semantic-negative.md](docs/mdl-semantic-negative.md) | Negative semantic-cache result: geometric MDL is not semantic safety. |
 | [docs/design/](docs/design/) | Five design sketches: persistent novelty, W1 eviction, submodular selection, learned metric, competitive ratio. |
 | [formal.md](formal.md) | Formal specification of the core invariant. |
 | [how.md](how.md) | How the engine works, internally. |
