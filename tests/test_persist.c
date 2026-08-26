@@ -646,6 +646,44 @@ static bool test_persist_stats(void)
     return true;
 }
 
+/*
+ * Locks the README Quick Start PersistentNovelty example.
+ * After observe(0.5) and observe(0.7), query 0.6 has min_dist = 0.1.
+ * is_novel_at is min_dist > t, so larger t is coarser (more coverage).
+ * Fallback: if this test fails, the README comments are wrong again.
+ */
+static bool test_readme_persist_example(void)
+{
+    futcache_persist_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    futcache_persist_t *eng = NULL;
+    TEST_STATUS(futcache_persist_create(&cfg, &eng), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_observe(eng, 0.5), FUTCACHE_OK);
+    TEST_STATUS(futcache_persist_observe(eng, 0.7), FUTCACHE_OK);
+
+    bool novel = true;
+    TEST_STATUS(futcache_persist_is_novel_at(eng, 0.6, 0.05, &novel),
+                FUTCACHE_OK);
+    TEST_ASSERT(novel == true);
+    TEST_STATUS(futcache_persist_is_novel_at(eng, 0.6, 0.1, &novel),
+                FUTCACHE_OK);
+    TEST_ASSERT(novel == false);
+    TEST_STATUS(futcache_persist_is_novel_at(eng, 0.6, 0.3, &novel),
+                FUTCACHE_OK);
+    TEST_ASSERT(novel == false);
+
+    double intervals[4];
+    size_t icount = 4;
+    TEST_STATUS(futcache_persist_novelty_spectrum(eng, 0.6, intervals, &icount),
+                FUTCACHE_OK);
+    TEST_ASSERT(icount == 1);
+    TEST_NEAR(intervals[0], 0.0, 1e-12);
+    TEST_NEAR(intervals[1], 0.1, 1e-12);
+
+    futcache_persist_destroy(eng);
+    return true;
+}
+
 int persist_test_suite(void)
 {
     static const test_case_t tests[] = {
@@ -662,6 +700,7 @@ int persist_test_suite(void)
         {"clear and reuse", test_persist_clear_reuse},
         {"randomized differential (100 trials)", test_persist_randomized},
         {"stats with prime cycle count", test_persist_stats},
+        {"README persist quick-start numbers", test_readme_persist_example},
     };
     return run_test_cases("persist", tests, sizeof(tests) / sizeof(tests[0]));
 }

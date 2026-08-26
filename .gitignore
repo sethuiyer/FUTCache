@@ -16,3 +16,5 @@ __pycache__/
 *.pyc
 pi-session-*.html
 /demos/.cache/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
