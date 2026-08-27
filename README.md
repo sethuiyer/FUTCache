@@ -8,6 +8,8 @@
 metric space you've already explored, so it can tell you when a point is
 genuinely new. C11 core with no third-party runtime library, plus Python bindings.
 
+> 🧭 **New to the project or looking for the high-level architecture?** Start with [**30KFEET.md**](30KFEET.md) for the 30,000-ft mental model, system architecture map, engine decision tree, and end-to-end usage flows.
+
 ---
 
 ## What is FUTCache?
@@ -920,6 +922,7 @@ Adversarial build, sanitizer, differential, and concurrency results in
 
 | Document | Content |
 |---|---|
+| [30KFEET.md](30KFEET.md) | **Start here**: 30,000-ft mental model, architectural layers, decision trees, subsystem map, and usage flows. |
 | [docs/cookbook.md](docs/cookbook.md) | Integration patterns for every engine (RAG, anomaly detection, RL curiosity). Traps to avoid. |
 | [docs/playbook.md](docs/playbook.md) | Engine ranking by exactness. Reuse-rate/precision frontier. Measured results. Adversarial & beneficial use cases. |
 | [docs/verification.md](docs/verification.md) | Adversarial build, sanitizer, differential, concurrency, and scaling results. |
