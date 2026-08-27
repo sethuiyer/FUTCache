@@ -83,6 +83,34 @@ Two honest limits make this precise:
 
 ---
 
+## Two Core Pillars: What FUTCache Solves
+
+FUTCache is a fundamental computational geometry primitive that solves two of the largest, most expensive problems in modern computing:
+
+### 1. The Observability & APM Crisis ($10B+ Market)
+* **The Problem:** Storing 100% of distributed microservice traces costs millions in Datadog/Splunk bills, but uniform 1% random sampling misses rare 1-in-a-million catastrophic incident traces.
+* **FUTCache's Solution:** A tiny, zero-dependency C11 engine running at **136k+ traces/sec** inside the local sidecar collector that **preferentially purges 72%+ of repetitive operational executions** while guaranteeing that **100% of structurally novel failure shapes are captured on Trace #1**.
+* 📊 *Empirical Receipt:* Tested on **1,000,000 real production Alibaba Cloud traces** ([`docs/alibaba-1m-scaling-benchmark.md`](docs/alibaba-1m-scaling-benchmark.md)) achieving 72.3% suppression and 0.29ms noise absorption.
+
+### 2. Neurosymbolic AI & Agentic Memory (The Frontier of AI)
+* **The Problem:** Multi-step LLM loops decay exponentially under **Lusser's Law** ($0.95^{20} \approx 35\%$), while vector databases and chat history summaries waste tokens on continuous operational jitter.
+* **FUTCache's Solution:** A deterministic operational visited-set where:
+  * **Ontology** governs exact symbolic guardrails (`Workflow`, `Tool`, `Permission`, `Business Object`).
+  * **FUTCache** governs continuous geometric experience, turning known operational states into **$O(1)$ zero-token deterministic fast-paths ($r = 1.0$)**.
+  * **CRDTs** give multi-agent fleets a shared **Geometric Blackboard** to eliminate redundant exploration across workers without locks.
+* 📜 *Manifesto:* Read [**`WHY_FUTCACHE.md`**](WHY_FUTCACHE.md) on defeating Lusser's Law and neurosymbolic state gates.
+
+---
+
+### The Complete Package
+1. **The Core Engine:** Pure POSIX C11 + VP-Tree spatial indexing + CRDT replication + Python bindings.
+2. **The 30,000-Ft Architecture:** [**`30KFEET.md`**](30KFEET.md) (Mental model, engine selector tree, subsystem guide).
+3. **The Neurosymbolic Manifesto:** [**`WHY_FUTCACHE.md`**](WHY_FUTCACHE.md) (Deterministic agent state & Lusser's Law antidote).
+4. **The Real Production Receipts:** [**`docs/alibaba-1m-scaling-benchmark.md`**](docs/alibaba-1m-scaling-benchmark.md) (1M real Alibaba traces, 72.3% suppression).
+5. **The Tail-Sampling Benchmark:** [**`docs/trace-sampling-benchmark.md`**](docs/trace-sampling-benchmark.md) (100k synthetic trace comparison vs random/latency gates).
+
+---
+
 ## When to use it
 
 **Good fits** — you have a stream of points in a metric space and you
