@@ -35,6 +35,21 @@ farther than `ε` from every representative.
 It is **not** a key/value store, and it doesn't do nearest-neighbor
 search. It answers one question, exactly: *have we covered this region?*
 
+### What FUTCache is now
+
+FUTCache is a bounded-memory geometric coverage and compression engine. It
+remembers a representative set of the observed region instead of the full
+trajectory, and its experimental MDL selector can choose a useful operating
+resolution from unlabeled geometry:
+
+> **ε* is the description-optimal resolution of the observed geometry.**
+
+That statement is relative to the supplied metric, explicit codec, and finite
+candidate grid. MDL selects geometric compressibility; it does not certify
+semantic interchangeability. For semantic answer caching, application labels
+or safety requirements may still demand a supervised ε choice. See the
+[MDL semantic negative result](docs/mdl-semantic-negative.md).
+
 ### Sufficient state for future novelty
 
 Another way to say this: **FUTCache is a sufficient-state compressor for
