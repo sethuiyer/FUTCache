@@ -923,6 +923,7 @@ Adversarial build, sanitizer, differential, and concurrency results in
 | Document | Content |
 |---|---|
 | [30KFEET.md](30KFEET.md) | **Start here**: 30,000-ft mental model, architectural layers, decision trees, subsystem map, and usage flows. |
+| [docs/trace-sampling-benchmark.md](docs/trace-sampling-benchmark.md) | **Empirical Benchmark**: Geometric tail-sampling on 100k distributed traces vs. random/latency baselines. |
 | [docs/cookbook.md](docs/cookbook.md) | Integration patterns for every engine (RAG, anomaly detection, RL curiosity). Traps to avoid. |
 | [docs/playbook.md](docs/playbook.md) | Engine ranking by exactness. Reuse-rate/precision frontier. Measured results. Adversarial & beneficial use cases. |
 | [docs/verification.md](docs/verification.md) | Adversarial build, sanitizer, differential, concurrency, and scaling results. |
