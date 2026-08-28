@@ -141,6 +141,7 @@ typedef struct {
     int indexed_finisher;
     uint64_t indexed_flips;
     uint32_t indexed_checkpoint;
+    const char *warm_start_path;
     NavokojCheckpoint checkpoint;
 } Options;
 
@@ -1406,6 +1407,7 @@ static void usage(const char *argv0)
         "  --exact                 run formal CDCL solver if heuristic fails\n"
         "  --proof FILE            emit DRAT proof of unsatisfiability to FILE\n"
         "  --weights FILE          emit heuristic variable importance weights to FILE\n"
+        "  --warm-start FILE       initialize solver state with literal hint file\n"
         "  --exact-max-clauses N   exact-mode clause ceiling (default: %" PRIu64 ")\n"
         "  --exact-memory-mb N     exact CDCL memory ceiling (default: %" PRIu64 ")\n"
         "  --exact-max-conflicts N exact CDCL conflict ceiling (default: %" PRIu64 ")\n",
@@ -1460,6 +1462,7 @@ static int parse_options(int argc, char **argv, Options *o)
         else if (!strcmp(argv[i], "--exact")) o->exact = 1;
         else if (!strcmp(argv[i], "--proof") && i + 1 < argc) o->proof_path = argv[++i];
         else if (!strcmp(argv[i], "--weights") && i + 1 < argc) o->weights_path = argv[++i];
+        else if (!strcmp(argv[i], "--warm-start") && i + 1 < argc) o->warm_start_path = argv[++i];
         else if (!strcmp(argv[i], "--exact-max-clauses") && i + 1 < argc && parse_u64(argv[i+1], &o->exact_max_clauses)) i++;
         else if (!strcmp(argv[i], "--exact-memory-mb") && i + 1 < argc && parse_u64(argv[i+1], &o->exact_memory_mb)) i++;
         else if (!strcmp(argv[i], "--exact-max-conflicts") && i + 1 < argc && parse_u64(argv[i+1], &o->exact_max_conflicts)) i++;
@@ -1675,6 +1678,21 @@ int main(int argc, char **argv)
         free(opt.add_files); return 2;
     }
 
+    if (opt.warm_start_path) {
+        FILE *ws_fp = fopen(opt.warm_start_path, "r");
+        if (ws_fp) {
+            for (uint32_t v = 1; v <= meta.num_vars; ++v) solver.x[v] = 0.05;
+            int64_t lit;
+            while (fscanf(ws_fp, "%" SCNd64, &lit) == 1 && lit != 0) {
+                uint32_t v = (uint32_t)(lit < 0 ? -lit : lit);
+                if (v >= 1 && v <= meta.num_vars) {
+                    solver.x[v] = (lit > 0) ? 0.95 : 0.05;
+                }
+            }
+            fclose(ws_fp);
+        }
+    }
+
     uint64_t unsat = meta.num_clauses;
     uint32_t epochs_run = 0;
     int io_ok = 1;
@@ -1699,6 +1717,7 @@ int main(int argc, char **argv)
                 seed_assignment[v] = solver.x[v] > 0.5 ? 1u : 0u;
             Verification initial_verification = {0};
             if (verify_assignment(&reader, &solver, &initial_verification)) {
+                retain_best(&initial_verification, &best_verification, &have_best, best_x, &solver);
                 navokoj_checkpoint_update(&opt.checkpoint, meta.num_vars,
                                           seed_assignment,
                                           initial_verification.hard_unsatisfied);
