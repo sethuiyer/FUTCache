@@ -439,6 +439,7 @@ implementation can dispatch on a single flag.
 - [x] VP-tree backend consistency after W1 eviction.
 - [x] W1 vs Gonzalez k-center: same accuracy at same k (bench/cache_comparison_extended.c).
 - [x] E1 Pulse Attack exploit: succeeds with 0–3 decoys on all 4 tested workloads (bench/exploit_e1_bench.c).
+- [x] E1 mitigation via persistent novelty: attack fails (0/4 evictions) on persist_nd-protected path with full-history retention (bench/exploit_e1_protected_bench.c). See docs/EXPLOIT.md §E1.
 - [ ] W1 vs FIFO on uniform distribution (expect parity — no structure).
 - [ ] W1 vs FIFO on adversarial workload (expect parity — always full).
 - [ ] Batch W1 (evict k at once vs greedy 1-at-a-time).

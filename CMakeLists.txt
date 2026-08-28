@@ -259,6 +259,14 @@ if(FUTCACHE_BUILD_BENCHMARKS)
   target_compile_features(futcache_exploit_e1_bench PRIVATE c_std_11)
   futcache_enable_warnings(futcache_exploit_e1_bench)
 
+  add_executable(futcache_exploit_e1_protected_bench
+    bench/exploit_e1_protected_bench.c)
+  target_link_libraries(futcache_exploit_e1_protected_bench
+    PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_exploit_e1_protected_bench
+    PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_exploit_e1_protected_bench)
+
   # ctest entries for the new benchmarks. Each runs in well under 30s and
   # must produce a recognisable output substring to pass.
   if(BUILD_TESTING)
@@ -297,6 +305,15 @@ if(FUTCACHE_BUILD_BENCHMARKS)
       TIMEOUT 60
       PASS_REGULAR_EXPRESSION
         "E1 Pulse Attack empirical benchmark"
+    )
+    add_test(
+      NAME exploit_e1_protected_bench
+      COMMAND futcache_exploit_e1_protected_bench
+    )
+    set_tests_properties(exploit_e1_protected_bench PROPERTIES
+      TIMEOUT 60
+      PASS_REGULAR_EXPRESSION
+        "PERSISTENT-NOVELTY protected path"
     )
   endif()
 endif()

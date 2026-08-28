@@ -1074,6 +1074,14 @@ unbounded and bounded modes). On all four tested workloads, the attack
 succeeds with 0–3 decoys after a ~150–4,000 μs recon pass. See
 `docs/EXPLOIT.md` §E1 for the empirical table.
 
+**Mitigation validated:** `bench/exploit_e1_protected_bench.c` runs the
+same attack against `futcache_persist_nd` (persistent novelty with
+resurgent flagging). On all four workloads, the attack **fails** — the
+target's coverage is preserved via the persist_nd full-history scan,
+even after persistence-based eviction removes the active rep. See
+`docs/EXPLOIT.md` §E1 "Mitigation Validation" for the side-by-side
+comparison (4/4 vs 0/4 evictions).
+
 **5-layer defense:**
 1. **Metric**: cosine distance, pin model version, monitor drift
 2. **Geometry**: persistent novelty + resurgent flagging
