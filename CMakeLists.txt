@@ -233,6 +233,72 @@ if(FUTCACHE_BUILD_BENCHMARKS)
   target_link_libraries(futcache_corpus_dedup PRIVATE FUTCache::futcache m)
   target_compile_features(futcache_corpus_dedup PRIVATE c_std_11)
   futcache_enable_warnings(futcache_corpus_dedup)
+
+  add_executable(futcache_cache_comparison_extended
+    bench/cache_comparison_extended.c)
+  target_link_libraries(futcache_cache_comparison_extended
+    PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_cache_comparison_extended
+    PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_cache_comparison_extended)
+
+  add_executable(futcache_crdt_fleet bench/crdt_fleet.c)
+  target_link_libraries(futcache_crdt_fleet PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_crdt_fleet PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_crdt_fleet)
+
+  add_executable(futcache_cache_comparison_2d bench/cache_comparison_2d.c)
+  target_link_libraries(futcache_cache_comparison_2d
+    PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_cache_comparison_2d PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_cache_comparison_2d)
+
+  add_executable(futcache_exploit_e1_bench bench/exploit_e1_bench.c)
+  target_link_libraries(futcache_exploit_e1_bench
+    PRIVATE FUTCache::futcache m)
+  target_compile_features(futcache_exploit_e1_bench PRIVATE c_std_11)
+  futcache_enable_warnings(futcache_exploit_e1_bench)
+
+  # ctest entries for the new benchmarks. Each runs in well under 30s and
+  # must produce a recognisable output substring to pass.
+  if(BUILD_TESTING)
+    add_test(
+      NAME cache_comparison_extended
+      COMMAND futcache_cache_comparison_extended
+    )
+    set_tests_properties(cache_comparison_extended PROPERTIES
+      TIMEOUT 60
+      PASS_REGULAR_EXPRESSION
+        "Geometric-baseline comparison"
+    )
+    add_test(
+      NAME cache_comparison_2d
+      COMMAND futcache_cache_comparison_2d
+    )
+    set_tests_properties(cache_comparison_2d PROPERTIES
+      TIMEOUT 60
+      PASS_REGULAR_EXPRESSION
+        "2D geometric-baseline comparison"
+    )
+    add_test(
+      NAME crdt_fleet
+      COMMAND futcache_crdt_fleet
+    )
+    set_tests_properties(crdt_fleet PROPERTIES
+      TIMEOUT 120
+      PASS_REGULAR_EXPRESSION
+        "CRDT fleet-replay benchmark"
+    )
+    add_test(
+      NAME exploit_e1_bench
+      COMMAND futcache_exploit_e1_bench
+    )
+    set_tests_properties(exploit_e1_bench PROPERTIES
+      TIMEOUT 60
+      PASS_REGULAR_EXPRESSION
+        "E1 Pulse Attack empirical benchmark"
+    )
+  endif()
 endif()
 
 if(FUTCACHE_BUILD_NITROSAT)
