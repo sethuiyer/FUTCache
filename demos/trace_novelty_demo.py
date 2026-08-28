@@ -223,6 +223,14 @@ def mdl_pick_epsilon(sigs, grid, mode="lossy", lam=1000.0, precision=1e-3):
 # ---------------------------------------------------------------------------
 
 # Late import after module definitions to satisfy topological imports.
+# Ensure local python/futcache is loaded before any site-packages copy.
+import os as _os_demo, sys as _sys_demo
+_repo_root_demo = _os_demo.path.dirname(_os_demo.path.dirname(_os_demo.path.abspath(__file__)))
+_python_pkg_demo = _os_demo.path.join(_repo_root_demo, 'python')
+if _python_pkg_demo not in _sys_demo.path:
+    _sys_demo.path.insert(0, _python_pkg_demo)
+
+
 from futcache import PackCache  # noqa: E402
 
 

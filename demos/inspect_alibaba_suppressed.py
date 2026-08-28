@@ -26,6 +26,14 @@ if python_pkg_dir not in sys.path:
     sys.path.insert(0, python_pkg_dir)
 
 import numpy as np
+# Ensure local python/futcache is loaded before any site-packages copy.
+import os as _os_demo, sys as _sys_demo
+_repo_root_demo = _os_demo.path.dirname(_os_demo.path.dirname(_os_demo.path.abspath(__file__)))
+_python_pkg_demo = _os_demo.path.join(_repo_root_demo, 'python')
+if _python_pkg_demo not in _sys_demo.path:
+    _sys_demo.path.insert(0, _python_pkg_demo)
+
+
 from futcache import PackCache
 from demos.alibaba_1m_scaling_benchmark import (
     stream_real_alibaba_traces,

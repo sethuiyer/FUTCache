@@ -46,6 +46,12 @@ from collections import defaultdict
 import numpy as np
 
 try:
+    import os as _os_demo, sys as _sys_demo
+    _repo_root_demo = _os_demo.path.dirname(_os_demo.path.dirname(_os_demo.path.abspath(__file__)))
+    _python_pkg_demo = _os_demo.path.join(_repo_root_demo, 'python')
+    if _python_pkg_demo not in _sys_demo.path:
+        _sys_demo.path.insert(0, _python_pkg_demo)
+
     from futcache import PackCache
 except ImportError as e:
     sys.exit(f"futcache not importable: {e}\nbuild it first: pip install .")
