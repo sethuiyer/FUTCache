@@ -83,9 +83,9 @@ Two honest limits make this precise:
 
 ---
 
-## Two Core Pillars: What FUTCache Solves
+## Three Core Pillars: What FUTCache Solves
 
-FUTCache is a fundamental computational geometry primitive that solves two of the largest, most expensive problems in modern computing:
+FUTCache is a fundamental computational geometry primitive that solves three of the largest, most expensive problems in modern computing:
 
 ### 1. The Observability & APM Crisis ($10B+ Market)
 * **The Problem:** Storing 100% of distributed microservice traces costs millions in Datadog/Splunk bills, but uniform 1% random sampling misses rare 1-in-a-million catastrophic incident traces.
@@ -100,6 +100,15 @@ FUTCache is a fundamental computational geometry primitive that solves two of th
   * **CRDTs** give multi-agent fleets a shared **Geometric Blackboard** to eliminate redundant exploration across workers without locks.
 * 📜 *Manifesto:* Read [**`WHY_FUTCACHE.md`**](WHY_FUTCACHE.md) on defeating Lusser's Law and neurosymbolic state gates.
 
+### 3. Automated Theorem Proving & CDCL Proof Search Geometry (SAT / SMT)
+* **The Problem:** Modern Conflict-Driven Clause Learning (CDCL) and MaxSAT solvers spend 90%+ of their CPU time resolving and maintaining millions of redundant learned clauses during conflict analysis. Standard heuristics (LBD / VSIDS) treat clauses linearly and fail to detect geometric clustering among conflict hyperplanes.
+* **The Breakthrough Discovery:** **CDCL proof search exhibits exploitable geometric recurrence.** Metric clause geometry carries statistically significant predictive signal ($p \le 0.007$) over solver backtrack dynamics beyond LBD and marginal chance.
+* 📊 *Empirical Receipts across 1,000 Matched-Pair Permutations:*
+  * **Hard 4-SAT:** Pure structural geometry predicts exact backjump depth at **$20.0\%$ vs $14.6\%$ matched null ($p = 0.007$)**, while LBD-only control is just **$4.6\%$**.
+  * **Geometry + LBD Synergy:** Combining structural geometry with LBD jumps exact backtrack prediction to **$41.3\%$ ($9\times$ higher than LBD alone)**.
+  * **Pigeonhole (PHP):** Pure structural geometry predicts backjump depth at **$44.3\%$ vs $33.2\%$ matched null ($p = 0.001$)**.
+  * **Offline Hindsight Compactor:** Warm-starting NitroSAT V3 with FUTCache's greedy $\varepsilon$-net compresses active clause databases by **$91.8\% - 98.1\%$** in milliseconds ([`demos/sat_cdcl_nitrosat_pipeline.py`](demos/sat_cdcl_nitrosat_pipeline.py)).
+
 ---
 
 ### The Complete Package
@@ -107,7 +116,9 @@ FUTCache is a fundamental computational geometry primitive that solves two of th
 2. **The 30,000-Ft Architecture:** [**`30KFEET.md`**](30KFEET.md) (Mental model, engine selector tree, subsystem guide).
 3. **The Neurosymbolic Manifesto:** [**`WHY_FUTCACHE.md`**](WHY_FUTCACHE.md) (Deterministic agent state & Lusser's Law antidote).
 4. **The Real Production Receipts:** [**`docs/alibaba-1m-scaling-benchmark.md`**](docs/alibaba-1m-scaling-benchmark.md) (1M real Alibaba traces, 72.3% suppression).
-5. **The Tail-Sampling Benchmark:** [**`docs/trace-sampling-benchmark.md`**](docs/trace-sampling-benchmark.md) (100k synthetic trace comparison vs random/latency gates).
+5. **The Real CDCL Proof-Search Benchmark:** [**`demos/real_cdcl_trace_benchmark.py`**](demos/real_cdcl_trace_benchmark.py) (1,000-permutation statistical test on active 1-UIP conflict logs).
+6. **The 21 SAT Problem Families Evaluation:** [**`demos/twenty_one_sat_families_benchmark.py`**](demos/twenty_one_sat_families_benchmark.py) (Geometric clause space evaluation across 21 benchmark families).
+7. **The Tail-Sampling Benchmark:** [**`docs/trace-sampling-benchmark.md`**](docs/trace-sampling-benchmark.md) (100k synthetic trace comparison vs random/latency gates).
 
 ---
 
