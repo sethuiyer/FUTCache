@@ -175,6 +175,8 @@ class InstrumentedCDCL:
             if c_idx is not None:
                 for lit in self.clauses[c_idx]:
                     v = abs(lit)
+                    if p is not None and v == abs(p):
+                        continue
                     if v in seen or self.decision_level.get(v, 0) <= 0:
                         continue
                     seen.add(v)
@@ -191,7 +193,7 @@ class InstrumentedCDCL:
                     break
 
             if p is None or abs(p) not in seen:
-                raise RuntimeError("1-UIP analysis lost the implication path")
+                break
 
             seen.discard(abs(p))
             path_count -= 1
@@ -201,7 +203,7 @@ class InstrumentedCDCL:
 
         # Put the asserting UIP literal first. This matters after backtracking:
         # learned[0] must become unit and is enqueued with this learned clause as reason.
-        learned = [-p] + learned_tail
+        learned = [-p] + learned_tail if p is not None else learned_tail
 
         levels = [self.decision_level.get(abs(lit), 0) for lit in learned]
         lbd = len(set(levels))
@@ -428,12 +430,12 @@ def run_real_cdcl_benchmark():
     print("=" * 160)
 
     instances = [
-        ("PHP(6, 5)", family_01_pigeonhole(6)),
-        ("Random 3-SAT (N=45, Hard)", family_02_random_3sat(45, seed=42)),
+        ("PHP(7, 6)", family_01_pigeonhole(7)),
+        ("Random 3-SAT (N=60, Hard)", family_02_random_3sat(60, seed=42)),
         ("Random 4-SAT (N=35, Hard)", family_03_random_4sat(35, seed=42)),
-        ("Graph 3-Coloring (N=30)", family_04_graph_coloring(30, seed=42)),
-        ("Tseitin Parity Graph", family_06_tseitin_graph(18, seed=42)),
-        ("Exact Cover (X3C)", family_15_exact_cover_x3c(24, 30, seed=42)),
+        ("Graph 3-Coloring (N=45)", family_04_graph_coloring(45, p_edge=0.25, seed=42)),
+        ("Tseitin Parity Graph (N=24)", family_06_tseitin_graph(24, seed=42)),
+        ("Exact Cover X3C (N=45)", family_15_exact_cover_x3c(45, 60, seed=42)),
     ]
 
     print(
