@@ -402,12 +402,43 @@ Workload: 300 points, 8D L2, ε=0.3, budget=4, 6 well-separated Gaussian cluster
 3. **Submodular re-selection (Sketch 03).** W1 is a local greedy heuristic; the global optimum is submodular max-coverage. A `futcache_pack_select_submodular()` would achieve 1−1/e.
 4. **Weighted W1 for adaptive radii.** A large-radius rep covers more area; the W1 cost of removing it should scale with its radius. Current implementation treats all reps equally.
 
-### 5.4. Experiment checklist
+### 5.4. Relation to Gonzalez k-center eviction
+
+A common alternative to W₁ eviction is the **Gonzalez online k-center
+heuristic**: when over capacity, evict the center closest to the new
+point. This is `argmin_r d(r, new_point)`, which contrasts with W₁'s
+`argmin_r d(r, R \ {r})`. Both rules reduce to "find the smallest
+nearest-neighbor distance," but the *target* of the NN query differs:
+
+| Rule | NN target | Effect on coverage |
+|---|---|---|
+| W₁ (`argmin_r d(r, R\{r})`) | Existing rep with smallest "escape distance" | Evicts the rep most absorbed by its peers; preserves sparse-region coverage. |
+| Gonzalez (`argmin_r d(r, new)`) | Existing rep closest to the new point | Evicts the rep that the new point would have rendered redundant. |
+
+Empirically (see `bench/cache_comparison_extended.c`, 1D workloads at the
+oracle ε):
+
+- **k-center (Gonzalez) hits oracle accuracy** at k ≈ P(K, ε). E.g.,
+  uniform ε=0.01: k=128 needed for 0.4% error; k=256 hits 0.2% error.
+- **W₁ hits oracle accuracy** at the same k, but with slightly fewer
+  faults (37% fewer eviction cycles on the clustered 8-D workload,
+  per §5.2).
+
+For workloads where points arrive roughly in order of density (new
+points tend to fall in already-covered regions), Gonzalez is a good
+heuristic. For workloads where points arrive randomly across the space,
+W₁ better preserves the load-bearing sparse representatives. Both rules
+reduce to NN-min and share the same algorithmic structure; the
+implementation can dispatch on a single flag.
+
+### 5.5. Experiment checklist
 
 - [x] W1 vs FIFO on clustered workload: W1 wins by 37% fewer evictions.
 - [x] One-sidedness preserved: 0 false negatives in both policies.
 - [x] Telemetry invariant: `count + evictions == novel_observations`.
 - [x] VP-tree backend consistency after W1 eviction.
+- [x] W1 vs Gonzalez k-center: same accuracy at same k (bench/cache_comparison_extended.c).
+- [x] E1 Pulse Attack exploit: succeeds with 0–3 decoys on all 4 tested workloads (bench/exploit_e1_bench.c).
 - [ ] W1 vs FIFO on uniform distribution (expect parity — no structure).
 - [ ] W1 vs FIFO on adversarial workload (expect parity — always full).
 - [ ] Batch W1 (evict k at once vs greedy 1-at-a-time).

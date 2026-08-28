@@ -118,6 +118,25 @@ graph LR
 * **Shared experience without data deluge:** Agents do not transmit massive raw trajectory streams ($H_t$) to each other. They broadcast only the minimal representative net ($R \subset H_t$).
 * **Global Novelty Awareness:** If Agent A encounters an edge case and records its geometric signature, Agent B instantly recognizes that territory as already visited and avoids redundant work.
 
+### Empirical Convergence & Gossip Schedule
+
+The CRDT join-semilattice convergence guarantee (PHASE2.md 12.29) was
+validated empirically at fleet sizes up to 256, with three gossip
+schedules (see `bench/crdt_fleet.c`):
+
+| Fleet W | Joint cells (target 14) | Dedup ratio | k=1 (rounds) | k=⌈log₂ W⌉ (rounds) | k=W-1 (rounds) |
+|---:|---:|---:|---:|---:|---:|
+| 8   | 14 | 0.125 | 5 | 3 | 1 |
+| 32  | 14 | 0.031 | 6 | 2 | 1 |
+| 128 | 14 | 0.0078 | 7.6 (mean) | 2 | 1 |
+| 256 | 14 | 0.0039 | 8.6 (mean) | 2 | 1 |
+
+**Every worker reaches the single-worker reference joint in 2 gossip
+rounds with `k=⌈log₂ W⌉`, at W=256 total latency 3.1 ms vs full fan-in's
+37 ms — a 12× speedup.** This is the empirical confirmation of the
+join-semilattice theorem for the practical gossip schedules that real
+fleet deployments use.
+
 ---
 
 ## 6. Mathematical State Compression

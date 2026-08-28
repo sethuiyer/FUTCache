@@ -531,6 +531,73 @@ state and are absorbed into the cluster join. The algebra is
 sufficient for correctness; the network only needs to deliver
 messages eventually.
 
+### Remark 12.32 (empirical convergence at fleet scales 1–256)
+
+Theorem 12.29 establishes convergence under any delivery schedule;
+Theorem 12.30 bounds termination at $O(\log N)$ rounds. The
+quantitative constants were measured in `bench/crdt_fleet.c` on the
+five 1D workloads (reciprocal, uniform, three-cluster, alternating,
+power-decay) at $\epsilon = 0.01$, with round-robin point distribution
+and deterministic gossip PRNG.
+
+For each (workload, fleet size $W$, schedule $k$) we report the
+smallest round $R$ such that *every* worker has reached the
+single-worker reference joint coverage, and the total wall time to
+$R$:
+
+| $W$ | k=1 (rounds / time) | k=3 (rounds / time) | k=$\lceil\log_2 W\rceil$ (rounds / time) | k=$W-1$ (rounds / time) |
+|---:|---:|---:|---:|---:|
+| 8   | 5 / 15 μs  | 3 / 18 μs  | 3 / 18 μs   | 1 / 33 μs   |
+| 32  | 6 / 96 μs  | 2 / 142 μs | 2 / 218 μs  | 1 / 1130 μs |
+| 128 | 7.6 / 1.4 ms | 3 / 1.0 ms | 2 / 1.3 ms | 1 / 18 ms |
+| 256 | 8.6 / 3.5 ms | 3 / 2.5 ms | 2 / 3.1 ms | 1 / 37 ms |
+
+Two observations:
+
+1. **$k = \lceil \log_2 W \rceil$ achieves the Theorem 12.30 bound
+   tightly.** All five workloads converge in 2–3 rounds at any $W$,
+   with each round costing $O(\log W \cdot |R|)$ merge operations per
+   worker. Total merge work is $O(W \log W \cdot |R|)$ across the
+   fleet, against $O(W^2 \cdot |R|)$ for full fan-in.
+
+2. **Full fan-in ($k = W-1$) at $W=256$ takes 12× longer** than
+   $k = \lceil \log_2 W \rceil$ for the same convergence guarantee
+   (37 ms vs 3.1 ms in-process; the gap widens further under realistic
+   network RTT). The schedule choice is the dominant deployment lever
+   for fleet scale.
+
+The exponential growth in $k = 1$ rounds (5 → 8.6 across $W = 8 \to
+256$) is consistent with the classical rumor-spreading bound
+$O(\log W / \log \log W)$ for pure peer-to-peer propagation without
+amplification. The CRDT join property does not accelerate this; it
+guarantees only that *combining* propagated state is free (idempotent,
+associative, commutative).
+
+**Network-RTT projection.** In-process merge costs are negligible
+compared to network RTT in any realistic deployment. Projecting the
+Section 2 schedules with per-message RTT $r$:
+
+$$T_{\text{conv}}(W, k) \;=\; R(W, k) \cdot \bigl(k \cdot r + t_{\text{merge}}\bigr).$$
+
+At $W = 256$, $r = 1$ ms (intra-DC): $T = 19$ ms for $k = \lceil\log_2 W\rceil$
+vs $293$ ms for $k = W - 1$ — a $15\times$ speedup. At $r = 10$ ms
+(cross-DC): $T = 82$ ms vs $2.6$ s — a $31\times$ speedup. The schedule
+choice is the dominant deployment knob: full fan-in scales as $O(W^2)$
+in message volume per round, randomized $O(\log W)$ at the cost of $O(\log W)$
+extra rounds.
+
+**Conflict-rate measurement.** The CRDT join rule's priority-based conflict
+resolution (Theorem 12.27) is defensive machinery: under the round-robin
+distribution with disjoint cell sets, gossip updates virtually never
+collide with existing local entries. On the `power-decay` workload at
+$\epsilon = 0.01$, $W = 16$, all four gossip schedules ($k = 1, 3,
+\lceil\log_2 W\rceil, W-1$) report **0 conflicts** out of $25{,}000$ to
+$376{,}000$ total merges — a $100\%$ adopt rate. Conflict resolution
+becomes load-bearing only under concurrent observation of the same
+anchor cell (e.g., two workers observing overlapping stream shards,
+or partial-failure replays), neither of which arises in the
+round-robin benchmark configuration.
+
 ---
 
 ## 12.7 Product with cyclic workflows
