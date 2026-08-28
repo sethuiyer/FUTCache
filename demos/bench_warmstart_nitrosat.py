@@ -92,17 +92,22 @@ def build_wcnf(points: np.ndarray, eps: float) -> str:
     dist = np.sqrt(np.einsum("ijk,ijk->ij", diff, diff))
     cov = dist <= eps
 
+    conflicts = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dist[i, j] <= eps:
+                conflicts.append((i + 1, j + 1))
+
     top_weight = n + 1
-    wcnf_lines = [f"p wcnf {n} {n + n*(n-1)//2} {top_weight}\n"]
+    total_clauses = n + len(conflicts) + n
+    wcnf_lines = [f"p wcnf {n} {total_clauses} {top_weight}\n"]
 
     for i in range(n):
         covering = np.where(cov[i])[0] + 1
         wcnf_lines.append(f"{top_weight} " + " ".join(str(c) for c in covering) + " 0\n")
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            if dist[i, j] <= eps:
-                wcnf_lines.append(f"{top_weight} -{i+1} -{j+1} 0\n")
+    for u, v in conflicts:
+        wcnf_lines.append(f"{top_weight} -{u} -{v} 0\n")
 
     for i in range(1, n + 1):
         wcnf_lines.append(f"1 -{i} 0\n")
