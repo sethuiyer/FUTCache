@@ -38,7 +38,7 @@ from demos.twenty_one_sat_families_benchmark import (
     family_13_boolean_multiplier,
     family_17_bounded_model_checking,
 )
-from demos.geometric_clause_reducer import generate_simulated_learned_stream, extract_two_stage_signature
+from demos.geometric_clause_reducer import generate_cdcl_learned_stream, extract_two_stage_signature
 
 SOLVER_BIN = os.path.join(repo_root, "third_party", "nitrosat", "nitrosatv3")
 
@@ -133,7 +133,7 @@ def run_full_pipeline_benchmark():
     print("-" * 108)
 
     for name, (_, n_vars, clauses) in benchmarks:
-        stream = generate_simulated_learned_stream(clauses, n_vars, stream_size=500)
+        stream = generate_cdcl_learned_stream(clauses, n_vars, stream_size=500)
         raw_count = len(stream)
 
         # 1. Online FUTCache Hot-Path (Microsecond Net)
