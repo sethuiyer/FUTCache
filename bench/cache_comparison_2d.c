@@ -741,8 +741,10 @@ int main(void)
     };
     size_t lsh_count = sizeof(lsh_params) / sizeof(lsh_params[0]);
 
+    /* Includes the per-workload oracle epsilons (0.08, 0.15) so FUTCache
+     * can be compared to kcenter/LSH at the SAME epsilon they are run at. */
     double futc_eps[] = {
-        0.2, 0.1, 0.05, 0.025, 0.01, 0.005
+        0.2, 0.15, 0.1, 0.08, 0.05, 0.025, 0.01, 0.005
     };
     size_t futc_count = sizeof(futc_eps) / sizeof(futc_eps[0]);
 
