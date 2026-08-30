@@ -20,3 +20,9 @@ pi-session-*.html
 *.tar.gz
 # CocoIndex Code (ccc)
 /.cocoindex_code/
+
+# External working copies kept on-disk for development but not shipped.
+# CaDiCaL clone used only to generate clause traces for the CDCL bench.
+/third_party/cadical/
+# Out-of-tree reference material (novelty-geometry site mirror).
+/references/
